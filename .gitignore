@@ -1,0 +1,11 @@
+node_modules/
+out/
+release/
+dist/
+resources/bin/
+.cursor/
+Source Codes/
+*.log
+.DS_Store
+.vite/
+build/python/
