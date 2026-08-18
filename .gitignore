@@ -6,6 +6,10 @@ dist/
 resources/bin/
 .cursor/
 Source Codes/
+# Local verification secrets. Never commit an API key: git history is permanent and a key
+# pushed once must be treated as burned even if the next commit removes it.
+.secrets/
+*.local.json
 *.log
 *.tsbuildinfo
 .DS_Store

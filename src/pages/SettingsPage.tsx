@@ -61,7 +61,7 @@ function effectivePrimary(settings: AppSettings): { slot: number | null; paid: b
 }
 
 const KEYS_TIP =
-  "Your Gemini API key(s) from Google AI Studio, in priority order. A run passes the two highest-ranked keys to the engine as -k and -k2; any further keys are a reserve pool that is promoted only when a key above becomes invalid. Keys marked invalid by the last check are skipped entirely. Use the eye icon to reveal a key. Set each key's tier (Free / Paid) yourself — Google's API cannot report it — as the primary key's tier controls rate-limiting. Note that free-tier quota is shared per Google Cloud project, so several keys from one project do not multiply your quota. Get a free key at aistudio.google.com/apikey."
+  "Your Gemini API key(s) from Google AI Studio, in priority order. A run passes the two highest-ranked keys to the engine as -k and -k2; any further keys are a reserve pool that is promoted only when a key above becomes invalid. Keys marked invalid by the last check are skipped entirely. Use the eye icon to reveal a key. Set each key's tier (Free / Paid) yourself — Google's API cannot report it — as the primary key's tier controls rate-limiting. Adding a second key is only worth doing if it comes from a DIFFERENT Google Cloud project: free-tier quota is counted per project, not per key, so extra keys from the same project share one pool and buy you no additional throughput — only a spare to fall back on if one key stops working. Get a free key at aistudio.google.com/apikey."
 
 function Eye(): React.JSX.Element {
   return (

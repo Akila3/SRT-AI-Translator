@@ -1,6 +1,6 @@
 {
   "name": "srt-ai-translation-ui",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Electron + React desktop UI for the gemini-srt-translator CLI",
   "main": "./out/main/index.js",
   "author": "SRT AI Translation UI",
@@ -15,6 +15,7 @@
     "test:gates": "node scripts/gates/run.mjs",
     "build:python": "python scripts/build_python.py",
     "check:bin": "node scripts/check-bin.mjs",
+    "verify:live": "node scripts/verify/run.mjs",
     "build:win": "node scripts/check-bin.mjs --target=win32 && electron-vite build && electron-builder --win",
     "build:dir": "npm run check:bin && electron-vite build && electron-builder --dir"
   },
