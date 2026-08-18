@@ -8,8 +8,32 @@ import type {
   TmdbResult,
   TmdbDetails,
   ProcOutput,
-  ProcDone
+  ProcDone,
+  KeyCheck,
+  SlotFetchResult,
+  RefreshOutcome
 } from '../shared/types'
+
+/**
+ * What `models:checkKeys` resolves to. Wider than the old shape because the renderer now
+ * needs the per-slot evidence to label keys and explain a partial refresh, instead of
+ * being handed a single boolean and left to guess.
+ */
+export interface CheckKeysResponse {
+  results: KeyCheck[]
+  slots: SlotFetchResult[]
+  models: ModelInfo[]
+  unionIds: string[]
+  runnableIds: string[]
+  activeSlots: number[]
+  refreshOutcome: RefreshOutcome
+  /** The selection after the Step 4a rules ran; may differ from what was stored. */
+  model: string
+  /** Human-readable explanation when a rule fired or the refresh was incomplete. */
+  notice: string
+  updatedAt: string
+  anyValid: boolean
+}
 
 const api = {
   // settings
@@ -22,16 +46,15 @@ const api = {
     ipcRenderer.invoke('models:getCached'),
   refreshModels: (
     apiKey: string
-  ): Promise<{ models: ModelInfo[]; updatedAt: string; keyValid: boolean; error: string }> =>
-    ipcRenderer.invoke('models:refresh', apiKey),
-  checkApiKeys: (
-    keys: string[]
   ): Promise<{
-    results: { valid: boolean | null; error: string }[]
     models: ModelInfo[]
     updatedAt: string
-    anyValid: boolean
-  }> => ipcRenderer.invoke('models:checkKeys', keys),
+    keyValid: boolean
+    error: string
+    notice: string
+  }> => ipcRenderer.invoke('models:refresh', apiKey),
+  checkApiKeys: (keys: string[]): Promise<CheckKeysResponse> =>
+    ipcRenderer.invoke('models:checkKeys', keys),
 
   // dialogs
   openFile: (filters?: Electron.FileFilter[]): Promise<string> =>

@@ -3,6 +3,7 @@ import { useStore } from '../store/useStore'
 import { Box, BoxTitle, Label, FilePicker, Button, ProgressBar, LogPanel, Select } from '../components/ui'
 import { THINKING_LEVELS } from '../data/freeTier'
 import { useRunner } from '../lib/useRunner'
+import { modelCapabilities } from '../../electron/shared/modelCaps'
 import type { TranscribeArgs } from '../../electron/shared/types'
 
 const MEDIA_FILTERS = [
@@ -25,14 +26,31 @@ export default function TranscribePage(): React.JSX.Element {
 
   if (!settings) return <div className="p-6 text-sm text-gray-500 dark:text-gray-400">Loading…</div>
 
-  const is3x = settings.model.startsWith('gemini-3') || settings.model.endsWith('-latest')
+  const caps = modelCapabilities(settings.model)
   const isRunning = state.status === 'running'
+
+  // A Select whose value is absent from its options renders BLANK, which reads as "no
+  // model selected" even though one is stored. Settings keeps the id visible in that case;
+  // this field must too, or the two pages disagree about what will run.
+  const modelOptions = settings.cachedModels.map((m) => ({ value: m.id, label: m.label }))
+  if (settings.model && !settings.cachedModels.some((m) => m.id === settings.model)) {
+    modelOptions.unshift({ value: settings.model, label: `${settings.model} (not in fetched list)` })
+  }
 
   async function handleStart(): Promise<void> {
     setStartError('')
     if (!settings) return
     if (!mediaFile) {
       setStartError('Choose an audio or video file to transcribe.')
+      return
+    }
+    // The engine refuses transcription outright for anything that is not a Gemini 2.5/3.x
+    // model, so say so here instead of spawning a job that exits immediately.
+    if (!modelCapabilities(settings.model).supportsTranscription) {
+      setStartError(
+        `Transcription requires a Gemini 2.5 or 3.x model. "${settings.model}" cannot transcribe — ` +
+          'pick a different model in Settings → Model & Generation.'
+      )
       return
     }
     const args: TranscribeArgs = {
@@ -43,6 +61,10 @@ export default function TranscribePage(): React.JSX.Element {
       apiKeys: settings.apiKeys,
       thinkingLevel: settings.thinkingLevel,
       thinkingBudget: settings.thinkingBudget,
+      customGenerationParams: settings.customGenerationParams,
+      temperature: settings.temperature,
+      topP: settings.topP,
+      topK: settings.topK,
       description: description || undefined,
       ffmpegPath: settings.ffmpegPath || undefined
     }
@@ -112,21 +134,31 @@ export default function TranscribePage(): React.JSX.Element {
             <Label tip="The model used for transcription is taken from your Settings → Model & Generation. Shown here for reference.">
               Model (from Settings)
             </Label>
-            <Select value={settings.model} onChange={() => {}} disabled options={settings.cachedModels.map((m) => ({ value: m.id, label: m.label }))} className="w-full" />
+            <Select value={settings.model} onChange={() => {}} disabled options={modelOptions} className="w-full" />
           </div>
           <div className="flex-1">
             <Label tip="Thinking level for transcription (Gemini 3.x). Low is usually sufficient. Disabled for 2.x models, which use the Thinking Budget from Settings instead.">
               Thinking Level
             </Label>
             <Select
-              value={settings.thinkingLevel}
+              value={caps.thinking === 'level' ? settings.thinkingLevel : ''}
               onChange={() => {}}
-              disabled={!is3x}
-              options={is3x ? THINKING_LEVELS : [{ value: '', label: '3.x models only' }]}
+              disabled={caps.thinking !== 'level'}
+              options={
+                caps.thinking === 'level'
+                  ? THINKING_LEVELS
+                  : [{ value: '', label: '3.x models only' }]
+              }
               className="w-full"
             />
           </div>
         </div>
+        {!caps.supportsTranscription && (
+          <p className="mt-3 text-sm text-amber-600 dark:text-amber-400">
+            “{settings.model}” cannot transcribe — the engine accepts only Gemini 2.5 and 3.x
+            models here. Choose another model in Settings → Model &amp; Generation.
+          </p>
+        )}
         <div className="mt-4">
           <Label tip="Optional context to help transcription accuracy — e.g. names, jargon, or the topic. Passed to the model as a hint.">
             Description / Context
@@ -146,7 +178,7 @@ export default function TranscribePage(): React.JSX.Element {
         {startError && <p className="mb-3 text-sm text-red-600 dark:text-red-400">{startError}</p>}
         <div className="flex items-center gap-2">
           {!isRunning ? (
-            <Button onClick={handleStart} disabled={!mediaFile}>
+            <Button onClick={handleStart} disabled={!mediaFile || !caps.supportsTranscription}>
               Start Transcription
             </Button>
           ) : (

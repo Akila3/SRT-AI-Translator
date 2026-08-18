@@ -12,9 +12,11 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "test:gates": "node scripts/gates/run.mjs",
     "build:python": "python scripts/build_python.py",
-    "build:win": "electron-vite build && electron-builder --win",
-    "build:dir": "electron-vite build && electron-builder --dir"
+    "check:bin": "node scripts/check-bin.mjs",
+    "build:win": "node scripts/check-bin.mjs --target=win32 && electron-vite build && electron-builder --win",
+    "build:dir": "npm run check:bin && electron-vite build && electron-builder --dir"
   },
   "dependencies": {
     "electron-store": "^8.2.0",

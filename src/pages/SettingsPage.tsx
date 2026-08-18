@@ -12,8 +12,56 @@ import {
   Pill
 } from '../components/ui'
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from '../data/languages'
-import { THINKING_LEVELS, SERVICE_TIERS, paidQuotaTooltip } from '../data/freeTier'
-import type { AppSettings } from '../../electron/shared/types'
+import { THINKING_LEVELS, SERVICE_TIERS, paidQuotaTooltip, RATE_LIMITS_URL } from '../data/freeTier'
+import {
+  activeKeySlots,
+  forgetSlotEvidence,
+  keyRoles,
+  orderKeySlots,
+  reindexEvidenceAfterRemoval,
+  type KeyRole,
+  type KeySlot
+} from '../../electron/shared/keyOrder'
+import { effectiveThinkingLevel, modelCapabilities } from '../../electron/shared/modelCaps'
+import {
+  DEFAULT_RESUME_CONTEXT_SIZE,
+  type AppSettings,
+  type ModelInfo
+} from '../../electron/shared/types'
+
+const PRICING_URL = 'https://ai.google.dev/gemini-api/docs/pricing'
+
+/**
+ * Slot descriptors for the configured keys, in the shape `shared/keyOrder` ranks.
+ * Indices only — no key material leaves this module.
+ */
+function keySlotsOf(settings: AppSettings): KeySlot[] {
+  return (settings.apiKeys ?? [])
+    .map((k, i) => ({ index: i, present: !!(k ?? '').trim() }))
+    .filter((s) => s.present)
+    .map(({ index }) => ({
+      index,
+      valid: settings.apiKeyValid?.[index] ?? null,
+      tier: settings.apiKeyTiers?.[index] ?? 'free'
+    }))
+}
+
+/**
+ * The key a run will actually send as `-k`, and its tier.
+ *
+ * This must be derived from the ranking rather than from slot 0, because
+ * `orderKeysByValidity` promotes a fallback when the configured first key is known-invalid
+ * and then derives `--paid-quota` from whichever key it promoted. Reading slot 0 here would
+ * let Settings report "Free" while the run emits `--paid-quota`, or the reverse.
+ */
+function effectivePrimary(settings: AppSettings): { slot: number | null; paid: boolean } {
+  const primary = orderKeySlots(keySlotsOf(settings))[0]
+  if (primary == null) return { slot: null, paid: false }
+  return { slot: primary, paid: (settings.apiKeyTiers?.[primary] ?? 'free') === 'paid' }
+}
+
+const KEYS_TIP =
+  "Your Gemini API key(s) from Google AI Studio, in priority order. A run passes the two highest-ranked keys to the engine as -k and -k2; any further keys are a reserve pool that is promoted only when a key above becomes invalid. Keys marked invalid by the last check are skipped entirely. Use the eye icon to reveal a key. Set each key's tier (Free / Paid) yourself — Google's API cannot report it — as the primary key's tier controls rate-limiting. Note that free-tier quota is shared per Google Cloud project, so several keys from one project do not multiply your quota. Get a free key at aistudio.google.com/apikey."
 
 function Eye(): React.JSX.Element {
   return (
@@ -189,22 +237,60 @@ function SectionLanguages({ settings, set }: SectionProps): React.JSX.Element {
   )
 }
 
+const ROLE_LABEL: Record<KeyRole, string> = {
+  primary: 'Primary (-k)',
+  fallback: 'Fallback (-k2)',
+  reserve: 'Reserve'
+}
+
+function RoleBadge({ role }: { role: KeyRole | undefined }): React.JSX.Element | null {
+  if (!role) return null
+  const tone =
+    role === 'primary'
+      ? 'bg-brand/10 text-brand'
+      : role === 'fallback'
+        ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+        : 'bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400'
+  return (
+    <span
+      className={`w-24 flex-shrink-0 rounded-full px-2 py-0.5 text-center text-[11px] font-semibold ${tone}`}
+      title={
+        role === 'reserve'
+          ? 'Held in reserve. Each run passes only two keys to the engine, so this one is used only if a key above it becomes invalid.'
+          : 'This key will be passed to the engine on the next run.'
+      }
+    >
+      {ROLE_LABEL[role]}
+    </span>
+  )
+}
+
 function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
-  const setModels = useStore((s) => s.setModels)
+  const reload = useStore((s) => s.load)
   const updatedAt = useStore((s) => s.modelsUpdatedAt)
   const [refreshing, setRefreshing] = useState(false)
   const [modelCount, setModelCount] = useState<number | null>(null)
+  const [notice, setNotice] = useState('')
+  const [failedSlots, setFailedSlots] = useState<number[]>([])
   const [revealed, setRevealed] = useState<Record<number, boolean>>({})
   const keys = settings.apiKeys.length ? settings.apiKeys : ['']
   const tiers = keys.map((_, i) => settings.apiKeyTiers?.[i] ?? 'free')
   const valids = keys.map((_, i) => settings.apiKeyValid?.[i] ?? null)
   const errs = keys.map((_, i) => settings.apiKeyError?.[i] ?? '')
 
+  // Same ranking the main process uses to choose -k / -k2, so the labels below cannot
+  // disagree with what a run actually does. Operates on slot indices only — no key
+  // material leaves this component.
+  const slots: KeySlot[] = keySlotsOf(settings)
+  const roles = keyRoles(slots)
+  const active = activeKeySlots(slots)
+
   function toggleReveal(i: number): void {
     setRevealed((r) => ({ ...r, [i]: !r[i] }))
   }
 
   function updateKey(i: number, val: string): void {
+    if (keys[i] === val) return
     const next = [...keys]
     next[i] = val
     set('apiKeys', next)
@@ -215,14 +301,16 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
     const ne = [...errs]
     ne[i] = ''
     set('apiKeyError', ne)
+    // ...and everything slot i previously proved about model availability, because that
+    // evidence came from a different key. Left alone, the pre-spawn guard would keep
+    // treating it as positive proof for a key it has never seen.
+    set('cachedModels', forgetSlotEvidence(settings.cachedModels ?? [], i))
     setModelCount(null)
   }
   function setTier(i: number, val: string): void {
     const next = [...tiers]
     next[i] = val
     set('apiKeyTiers', next)
-    // The primary key's tier is what the translator actually uses for rate limiting.
-    if (i === 0) set('paidQuota', val === 'paid')
   }
   function addKey(): void {
     if (keys.length >= 5) return
@@ -240,19 +328,29 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
     set('apiKeyTiers', drop(tiers, 'free'))
     set('apiKeyValid', drop(valids, null))
     set('apiKeyError', drop(errs, ''))
+    // Removing a slot renumbers every slot above it, so stored availability evidence has
+    // to follow the keys it came from or it starts describing the wrong ones.
+    set('cachedModels', reindexEvidenceAfterRemoval(settings.cachedModels ?? [], i))
   }
 
   async function refresh(): Promise<void> {
     if (!keys.some((k) => k.trim())) return
     setRefreshing(true)
     setModelCount(null)
+    setNotice('')
     try {
       const res = await window.api.checkApiKeys(keys)
-      if (res.anyValid) setModels(res.models, res.updatedAt)
-      // Mirror the per-key status into the live store so it sticks across tabs.
-      set('apiKeyValid', res.results.map((r) => r.valid))
-      set('apiKeyError', res.results.map((r) => r.error))
-      setModelCount(res.models.length)
+      // The main process has already persisted validity, the model cache and any model
+      // change the Step 4a rules made. Re-read rather than writing the same values back:
+      // a second write here would race the rules and could resurrect the old selection.
+      await reload()
+      // Report a count only for a refresh that was actually persisted. An incomplete
+      // refresh keeps the previous list, so quoting the number it happened to return
+      // would claim a fetch succeeded when the picker did not change.
+      const persisted = res.refreshOutcome === 'allComplete' || res.refreshOutcome === 'activeComplete'
+      setModelCount(persisted ? res.models.length : null)
+      setFailedSlots(res.slots.filter((s) => s.queried && !s.ok).map((s) => s.slot))
+      setNotice(res.notice)
     } finally {
       setRefreshing(false)
     }
@@ -264,16 +362,23 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
   // (or edited) key has status `null` (unchecked) and must not be reported as bad.
   const invalidCount = valids.filter((v, i) => v === false && keys[i].trim()).length
   const checkedAny = valids.some((v) => v !== null)
-  const primaryPaid = tiers[0] === 'paid'
+  // Read from the ranking, not from slot 0: an invalid first key is skipped at spawn time
+  // and the promoted key's tier is what decides `--paid-quota`.
+  const { slot: primarySlot, paid: primaryPaid } = effectivePrimary(settings)
   const tierLabel = primaryPaid ? 'Paid' : 'Free'
 
   return (
     <div className="max-w-xl space-y-5">
       <SectionTitle>Gemini API Keys</SectionTitle>
       <div>
-        <Label tip="Your Gemini API key(s) from Google AI Studio. The first key is used by default; additional keys are passed as fallback quota (-k2) so the tool can keep going if the first key hits its limit. Add up to 5 keys. Use the eye icon to reveal a key. Set each key's tier (Free / Paid) — Google's API can't report this automatically, so mark it yourself; the primary key's tier controls rate-limiting (Paid Quota). Get a free key at aistudio.google.com/apikey.">
-          API Keys (up to 5)
-        </Label>
+        <Label tip={KEYS_TIP}>API Keys (up to 5)</Label>
+        <p className="mb-2 text-xs text-gray-500 dark:text-gray-400">
+          Each run passes exactly <strong>two</strong> keys to the engine — a primary
+          (&#8209;k) and one fallback (&#8209;k2) it switches to when the primary hits its
+          quota. Extra keys are a <strong>reserve pool</strong>: they are not used during a
+          run, but are promoted automatically when a key above them turns out to be
+          invalid. Keys are ranked below in the order they will actually be used.
+        </p>
         <div className="space-y-2">
           {keys.map((k, i) => (
             <div key={i} className="flex items-center gap-2">
@@ -295,6 +400,7 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
                 </button>
               </div>
               <KeyStatus refreshing={refreshing} state={valids[i]} error={errs[i]} hasKey={!!keys[i].trim()} />
+              <RoleBadge role={roles.get(i)} />
               <Select
                 value={tiers[i]}
                 onChange={(v) => setTier(i, v)}
@@ -326,7 +432,7 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
       <Divider />
 
       <div>
-        <Label tip="Validates every saved API key individually (each gets a ✓ or ✗ next to it) and retrieves the list of Gemini models from the first valid key — which determines what appears in the Model dropdown. New models Google releases (e.g. a future Flash 4.0) show up here automatically. The list is cached so it loads instantly next time. Run this after entering your keys. (Tier is set per key above — Google's API can't report it automatically.)">
+        <Label tip="Validates every saved API key individually (each gets a ✓ or ✗ next to it) and retrieves the model list from EVERY valid key, not just the first. The Model dropdown offers the combined list; a model that only some of your keys can see is marked, because a run may switch between your two active keys. New models Google releases show up here automatically, and the list is cached so it loads instantly next time. Run this after entering your keys. (Tier is set per key above — Google's API can't report it automatically.)">
           Fetch Models &amp; Check API Keys
         </Label>
         <div className="flex flex-wrap items-center gap-3">
@@ -339,10 +445,20 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
                 ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300'
                 : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300'
             }`}
-            title="Primary key's tier (set per key above). Google's API does not expose a key's billing tier, so set it manually. This drives rate-limiting (Paid Quota)."
+            title="Tier of the key this run will actually use as -k, which is not always Key 1 — a known-invalid key is skipped and the next one is promoted. Google's API does not expose a key's billing tier, so set it manually per key above. This is what drives rate-limiting (Paid Quota)."
           >
-            Primary key tier: {tierLabel}
+            {primarySlot == null
+              ? 'Primary key tier: —'
+              : `Primary key tier (Key ${primarySlot + 1}): ${tierLabel}`}
           </span>
+          <button
+            type="button"
+            onClick={() => void window.api.openExternal(RATE_LIMITS_URL)}
+            className="text-xs font-medium text-brand hover:underline"
+            title="Google's live rate-limit table — the authoritative source. Any figure shown in this app is a rounded approximation and can go out of date."
+          >
+            View current rate limits ↗
+          </button>
           {updatedAt && (
             <span className="text-xs text-gray-500 dark:text-gray-400">
               Last updated: {new Date(updatedAt).toLocaleString()}
@@ -374,6 +490,21 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
                 key instead.
               </p>
             )}
+            {failedSlots.length > 0 && (
+              <p className="text-amber-600 dark:text-amber-400">
+                Key {failedSlots.map((i) => i + 1).join(', ')} could not be checked
+                {failedSlots.every((i) => !active.includes(i))
+                  ? ' — it is a reserve key, so this does not affect runs.'
+                  : ' — it is one of the two keys a run would use.'}
+              </p>
+            )}
+            {notice && <p className="text-brand">{notice}</p>}
+            {active.length > 0 && (
+              <p className="text-gray-500 dark:text-gray-400">
+                Next run will use key{active.length > 1 ? 's' : ''}{' '}
+                {active.map((i) => i + 1).join(' and ')}.
+              </p>
+            )}
           </div>
         )}
 
@@ -386,22 +517,50 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
 }
 
 function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
-  const models = settings.cachedModels.map((m) => ({
+  const caps = modelCapabilities(settings.model)
+  const cached = settings.cachedModels
+  const verifiedAny = cached.some((m) => m.source === 'live')
+  const selected = cached.find((m) => m.id === settings.model)
+
+  // The active set is what a run will actually pass as -k/-k2, so "available on every
+  // active key" is the honest bar for an unqualified entry.
+  const activeSlots = activeKeySlots(
+    settings.apiKeys
+      .map((k, i) => ({
+        index: i,
+        valid: settings.apiKeyValid?.[i] ?? null,
+        tier: settings.apiKeyTiers?.[i] ?? 'free',
+        present: !!k.trim()
+      }))
+      .filter((s) => s.present)
+      .map(({ index, valid, tier }) => ({ index, valid, tier }))
+  )
+  const availableOnAllActive = (m: ModelInfo): boolean =>
+    m.source === 'live' && activeSlots.every((slot) => m.availableOn.includes(slot))
+
+  const models = cached.map((m) => ({
     value: m.id,
-    label: m.available ? m.label : `${m.label} (unavailable)`
+    label:
+      m.source !== 'live'
+        ? `${m.label} (unverified)`
+        : availableOnAllActive(m)
+          ? m.label
+          : `${m.label} (some keys only)`
   }))
-  const is3x = settings.model.startsWith('gemini-3') || settings.model.endsWith('-latest')
-  const is25 = settings.model.startsWith('gemini-2.5')
+  // The stored id may not be in the list yet (never fetched, or fetched on another
+  // profile). A Select whose value is absent from its options renders BLANK, which reads
+  // as "no model selected" — so keep it visible as an explicit entry.
+  if (settings.model && !cached.some((m) => m.id === settings.model)) {
+    models.unshift({ value: settings.model, label: `${settings.model} (not in fetched list)` })
+  }
 
   function handleModel(v: string): void {
     set('model', v)
-    if (v.startsWith('gemini-3') || v.endsWith('-latest')) {
-      set('temperature', 1.0)
-      set('topP', 0.95)
-    } else {
-      set('temperature', 0.3)
-      set('topP', 0.8)
-    }
+    // Sampling defaults differ by generation. Only meaningful while custom parameters are
+    // on; still applied so switching the toggle on later shows sensible values.
+    const gen3 = /(^|-)3(\.|-)/.test(v)
+    set('temperature', gen3 ? 1.0 : 0.3)
+    set('topP', gen3 ? 0.95 : 0.8)
   }
 
   return (
@@ -409,10 +568,42 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
       <SectionTitle>Model &amp; Generation</SectionTitle>
 
       <div>
-        <Label tip="The Gemini model used for translation. Recommendation: Gemini Flash Lite Latest — best for free-tier users, fastest, very good quality (the default). Gemini Flash Latest — higher quality, slower, uses more quota. Gemini Pro Latest — highest quality, much slower, for difficult content. The '… Latest' options always track Google's newest model in each tier (the resolved version is shown in parentheses). Use 'Fetch Models & Check API Key' to refresh the list.">
+        <Label tip="The Gemini model used for translation and transcription. The list comes from your own API keys, so newly released models appear automatically once you press 'Fetch Models & Check API Keys'. Guidance: a flash-lite model is fastest and cheapest and is what the app defaults to (it moves to the newest flash-lite by itself); flash trades speed for quality; pro is the most capable and by far the slowest and most expensive. Preview models are offered but never selected automatically.">
           Model
         </Label>
         <Select value={settings.model} onChange={handleModel} options={models} className="w-80" />
+        <div className="mt-1.5 space-y-1 text-xs">
+          <p className="text-gray-500 dark:text-gray-400">
+            Cost varies enormously by tier — a pro model can cost more than ten times a
+            flash-lite one for the same file, and a newer model is not automatically
+            cheaper.{' '}
+            <button
+              type="button"
+              onClick={() => void window.api.openExternal(PRICING_URL)}
+              className="font-medium text-brand hover:underline"
+            >
+              Current pricing ↗
+            </button>
+          </p>
+          {!verifiedAny && (
+            <p className="text-amber-600 dark:text-amber-400">
+              These models have not been verified against your API key yet — open Gemini API
+              Keys and press “Fetch Models &amp; Check API Keys”.
+            </p>
+          )}
+          {settings.modelNeedsVerification && (
+            <p className="text-amber-600 dark:text-amber-400">
+              Your saved model has not been confirmed against your key yet. It has been kept
+              as-is; fetch models to verify it.
+            </p>
+          )}
+          {verifiedAny && selected && !availableOnAllActive(selected) && (
+            <p className="text-amber-600 dark:text-amber-400">
+              This model was not reported by every key a run may use. If the engine switches
+              to the fallback key mid-run, it may fail.
+            </p>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 items-start gap-x-10 gap-y-5">
@@ -450,16 +641,27 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
         {/* Left: thinking */}
         <div className="space-y-5">
           <div>
-            <Label tip="Gemini 3.x only. Controls how much internal reasoning the model does before output. Order: Disabled (none, fastest) → Minimal → Low (default, recommended) → Medium → High (most thorough, slowest). Low is sufficient for most subtitle jobs. Greyed out for 2.x — use Thinking Budget instead.">
+            <Label tip="Gemini 3.x only. Controls how much internal reasoning the model does before output. Order: Minimal (fastest) → Low (default, recommended) → Medium → High (most thorough, slowest). Low is sufficient for most subtitle jobs. Thinking cannot be switched off entirely on 3.x models — the engine raises 'Disabled' to the lowest level the model accepts. Gemini 3 Pro does not accept 'Minimal' and treats it as 'Low'. For 2.5 models use Thinking Budget instead.">
               Thinking Level
             </Label>
-            {is3x ? (
-              <Select
-                value={settings.thinkingLevel}
-                onChange={(v) => set('thinkingLevel', v)}
-                options={THINKING_LEVELS}
-                className="w-52"
-              />
+            {caps.thinking === 'level' ? (
+              <>
+                <Select
+                  value={settings.thinkingLevel}
+                  onChange={(v) => set('thinkingLevel', v)}
+                  options={THINKING_LEVELS.filter(
+                    (o) => !(caps.rejectsMinimalLevel && o.value === 'minimal')
+                  )}
+                  className="w-52"
+                />
+                {effectiveThinkingLevel(settings.model, settings.thinkingLevel) !==
+                  settings.thinkingLevel && (
+                  <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                    This model does not support “{settings.thinkingLevel}” — it will run at “
+                    {effectiveThinkingLevel(settings.model, settings.thinkingLevel)}”.
+                  </p>
+                )}
+              </>
             ) : (
               <>
                 <Select value="" onChange={() => {}} disabled options={[{ value: '', label: '3.x models only' }]} className="w-52" />
@@ -468,17 +670,23 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
             )}
           </div>
           <div>
-            <Label tip="Gemini 2.5 only. Maximum tokens the model may use for internal reasoning. Default: 512. Set to 0 to disable thinking (faster, cheaper). Increase to 2048–8192 for complex content. Maximum: 32,768. Greyed out for 3.x — use Thinking Level instead.">
+            <Label tip="Gemini 2.5 only. Maximum tokens the model may use for internal reasoning. Default: 512. On non-Pro 2.5 models, 0 disables thinking (faster, cheaper) and the maximum is 24,576. Gemini 2.5 Pro cannot disable thinking: its range is 128 – 32,768. Increase to 2048–8192 for complex content. For 3.x models use Thinking Level instead.">
               Thinking Budget
             </Label>
-            {is25 ? (
-              <NumberInput
-                value={settings.thinkingBudget}
-                min={0}
-                max={32768}
-                onChange={(v) => set('thinkingBudget', v ?? 512)}
-                className="w-28"
-              />
+            {caps.thinking === 'budget' ? (
+              <>
+                <NumberInput
+                  value={settings.thinkingBudget}
+                  min={caps.thinkingBudgetMin}
+                  max={caps.thinkingBudgetMax}
+                  onChange={(v) => set('thinkingBudget', v ?? 512)}
+                  className="w-28"
+                />
+                <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
+                  Range for this model: {caps.thinkingBudgetMin} – {caps.thinkingBudgetMax.toLocaleString()}
+                  {caps.canDisableThinking ? ' (0 disables thinking)' : ' (cannot be disabled)'}.
+                </p>
+              </>
             ) : (
               <>
                 <TextInput disabled value="—" className="w-28" />
@@ -490,23 +698,63 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
 
         {/* Right: sampling */}
         <div className="space-y-5">
-          <div>
-            <Label tip={`Controls randomness (creativity). Lower = more literal. Higher = more natural-sounding. Range: 0.0 – 2.0. Default for ${is3x ? 'Gemini 3.x' : 'Gemini 2.x'}: ${is3x ? '1.0' : '0.3'}. Lower it if translations feel too creative; raise it if too robotic.`}>
-              Temperature
-            </Label>
-            <NumberInput value={settings.temperature} min={0} max={2} step={0.05} onChange={(v) => set('temperature', v ?? 1)} className="w-28" />
-          </div>
-          <div>
-            <Label tip={`Nucleus sampling — limits token candidates to the top P% by probability. Range: 0.0 – 1.0. Default for ${is3x ? 'Gemini 3.x' : 'Gemini 2.x'}: ${is3x ? '0.95' : '0.80'}. Works with Temperature. Leave at default unless you have a specific reason.`}>
-              Top-P
-            </Label>
-            <NumberInput value={settings.topP} min={0} max={1} step={0.05} onChange={(v) => set('topP', v ?? 0.95)} className="w-28" />
-          </div>
-          <div>
-            <Label tip="Limits candidate tokens considered at each step. Range: 1 – 100. Optional — leave empty to use the model's built-in default. Rarely needs changing for subtitle translation.">
-              Top-K
-            </Label>
-            <NumberInput value={settings.topK} min={1} max={100} allowEmpty onChange={(v) => set('topK', v)} placeholder="— model default —" className="w-40" />
+          <ToggleRow
+            label="Custom Generation Parameters"
+            desc="Override the model's own temperature / top-p / top-k defaults"
+            checked={settings.customGenerationParams}
+            onChange={(v) => set('customGenerationParams', v)}
+            tip={
+              'OFF (default, recommended): temperature, top-p and top-k are not sent at all, so each model uses the values Google tuned for it. This is what you want unless you have a specific reason.\n\n' +
+              'ON: the three values below are sent with every request. They apply to ALL models, including ones released after these defaults were chosen — a value that suits one generation can degrade another.\n\n' +
+              'Note: a value of exactly 0 cannot be sent (the engine treats it as "not set"), which is why the minimums below are above zero.'
+            }
+          />
+          <div className={settings.customGenerationParams ? '' : 'pointer-events-none opacity-50'}>
+            <div className="space-y-5">
+              <div>
+                <Label tip="Controls randomness (creativity). Lower = more literal. Higher = more natural-sounding. Range: 0.05 – 2.0. Typical: 1.0 for Gemini 3.x, 0.3 for 2.x. Lower it if translations feel too creative; raise it if too robotic. Exactly 0 cannot be sent — the engine would ignore it and silently use the model default.">
+                  Temperature
+                </Label>
+                <NumberInput
+                  value={settings.temperature}
+                  min={0.05}
+                  max={2}
+                  step={0.05}
+                  disabled={!settings.customGenerationParams}
+                  onChange={(v) => set('temperature', v ?? 1)}
+                  className="w-28"
+                />
+              </div>
+              <div>
+                <Label tip="Nucleus sampling — limits token candidates to the top P% by probability. Range: 0.05 – 1.0. Typical: 0.95 for Gemini 3.x, 0.80 for 2.x. Works with Temperature. Exactly 0 cannot be sent — the engine would ignore it and silently use the model default.">
+                  Top-P
+                </Label>
+                <NumberInput
+                  value={settings.topP}
+                  min={0.05}
+                  max={1}
+                  step={0.05}
+                  disabled={!settings.customGenerationParams}
+                  onChange={(v) => set('topP', v ?? 0.95)}
+                  className="w-28"
+                />
+              </div>
+              <div>
+                <Label tip="Limits candidate tokens considered at each step. Range: 1 – 100. Leave empty to use the model's built-in default. Rarely needs changing for subtitle translation.">
+                  Top-K
+                </Label>
+                <NumberInput
+                  value={settings.topK}
+                  min={1}
+                  max={100}
+                  allowEmpty
+                  disabled={!settings.customGenerationParams}
+                  onChange={(v) => set('topK', v)}
+                  placeholder="— model default —"
+                  className="w-40"
+                />
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -517,6 +765,7 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
 function SectionService({ settings, set }: SectionProps): React.JSX.Element {
   const modelLabel =
     settings.cachedModels.find((m) => m.id === settings.model)?.label ?? settings.model
+  const { slot: primarySlot, paid } = effectivePrimary(settings)
   return (
     <div className="max-w-xl space-y-5">
       <SectionTitle>Service</SectionTitle>
@@ -526,13 +775,33 @@ function SectionService({ settings, set }: SectionProps): React.JSX.Element {
         </Label>
         <Select value={settings.serviceTier} onChange={(v) => set('serviceTier', v)} options={SERVICE_TIERS} className="w-52" />
       </div>
-      <ToggleRow
-        label="Paid Quota"
-        desc="Disable free-tier rate limiting (paid plans only)"
-        checked={settings.paidQuota}
-        onChange={(v) => set('paidQuota', v)}
-        tip={paidQuotaTooltip(settings.model, modelLabel)}
-      />
+      <div>
+        <Label tip={paidQuotaTooltip(settings.model, modelLabel)}>Paid Quota</Label>
+        <div className="flex items-center gap-3">
+          <span
+            className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
+              paid
+                ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300'
+                : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300'
+            }`}
+          >
+            {paid ? 'ON — free-tier rate limiting disabled' : 'OFF — free-tier rate limiting applied'}
+          </span>
+        </div>
+        <p className="mt-1.5 text-xs text-gray-500 dark:text-gray-400">
+          {primarySlot == null
+            ? 'Add an API key to see which tier a run will use.'
+            : `Follows the tier set on Key ${primarySlot + 1}, the key this run sends as -k. `}
+          {primarySlot != null && (
+            <>
+              Change it in{' '}
+              <strong>Gemini API Keys</strong>. It is shown here rather than toggled, because the
+              engine is told which quota to assume by the key that is actually promoted — a
+              separate switch could only ever disagree with the run.
+            </>
+          )}
+        </p>
+      </div>
       <ToggleRow
         label="Disable Streaming"
         desc="Wait for the full batch response before saving"
@@ -598,9 +867,11 @@ function SectionAdvanced({ settings, set }: SectionProps): React.JSX.Element {
     <div className="max-w-2xl space-y-5">
       <SectionTitle>Advanced</SectionTitle>
       <div>
-        <Label tip="Path to the FFmpeg executable. Only needed for video/audio features: the Transcribe tab, the Video File field, and the Audio File field on the Translate tab. Not required for plain SRT translation.
+        <Label tip="Path to the FFmpeg executable. Only needed for video/audio features: the Transcribe tab, the Video File field, and the Audio File field on the Translate tab. Not required for plain subtitle translation.
 
-Leave empty (recommended) to use the FFmpeg bundled inside this app — no separate install required. If for some reason the bundled copy is missing, it then falls back to FFmpeg on your system PATH. Only set a path here to override the bundled copy with your own FFmpeg build (e.g. one with extra codecs or hardware acceleration); when set, that path is used directly.">
+Leave empty (recommended) to use the FFmpeg bundled inside this app — no separate install required. If for some reason the bundled copy is missing, it then falls back to FFmpeg on your system PATH. Only set a path here to override the bundled copy with your own FFmpeg build (e.g. one with extra codecs or hardware acceleration); when set, that path is used directly.
+
+Since engine 3.7.0, a missing FFmpeg no longer aborts operations that do not need it — fetching models and translating a subtitle file keep working, and only the audio/video features report the problem.">
           FFmpeg Path
         </Label>
         <div className="flex items-center gap-2">
@@ -626,6 +897,24 @@ Leave empty (recommended) to use the FFmpeg bundled inside this app — no separ
           placeholder="— use built-in default prompt —"
           className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 outline-none focus:border-brand focus:ring-1 focus:ring-brand dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 dark:placeholder:text-gray-500"
         />
+      </div>
+      <Divider />
+      <div>
+        <Label tip={`Lines of already-translated context replayed to the model when a job is RESUMED from a specific line. Default: ${DEFAULT_RESUME_CONTEXT_SIZE}. 0 sends no prior context. More context keeps names and tone consistent across the break, at the cost of extra input tokens on the first resumed batch.
+
+This setting has NO effect on a normal run — it applies only when a translation is resumed part-way through.`}>
+          Resume Context Size
+        </Label>
+        <NumberInput
+          value={settings.resumeContextSize}
+          min={0}
+          max={500}
+          onChange={(v) => set('resumeContextSize', v ?? DEFAULT_RESUME_CONTEXT_SIZE)}
+          className="w-28"
+        />
+        <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+          Only takes effect when resuming an interrupted job.
+        </p>
       </div>
       <Divider />
       <ToggleRow

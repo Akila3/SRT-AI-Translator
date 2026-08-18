@@ -5,7 +5,9 @@ import fs from 'fs'
 import { gstLanguageName } from '../shared/languages'
 import { envWithFfmpeg } from './ffmpeg'
 import { getSettings } from './store'
-import type { TranslateArgs, TranscribeArgs } from '../shared/types'
+import { orderKeySlots, type KeySlot } from '../shared/keyOrder'
+import { effectiveThinkingLevel, modelCapabilities } from '../shared/modelCaps'
+import { DEFAULT_RESUME_CONTEXT_SIZE, type TranslateArgs, type TranscribeArgs } from '../shared/types'
 
 let current: ChildProcessWithoutNullStreams | null = null
 
@@ -19,26 +21,96 @@ export function resolveGstBin(): string {
   return 'gst'
 }
 
+/**
+ * Resolve a bare executable name against the same PATH a spawned child would see.
+ * Only used for the startup log below — spawn does its own resolution.
+ */
+function resolveOnPath(name: string): string | null {
+  const env = envWithFfmpeg(getSettings().ffmpegPath)
+  const sep = process.platform === 'win32' ? ';' : ':'
+  const exts =
+    process.platform === 'win32'
+      ? (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
+      : ['']
+  for (const dir of (env.PATH ?? '').split(sep)) {
+    if (!dir) continue
+    for (const ext of exts) {
+      const candidate = path.join(dir, name + ext)
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate
+      } catch {
+        /* unreadable PATH entry */
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Log which `gst` binary this process will actually run.
+ *
+ * This is permanent by design. `resolveGstBin()` returns a bare `gst` unless packaged,
+ * and `envWithFfmpeg` deliberately APPENDS the bundled dir to PATH, so a globally pip
+ * installed engine silently wins in dev — which would make every dev-run test measure a
+ * different binary from the one that ships. Without this line, "which binary am I
+ * running" is unanswerable at runtime.
+ */
+export function logResolvedGstBin(): void {
+  const bin = resolveGstBin()
+  if (path.isAbsolute(bin)) {
+    console.log(`[gst] resolveGstBin() -> ${bin} (bundled, packaged build)`)
+    return
+  }
+  const resolved = resolveOnPath(bin)
+  console.log(
+    `[gst] resolveGstBin() -> "${bin}" (resolved via PATH to: ${resolved ?? 'NOT FOUND ON PATH'})`
+  )
+  if (resolved && !resolved.toLowerCase().includes(`${path.sep}resources${path.sep}bin${path.sep}`)) {
+    console.warn(
+      '[gst] WARNING: the resolved binary is not the bundled resources/bin copy. ' +
+        'Dev runs are exercising a different engine build than the one that ships.'
+    )
+  }
+}
+
 export function tempOutputPath(suffix = '.srt'): string {
   const dir = path.join(app.getPath('userData'), 'temp')
   fs.mkdirSync(dir, { recursive: true })
   return path.join(dir, `${Date.now()}${suffix}`)
 }
 
+export type SubtitleNormalizeResult = { ok: true; path: string } | { ok: false; error: string }
+
+/** Subtitle formats the engine accepts for `-i` (cli.py:114). */
+const SUBTITLE_EXTS = ['.srt', '.ass']
+
 /**
- * Normalize an SRT to plain UTF-8 (no BOM) before handing it to `gst`, which
- * opens its input with `encoding="utf-8"`. This guards against two failure
- * modes: a UTF-16/legacy-encoded file making gst raise UnicodeDecodeError, and
- * a BOM leaking into the first cue. Returns a converted temp copy when needed,
- * otherwise the original path unchanged.
+ * Normalize a subtitle file to plain UTF-8 (no BOM) before handing it to `gst`, which
+ * opens its input with `encoding="utf-8"`. Guards two failure modes: a UTF-16/legacy
+ * encoded file making gst raise UnicodeDecodeError, and a BOM leaking into the first cue.
+ *
+ * Invariants:
+ *  - The user's original file is NEVER modified. This returns either the input path
+ *    untouched or the path of a separate temp copy.
+ *  - The input's EXTENSION is preserved. The previous version hardcoded `.utf8.srt`, so
+ *    a converted `.ass` reached gst with an `.srt` name — gst then parses ASS content as
+ *    SRT and names the output `.srt` instead of `_translated.ass` (main.py:141-142 keys
+ *    off the extension). Corrupt output, no error.
+ *  - An ambiguous encoding is NOT guessed for `.ass`. The windows-1252/latin1 fallback
+ *    stays for `.srt` (preserving today's behaviour for the format it was written for),
+ *    but silently transcoding a styled format with a guessed code page mangles dialogue
+ *    AND non-ASCII style names with no signal, so ASS is refused with an actionable error.
  */
-export function ensureUtf8Srt(inputPath: string): string {
+export function ensureUtf8Subtitle(inputPath: string): SubtitleNormalizeResult {
   let buf: Buffer
   try {
     buf = fs.readFileSync(inputPath)
   } catch {
-    return inputPath
+    return { ok: true, path: inputPath }
   }
+
+  const ext = (path.extname(inputPath) || '.srt').toLowerCase()
+  const suffix = SUBTITLE_EXTS.includes(ext) ? ext : '.srt'
 
   let text: string
   if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
@@ -51,8 +123,17 @@ export function ensureUtf8Srt(inputPath: string): string {
     try {
       // Already valid, BOM-less UTF-8 — feed it straight through.
       new TextDecoder('utf-8', { fatal: true }).decode(buf)
-      return inputPath
+      return { ok: true, path: inputPath }
     } catch {
+      if (suffix === '.ass') {
+        return {
+          ok: false,
+          error:
+            'This .ass file is not UTF-8. Re-save it as UTF-8 (most subtitle editors offer ' +
+            '"Save as UTF-8") and try again. It was left untouched — guessing a legacy code page ' +
+            'would corrupt styled text and style names.'
+        }
+      }
       // Not UTF-8: assume a legacy Windows code page (covers most Latin SRTs).
       try {
         text = new TextDecoder('windows-1252').decode(buf)
@@ -63,26 +144,63 @@ export function ensureUtf8Srt(inputPath: string): string {
   }
 
   try {
-    const outPath = tempOutputPath('.utf8.srt')
+    const outPath = tempOutputPath(`.utf8${suffix}`)
     fs.writeFileSync(outPath, text, 'utf-8')
-    return outPath
+    return { ok: true, path: outPath }
   } catch {
-    return inputPath
+    return { ok: true, path: inputPath }
   }
 }
 
+/**
+ * Thinking flags for the chosen model, derived from the ONE shared capability helper.
+ *
+ * This used to be implemented twice — here and inline in SettingsPage — with different
+ * logic, which is exactly how the `-latest` bug survived: the UI offered a control the
+ * engine then ignored.
+ */
 function thinkingArgs(level: string, budget: number, model: string): string[] {
-  // "-latest" aliases currently resolve to a Gemini 3.x model, which uses
-  // thinking levels rather than a numeric budget.
-  const isGen3 = model.startsWith('gemini-3') || model.endsWith('-latest')
-  if (level === 'disabled') return ['--no-thinking']
-  if (isGen3) {
-    return ['--thinking-level', level]
+  const caps = modelCapabilities(model)
+  if (level === 'disabled' && caps.canDisableThinking) return ['--no-thinking']
+  if (caps.thinking === 'level') {
+    return ['--thinking-level', effectiveThinkingLevel(model, level)]
   }
-  if (model.startsWith('gemini-2.5')) {
-    return ['--thinking-budget', String(budget)]
+  if (caps.thinking === 'budget') {
+    const clamped = Math.min(caps.thinkingBudgetMax, Math.max(caps.thinkingBudgetMin, budget))
+    return ['--thinking-budget', String(clamped)]
   }
   return []
+}
+
+/**
+ * Emit --temperature / --top-p / --top-k only when the user has opted into custom
+ * generation parameters; otherwise omit them entirely so the model's own defaults apply
+ * (all three default to None in the engine and flow into GenerateContentConfig unchanged
+ * — main.py:100-112, 245-251).
+ *
+ * The zero trap: `cli.py` tests these with plain truthiness (lines 153-158), so a literal
+ * 0 is silently dropped. The UI clamps above zero; this skips-and-logs as a second line
+ * of defence rather than letting a user believe a 0 was applied.
+ */
+function generationParamArgs(a: {
+  customGenerationParams: boolean
+  temperature: number
+  topP: number
+  topK: number | null
+}): string[] {
+  if (!a.customGenerationParams) return []
+  const args: string[] = []
+  const push = (flag: string, value: number): void => {
+    if (!value) {
+      console.warn(`[gst] skipping ${flag} ${value}: the engine silently ignores a zero value`)
+      return
+    }
+    args.push(flag, String(value))
+  }
+  push('--temperature', a.temperature)
+  push('--top-p', a.topP)
+  if (a.topK != null) push('--top-k', a.topK)
+  return args
 }
 
 export interface SpawnHandlers {
@@ -91,26 +209,49 @@ export interface SpawnHandlers {
 }
 
 /**
+ * Describe each non-empty key slot with the validity/tier metadata stored for it.
+ *
+ * THE single place slot metadata is assembled in the main process. `modelsList` ranks
+ * the same descriptors to decide which keys are "active", and that answer must match the
+ * pair this file actually spawns with — if the two drifted, a model could be offered
+ * because a reserve key can see it and then 404 at spawn time.
+ *
+ * `apiKeyValid`/`apiKeyTiers` are index-aligned with `apiKeys`, so slot i is read
+ * directly; the indexOf fallback covers a caller passing a re-ordered/partial array.
+ */
+export function keySlotsFor(apiKeys: string[]): KeySlot[] {
+  const s = getSettings()
+  const slots: KeySlot[] = []
+  apiKeys.forEach((raw, i) => {
+    const k = (raw ?? '').trim()
+    if (!k) return
+    const idx = s.apiKeys?.[i]?.trim() === k ? i : (s.apiKeys ?? []).findIndex((x) => x?.trim() === k)
+    slots.push({
+      index: i,
+      valid: idx >= 0 ? s.apiKeyValid?.[idx] ?? null : null,
+      tier: idx >= 0 ? s.apiKeyTiers?.[idx] ?? 'free' : 'free'
+    })
+  })
+  return slots
+}
+
+/**
  * Order the provided keys so a known-valid key is always used as the primary
  * (-k), with valid keys first, unknown-status keys next, and known-invalid keys
  * dropped (kept only as a last resort if nothing else is available). Also reports
  * the effective primary key's tier so rate-limiting matches the key actually used.
+ *
+ * The ranking itself lives in `shared/keyOrder` so the Settings UI can label the exact
+ * same slots "primary / fallback / reserve" without re-deriving (and mis-deriving) it.
  */
 export function orderKeysByValidity(apiKeys: string[]): { keys: string[]; paid: boolean } {
-  const s = getSettings()
-  const entries = apiKeys
-    .map((k) => k.trim())
-    .filter((k) => k.length > 0)
-    .map((k) => {
-      const idx = s.apiKeys.indexOf(k)
-      const valid = idx >= 0 ? s.apiKeyValid?.[idx] ?? null : null
-      const tier = idx >= 0 ? s.apiKeyTiers?.[idx] ?? 'free' : 'free'
-      return { k, valid, tier }
-    })
-  const rank = (v: boolean | null): number => (v === true ? 0 : v === null ? 1 : 2)
-  const usable = entries.filter((e) => e.valid !== false)
-  const ordered = (usable.length ? usable : entries).slice().sort((a, b) => rank(a.valid) - rank(b.valid))
-  return { keys: ordered.map((e) => e.k), paid: (ordered[0]?.tier ?? 'free') === 'paid' }
+  const slots = keySlotsFor(apiKeys)
+  const ordered = orderKeySlots(slots)
+  const tierOf = new Map(slots.map((s) => [s.index, s.tier]))
+  return {
+    keys: ordered.map((i) => apiKeys[i].trim()),
+    paid: (tierOf.get(ordered[0]) ?? 'free') === 'paid'
+  }
 }
 
 export function buildTranslateArgs(a: TranslateArgs, outputPath: string): string[] {
@@ -127,9 +268,7 @@ export function buildTranslateArgs(a: TranslateArgs, outputPath: string): string
 
   args.push('-m', a.model)
   args.push('-b', String(a.batchSize))
-  args.push('--temperature', String(a.temperature))
-  args.push('--top-p', String(a.topP))
-  if (a.topK != null) args.push('--top-k', String(a.topK))
+  args.push(...generationParamArgs(a))
 
   args.push(...thinkingArgs(a.thinkingLevel, a.thinkingBudget, a.model))
 
@@ -153,7 +292,17 @@ export function buildTranslateArgs(a: TranslateArgs, outputPath: string): string
   if (a.resumeFrom && a.resumeFrom > 0) {
     args.push('-s', String(a.resumeFrom), '--resume')
   } else {
+    // Exactly one of --resume/--no-resume must always be present: without either, the
+    // engine falls back to an interactive stdin prompt, which would hang the UI (C22b).
     args.push('--no-resume')
+  }
+
+  // Ships DORMANT: the engine consults resume_context_size only when start_line > 1
+  // (main.py:718-719), i.e. on a resumed run. Emitted only when it differs from the
+  // engine default so argv stays clean for everyone who never touches it.
+  const resumeContext = a.resumeContextSize ?? DEFAULT_RESUME_CONTEXT_SIZE
+  if (resumeContext !== DEFAULT_RESUME_CONTEXT_SIZE) {
+    args.push('--resume-context-size', String(resumeContext))
   }
 
   args.push('--token-stats', '--skip-upgrade', '--no-colors')
@@ -181,6 +330,7 @@ export function buildTranscribeArgs(a: TranscribeArgs, outputPath: string): stri
   if (keys[0]) args.push('-k', keys[0])
 
   args.push('-m', a.model)
+  args.push(...generationParamArgs(a))
   args.push(...thinkingArgs(a.thinkingLevel, a.thinkingBudget, a.model))
   if (a.description?.trim()) args.push('-d', a.description.trim())
 
@@ -247,8 +397,19 @@ export interface StartTranslateResult {
 }
 
 export function startTranslate(a: TranslateArgs, handlers: SpawnHandlers): StartTranslateResult {
-  const outputPath = tempOutputPath('.srt')
-  const normalized: TranslateArgs = { ...a, inputFile: ensureUtf8Srt(a.inputFile) }
+  // The output must keep the input's format. gst decides how to WRITE the result from the
+  // output path's extension (main.py:141-142), so handing it a `.srt` name for an `.ass`
+  // job silently downgrades a styled subtitle to plain SRT.
+  const inExt = path.extname(a.inputFile).toLowerCase()
+  const outputPath = tempOutputPath(SUBTITLE_EXTS.includes(inExt) ? inExt : '.srt')
+
+  const norm = ensureUtf8Subtitle(a.inputFile)
+  if (!norm.ok) {
+    handlers.onOutput('stderr', norm.error)
+    handlers.onDone(-1, outputPath)
+    return { outputPath, logPaths: [] }
+  }
+  const normalized: TranslateArgs = { ...a, inputFile: norm.path }
   run(buildTranslateArgs(normalized, outputPath), outputPath, handlers)
 
   const logPaths: string[] = []

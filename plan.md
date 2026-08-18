@@ -171,18 +171,20 @@ Only **one** gst child runs at a time (`current` guard in `pythonBridge.ts`).
 
 ## 6. Translate workflow (`TranslatePage.tsx` + `pythonBridge.ts`)
 
-1. **Inputs:** SRT file (required) **or** a Video file (extract an embedded track) + optional Audio file (gender context). Languages (source incl. Auto Detect; target required). TMDB context (optional).
+1. **Inputs:** subtitle file — `.srt` or `.ass` (required) **or** a Video file (extract an embedded track) + optional Audio file (gender context). Languages (source incl. Auto Detect; target required). TMDB context (optional).
 2. **Persistence across tabs:** `App.tsx` keeps all pages **mounted** and toggles visibility with `hidden`, so inputs/TMDB selection survive tab switches. Language pickers seed from settings **once** (`langSeeded` ref) to avoid clobbering in-progress edits when Settings changes.
 3. **New SRT resets TMDB:** picking a new SRT clears `description` and bumps `tmdbResetKey` (remounts `TmdbSearch`, wiping its selection/cast).
 4. **Start:** if translating from a video track, `extractToTemp` runs ffmpeg first to get a temp `.srt`. Then `startTranslate(args)`.
-5. **UTF-8 normalization (`ensureUtf8Srt`)**: before spawning gst, the input SRT is sniffed (UTF-8 BOM / UTF-16 LE/BE / valid UTF-8 / Windows-1252 fallback) and rewritten to a clean BOM-less `*.utf8.srt` when needed. Output is already UTF-8 (gst opens output with `encoding="utf-8"`).
-6. **Arg building (`buildTranslateArgs`)**: `translate -i <utf8 input> -o <temp> -l <gstName> -k <primary> [-k2 <fallback>] [-a audio] -m <model> -b <batch> --temperature --top-p [--top-k] <thinking> [--service-tier] [--paid-quota] [--no-context] [--no-streaming] [-d "<desc>"] (--no-resume | -s N --resume) --token-stats --skip-upgrade --no-colors`.
+5. **UTF-8 normalization (`ensureUtf8Subtitle`)**: before spawning gst, the input is sniffed (UTF-8 BOM / UTF-16 LE/BE / valid UTF-8 / Windows-1252 fallback) and rewritten to a clean BOM-less temp copy when needed, **preserving the original extension** (`*.utf8.srt` / `*.utf8.ass`). A non-UTF-8 `.ass` is refused rather than transcoded from a guessed code page, which would mangle styling. The user's file is never modified. Output is already UTF-8 (gst opens output with `encoding="utf-8"`).
+6. **Arg building (`buildTranslateArgs`)**: `translate -i <utf8 input> -o <temp, same extension as input> -l <gstName> -k <primary> [-k2 <fallback>] [-a audio] -m <model> -b <batch> [--temperature --top-p [--top-k]] <thinking> [--service-tier] [--paid-quota] [--no-context] [--no-streaming] [-d "<desc>"] (--no-resume | -s N --resume) [--resume-context-size N] --token-stats --skip-upgrade --no-colors`.
    - Source language is folded into `-d` as `"Source language: <Name>. <desc>"` (no dedicated CLI flag).
-   - **Thinking (`thinkingArgs`)**: `disabled` → `--no-thinking`; gen-3 (`gemini-3*` or `*-latest`) → `--thinking-level <level>`; `gemini-2.5*` → `--thinking-budget <n>`; else nothing.
-7. **Key ordering (`orderKeysByValidity`)**: known-valid keys first, unknown next, known-invalid dropped (unless nothing else). Effective primary `-k`, next `-k2`. `--paid-quota` is derived from the **effective** primary key's tier.
+   - **Generation parameters** are emitted only when `customGenerationParams` is on; otherwise the model's own defaults apply. A zero is never emitted — the engine's truthiness check would silently drop it.
+   - **Thinking (`thinkingArgs`)** is derived from `shared/modelCaps.ts`, the single capability table shared with the UI: 3.x → `--thinking-level` (coerced exactly as the engine does); 2.5 → `--thinking-budget` clamped to that model's range; `--no-thinking` only where the engine honours it; 2.0/non-Gemini → nothing.
+   - `--resume-context-size` is emitted only when it differs from the engine default (50).
+7. **Key ordering (`orderKeysByValidity`)**: ranks slots via `shared/keyOrder.ts` — known-valid first, unknown next, known-invalid dropped (unless nothing else). Effective primary `-k`, next `-k2`; anything beyond is a reserve pool that is never passed to a run. `--paid-quota` is derived from the **effective** primary key's tier.
 8. **Spawn env**: `envWithFfmpeg(ffmpegPath, { PYTHONUNBUFFERED:1, PYTHONUTF8:1, PYTHONIOENCODING:utf-8 })`.
 9. **Streaming (`useRunner`)**: parses `cur/total` and `NN%` for the progress bar; lines containing `total … token` populate the token-stats footer; sets `done` on exit 0, else `error` with exit code.
-10. **Save:** `Save Subtitles…` → `saveFile` copies temp output to `<base>_<tgtLang>.srt` (defaults to Output Folder or source dir).
+10. **Save:** `Save Subtitles…` → `saveFile` copies temp output to `<base>_<tgtLang>.<srt|ass>` — the extension follows the format the engine actually produced (defaults to Output Folder or source dir).
 
 ---
 
@@ -206,20 +208,24 @@ Only **one** gst child runs at a time (`current` guard in `pythonBridge.ts`).
 
 ## 9. Model management (`modelsList.ts` + `store.ts`)
 
-- **`DEFAULT_MODELS`**: 3 "latest" aliases (`gemini-flash-lite-latest`, `gemini-flash-latest`, `gemini-pro-latest`) + core versioned (`3.5-flash`, `3.1-flash-lite`, `3.1-pro`, `2.5-flash`, `2.5-flash-lite`, `2.5-pro`). Default model = `gemini-flash-lite-latest`.
-- **`buildModelList(rawIds)`**: always includes the 3 latest aliases (label shows resolved version, e.g. *"Gemini Flash Lite Latest (3.1)"* via `latestVersion` + `FAMILY_FLOOR`) and core models; additionally keeps fetched flash/flash-lite/pro at **v3.0+**; drops anything `<3`, non-translation families, and previews not newer than the latest released in their tier. Friendly labels via `friendlyLabel` (e.g. `gemini-3.1-flash-lite` → "Gemini Flash Lite 3.1").
-- **`refreshModels(apiKey)`**: `gst list-models -k <key>` (env forces UTF-8 + `NO_COLOR`). Regex-extracts `gemini-…` ids, filters out embedding/tts/vision/robotics/etc. Empty result → keep `DEFAULT_MODELS` + `friendlyError(out)`.
+- **No aliases anywhere.** The invented `*-latest` ids are filtered out of the seed, the cache and the fetch path: Google does not publish them, so the engine rejects them outright, and even a real one would defeat its thinking-config substring match.
+- **`DEFAULT_MODELS`**: display-only seed of real versioned ids (`3.5-flash`, `3.1-flash-lite`, `3.1-pro`, `2.5-flash`, `2.5-flash-lite`, `2.5-pro`), each marked `source: 'seed'`. Static fallback `DEFAULT_MODEL_ID = gemini-3.1-flash-lite`; the live rule supersedes it on the first successful refresh.
+- **`buildModelList(rawIds, availability)`**: curates and sorts by a **version tuple** (`3.10 > 3.9`; never `parseFloat`). Previews are always offered and marked, never auto-selected. Each entry records `source: 'live' | 'seed'` and `availableOn` — the key slots that actually returned it.
+- **`refreshModels(apiKey)`**: `gst list-models -k <key> --skip-upgrade` (env forces UTF-8 + `NO_COLOR`). Returns the raw ids that key reported, never a curated list — availability decisions must rest on what the API said, not on display filtering.
 - **`friendlyError`**: maps raw dumps to messages for invalid key / 403 / quota-429 / network.
-- **`checkApiKeys(keys)`**: validates each non-empty key individually (`refreshModels` per key); models from the first valid key; returns per-key `{valid,error}` for the ✓/✗ UI.
-- Model-aware UI: 3.x shows Thinking Level; 2.5 shows Thinking Budget; switching model auto-sets temperature/top-p defaults.
+- **`checkApiKeys(keys)`**: validates every non-empty key and keeps EACH one's list. `summarizeRefresh` derives the union, the runnable intersection over the active set, and a `refreshOutcome` of `allComplete | activeComplete | partial | failed`.
+- **Selection rules** (`applyModelSelectionRules`, `ipc.ts`): a refresh may change the stored model in exactly three cases — fresh install, proven absence (only on `allComplete` with a non-empty union), and auto-advance to a newer default (at the `activeComplete` bar). Everything else is preserved; a model present in the union but not on every active key warns rather than resets.
+- **`guardModelForSpawn`**: pre-spawn check that blocks only on positive evidence of absence and warns when availability is unknown.
+- Model-aware UI: all three consumers (`thinkingArgs`, Settings, Transcribe) read `shared/modelCaps.ts`, so the UI cannot offer a combination the engine will silently override.
 
 ---
 
 ## 10. API key UX (`SettingsPage.tsx`)
 
-- Up to 5 keys; each row: masked input + eye toggle + Free/Paid selector + remove.
-- "Fetch Models & Check API Keys" → `checkApiKeys`; shows per-key ✓/✗ (persisted), a "Primary key tier" badge, "X of Y keys valid — N models", and a note if the first key is invalid (translations auto-promote first valid key).
-- Tier is **manual** (Google's API doesn't expose billing tier).
+- Up to 5 keys; each row: masked input + eye toggle + ✓/✗ status + **role badge** (Primary `-k` / Fallback `-k2` / Reserve) + Free/Paid selector + remove. Roles come from the same `shared/keyOrder.ts` ranking the spawn path uses, so the labels cannot disagree with what a run does. The renderer works from slot indices only and never handles key material.
+- Copy states plainly that only **two** keys are passed per run and that the rest are a reserve pool promoted on invalidity — not extra parallel quota.
+- "Fetch Models & Check API Keys" → `checkApiKeys`; shows per-key ✓/✗ (persisted), a "Primary key tier" badge, "X of Y keys valid — N models", which keys the next run will use, which slots could not be checked, and any model change the selection rules made.
+- Tier is **manual** (Google's API doesn't expose billing tier). Rate-limit figures are presented as approximate, note that quota is per Google Cloud **project** rather than per key, and link to Google's live table.
 
 ---
 
@@ -234,9 +240,32 @@ Only **one** gst child runs at a time (`current` guard in `pythonBridge.ts`).
 
 ## 12. Python bundling & `gst` resolution
 
-- **Build**: `scripts/build_python.py` runs PyInstaller `--onefile --name gst --collect-all gemini_srt_translator --copy-metadata gemini-srt-translator scripts/gst_entry.py` → `resources/bin/gst[.exe]`. Entry shim imports `gemini_srt_translator.cli.main` to preserve package context. **PyInstaller does not cross-compile** — build each OS on that OS.
+### 12.0 Pinned engine version
+
+| Item | Value |
+|---|---|
+| Engine shipped before this upgrade | **`gemini-srt-translator` 3.5.8** |
+| Engine shipped from this upgrade on | **`gemini-srt-translator` 3.7.0** |
+| Build interpreter | Python 3.14.6 (`C:\Program Files\Python314\python.exe`) |
+| Freezer | `pyinstaller==6.22.1` |
+| Reproducibility record | `scripts/build-python-requirements.lock` (committed) |
+
+The 3.5.8 baseline was established by three independent CLI probes of the frozen
+`resources/bin/gst.exe` (19.7 MB, frozen 2026-07-01), so it never has to be re-derived:
+
+- `gst extract --help` showed `--srt` and **not** `--subtitle` ⇒ predates 3.7.0.
+- `gst list-models --help` had **no** `--skip-upgrade` ⇒ predates 3.6.2.
+- `gst translate --help` had **no** `--resume-context-size` ⇒ predates 3.6.0.
+
+Corroborated by `Source Codes/gemini-srt-translator-3.5.8.zip` (dated 2026-06-29).
+The 3.5.8 executable is preserved for instant rollback at
+`C:\Projects\_Backups\gst-3.5.8.exe`, alongside the pre-upgrade source snapshot and the
+git tag `v1.0.0-pre-3.7.0`.
+
+- **Build**: `scripts/build_python.py` runs PyInstaller `--onefile --name gst --collect-all gemini_srt_translator --collect-all pysubs2 --collect-all google.genai --copy-metadata gemini-srt-translator --copy-metadata pysubs2 --copy-metadata google-genai scripts/gst_entry.py` → `resources/bin/gst[.exe]`. Entry shim imports `gemini_srt_translator.cli.main` to preserve package context. **PyInstaller does not cross-compile** — build each OS on that OS.
+- **Isolated build env**: the engine is installed into `.venv-build/` (git-ignored) and **never** onto the ambient PATH. A global pip install would make `npm run dev` resolve bare `gst` to the pip package instead of the shipped binary, invalidating every dev-run test (see §13.2 and the startup log below).
 - **Packaging**: `electron-builder` `extraResources` copies `resources/bin/{gst*,ffmpeg*,ffprobe*}` → app `resources/bin`.
-- **Runtime resolution (`resolveGstBin`)**: packaged → absolute `resources/bin/gst.exe`; dev → bare `gst` from PATH (the pip install).
+- **Runtime resolution (`resolveGstBin`)**: packaged → absolute `resources/bin/gst.exe`; dev → bare `gst` from PATH (the pip install). `logResolvedGstBin()` runs at startup and prints the path that bare name actually resolves to, so "which engine did this session run" is always answerable — a dev run silently exercising a different build would invalidate any conclusion drawn from it.
 - **FFmpeg resolution (`resolveTool`)**: explicit Settings path → bundled `resources/bin` → system PATH.
 
 ---
@@ -246,9 +275,12 @@ Only **one** gst child runs at a time (`current` guard in `pythonBridge.ts`).
 1. **`charmap` crash on non-Latin output (Hebrew):** Windows Python defaults stdio to cp1252. Fixed by forcing `PYTHONUTF8=1` (+`PYTHONIOENCODING=utf-8`) on every gst spawn. Verified: under this env, stdout/stderr/locale all resolve to utf-8.
 2. **PATH shadowing:** `resources/bin` contains **both** ffmpeg and `gst.exe`. Originally we *prepended* it to PATH so gst could find ffmpeg — which made `spawn('gst')` resolve to the **frozen** `gst.exe` (which ignores `PYTHONUTF8`) instead of the pip gst, re-triggering the charmap crash. **Fix:** `envWithFfmpeg` now **appends** the bin dir (`[base, ...dirs]`), so the intended `gst` wins while ffmpeg stays discoverable. (Packaged builds resolve gst by absolute path, so unaffected.)
    - **Open risk for packaged builds:** the frozen `gst.exe` is used in production and *may* not honor `PYTHONUTF8`. Verify a Hebrew translation in a packaged build; if it recurs, add a UTF-8 runtime hook to the PyInstaller build.
-3. **Defensive input encoding:** `ensureUtf8Srt` converts any input SRT to clean UTF-8 before translating (guards UTF-16/Windows-1252 inputs from `UnicodeDecodeError`).
-4. **gst `list-models` flags:** it does NOT accept `--no-colors`/`--skip-upgrade`; use `NO_COLOR=1` env instead. (translate/transcribe DO accept those flags.)
-5. **gst hard-exits if ffmpeg missing** even on `list-models` — that's why ffmpeg must be on the child PATH.
+3. **Defensive input encoding:** `ensureUtf8Subtitle` converts a non-UTF-8 input to a clean UTF-8 temp copy before translating (guards UTF-16/Windows-1252 inputs from `UnicodeDecodeError`), keeping the original extension. It refuses a non-UTF-8 `.ass` instead of guessing a code page. The user's file is never modified.
+4. **gst `list-models` flags:** 3.6.2 added `--skip-upgrade`, which is now used instead of the old trick of writing `n\n` to stdin to answer the blocking upgrade prompt. `--no-colors` is still not accepted there; use `NO_COLOR=1` env. (translate/transcribe accept both.)
+5. **ffmpeg on the child PATH:** 3.5.8 hard-exited without ffmpeg even on `list-models`. 3.7.0 no longer does, but ffmpeg is still required for every audio/video path, so it stays on the child PATH.
+6. **Never `parseFloat` a model version.** `parseFloat('3.10') === 3.1`, so a two-digit minor sorts below `3.9` and "newest flash-lite" silently picks the older model. Compare the `{major, minor}` tuple via `compareVersions`.
+7. **`-latest` aliases are fabricated, not real.** Injecting them produced ids Google does not publish (engine `exit(1)`), and they also defeat the engine's thinking-config substring match. They are filtered from the seed, the cache and the fetch.
+8. **A migration cannot prove a model is gone.** It runs offline at store load. Only an `allComplete` refresh is allowed to replace a user's model; a migration may at most flag it.
 
 ---
 
@@ -263,7 +295,8 @@ Only **one** gst child runs at a time (`current` guard in `pythonBridge.ts`).
 
 ## 15. Build & distribution
 
-- Scripts: `dev` (electron-vite dev), `build` (build only), `build:win` (`electron-vite build && electron-builder --win`), `build:python`, `build:dir`.
+- Scripts: `dev` (electron-vite dev), `build` (build only), `build:win` (`electron-vite build && electron-builder --win`), `build:python`, `build:dir`, `typecheck`, `test:gates`.
+- **`npm run test:gates`** runs the migration/model/argv/encoding gate suite (`scripts/gates/`). It bundles the real main-process modules with esbuild (already a Vite dependency) and stubs only `electron` and `electron-store`, so a gate cannot pass against a stale copy of the logic. Run it after any change to migrations, model selection, key ranking or argument building.
 - `electron-builder` config (in `package.json`): `appId com.srtai.translationui`, `productName "SRT AI Translator"`, win target **`zip`** (portable), `signAndEditExecutable:false`, artifact `${productName}-${version}-portable.${ext}`, `asar:true`, extraResources as above.
 - **Portable output:** `release\SRT AI Translator-1.0.0-portable.zip` (~190 MB) and `release\win-unpacked\` (contains `SRT AI Translator.exe` + `resources/bin/{gst,ffmpeg,ffprobe}.exe`). Unzip-and-run; no install, no Python.
 - **Build gotcha:** the unsigned `gst.exe` can be transiently locked by Windows Defender during zipping (`process cannot access the file`). Re-running `npx electron-builder --win` succeeds once the scan releases it.
@@ -282,5 +315,25 @@ Only **one** gst child runs at a time (`current` guard in `pythonBridge.ts`).
 ## 17. Known open items / backlog
 
 - Verify Hebrew (and other non-Latin) translation in a **packaged** build (frozen `gst.exe` + `PYTHONUTF8` caveat, §13.2).
-- `resumeFrom`/`--resume` plumbing exists in args but there is no UI to resume an interrupted job yet.
+- `resumeFrom`/`--resume` plumbing exists in args but there is no UI to resume an interrupted job yet. `resumeContextSize` therefore ships **dormant**: it is persisted and emitted, but changes nothing until a resume happens, and the Settings label says so.
+- A permanently dead key slot makes `allComplete` unreachable, so a genuinely withdrawn model stays selected indefinitely. Deliberate (overrides must survive) and non-fatal — auto-advance still works, the pre-spawn guard explains the failure, and the key list shows which slot is failing.
 - macOS/Linux bundled binaries not yet produced (PyInstaller must run per-OS).
+
+### 17.1 Verification status of the 3.7.0 upgrade
+
+Automated and green (`npm run typecheck`, `npm run test:gates` — 130 checks):
+migration fixtures F1-F9, version-tuple ordering and default selection, refresh-outcome
+classification, the three-case selection rule, the pre-spawn guard, key ranking, argv
+construction (keys, thinking, generation parameters, resume flags), and subtitle
+normalisation including the ASS encoding rules.
+
+Still requires a human with a real API key and a packaged build — these cannot be
+automated here and must be run before release:
+
+| Check | Why it cannot be automated here |
+|---|---|
+| A1-A5 engine probes on `resources/bin/gst.exe` | Needs the rebuilt binary and a live key |
+| A6 startup binary log | Implemented (`logResolvedGstBin`); read it once in `npm run dev` |
+| B1-B4 probes, incl. B3 persistence | Needs live fetches; enable with `SRT_DEBUG_MODELS=1` |
+| C20/C21 ASS + embedded-track round trip | Needs the engine to actually translate a file |
+| D1-D2 packaged build, Hebrew output | Needs `npm run build:win` and a manual run |

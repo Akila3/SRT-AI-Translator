@@ -18,7 +18,8 @@ import { useRunner } from '../lib/useRunner'
 import type { SubtitleTrack, TranslateArgs } from '../../electron/shared/types'
 
 const VIDEO_FILTERS = [{ name: 'Video', extensions: ['mp4', 'mkv', 'mov', 'avi', 'webm', 'm4v', 'ts'] }]
-const SRT_FILTERS = [{ name: 'Subtitles', extensions: ['srt'] }]
+// 3.7.0 swapped the engine's parser to pysubs2, which reads and writes ASS as well as SRT.
+const SUBTITLE_FILTERS = [{ name: 'Subtitles', extensions: ['srt', 'ass'] }]
 const AUDIO_FILTERS = [
   { name: 'Audio/Video', extensions: ['mp3', 'aac', 'wav', 'm4a', 'flac', 'mp4', 'mkv'] }
 ]
@@ -108,7 +109,7 @@ export default function TranslatePage(): React.JSX.Element {
       inputFile = res.path
     }
     if (!inputFile) {
-      setStartError('Provide an SRT file, or a video with a selectable text track.')
+      setStartError('Provide a subtitle file (.srt or .ass), or a video with a selectable text track.')
       return
     }
 
@@ -122,6 +123,7 @@ export default function TranslatePage(): React.JSX.Element {
       apiKeys: cfg.apiKeys,
       batchSize: cfg.batchSize,
       batchContext: cfg.batchContext,
+      customGenerationParams: cfg.customGenerationParams,
       temperature: cfg.temperature,
       topP: cfg.topP,
       topK: cfg.topK,
@@ -143,7 +145,10 @@ export default function TranslatePage(): React.JSX.Element {
   async function handleSave(): Promise<void> {
     if (!state.outputPath) return
     const base = (srtFile || videoFile || 'subtitle').replace(/\.[^.]+$/, '')
-    const name = `${base.split(/[\\/]/).pop()}_${tgtLang}.srt`
+    // Keep the format the engine actually produced. It writes according to the output
+    // path's extension, so proposing ".srt" for an ASS job would mislabel the file.
+    const ext = /\.ass$/i.test(state.outputPath) ? '.ass' : '.srt'
+    const name = `${base.split(/[\\/]/).pop()}_${tgtLang}${ext}`
     const saved = await window.api.saveFile({
       srcPath: state.outputPath,
       defaultName: name,
@@ -159,14 +164,14 @@ export default function TranslatePage(): React.JSX.Element {
         <BoxTitle>Input Files</BoxTitle>
         <div className="space-y-4">
           <div>
-            <Label tip="The .srt subtitle file you want to translate. This is the only required input for basic translation — no video or audio needed. If you have a video file instead, use the Video File field below to extract subtitles from it.">
-              SRT File
+            <Label tip="The subtitle file you want to translate — .srt or .ass. This is the only required input for basic translation: no video or audio needed. An .ass file keeps its styling and is saved back as .ass. If you have a video file instead, use the Video File field below to extract subtitles from it. Subtitle files must be UTF-8; a non-UTF-8 .srt is converted automatically, while a non-UTF-8 .ass is refused rather than risk mangling its styling.">
+              Subtitle File (.srt / .ass)
             </Label>
             <FilePicker
               value={srtFile}
               placeholder="Required (unless Video File is provided)"
               onPick={async () => {
-                const p = await window.api.openFile(SRT_FILTERS)
+                const p = await window.api.openFile(SUBTITLE_FILTERS)
                 if (!p) return
                 setSrtFile(p)
                 // Loading a new SRT invalidates the prior TMDB context.

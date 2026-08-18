@@ -2,10 +2,12 @@ node_modules/
 out/
 release/
 dist/
+.venv-build/
 resources/bin/
 .cursor/
 Source Codes/
 *.log
+*.tsbuildinfo
 .DS_Store
 .vite/
 build/python/

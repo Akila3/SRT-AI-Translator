@@ -4,18 +4,32 @@ import path from 'path'
 import { getSettings, setSettings, store } from './store'
 import { probeTracks, extractTrack } from './ffmpeg'
 import { tmdbSearch, tmdbCast } from './tmdb'
-import { refreshModels, buildModelList, checkApiKeys } from './modelsList'
+import {
+  refreshModels,
+  buildModelList,
+  checkApiKeys,
+  guardModelForSpawn,
+  resolveDefaultModel,
+  resolveDefaultModelWithBasis,
+  summarizeRefresh,
+  type ModelAvailability
+} from './modelsList'
 import {
   startTranslate,
   startTranscribe,
   stopCurrent,
   isRunning,
-  tempOutputPath
+  tempOutputPath,
+  keySlotsFor
 } from './pythonBridge'
+import { activeKeySlots } from '../shared/keyOrder'
 import type {
   TranslateArgs,
   TranscribeArgs,
-  AppSettings
+  AppSettings,
+  ModelInfo,
+  RefreshOutcome,
+  SlotFetchResult
 } from '../shared/types'
 
 let win: BrowserWindow | null = null
@@ -27,6 +41,137 @@ function send(channel: string, payload: unknown): void {
   win?.webContents.send(channel, payload)
 }
 
+export interface SingleKeyRefreshScope {
+  /** One entry per configured slot, so completeness is judged over the real key set. */
+  slots: SlotFetchResult[]
+  activeSlots: number[]
+  /** False when the supplied key is not one of the configured slots — display only. */
+  authoritative: boolean
+}
+
+/**
+ * Describe a one-key refresh in terms of the user's CONFIGURED slots.
+ *
+ * The subtlety is the unknown-key case. Building a lone `slot 0` descriptor for a key the
+ * user has not saved makes the summary read `allComplete`, which is the strongest evidence
+ * bar in the system — the one that authorises deleting a model selection. Nothing about
+ * asking a stranger's key justifies that, so the scope is marked non-authoritative and the
+ * caller must not persist or apply anything from it.
+ */
+export function singleKeyRefreshScope(
+  configured: string[],
+  apiKey: string,
+  ids: string[]
+): SingleKeyRefreshScope {
+  const slotIndex = configured.findIndex((k) => (k ?? '').trim() === apiKey.trim())
+  if (slotIndex === -1) {
+    return { slots: [{ slot: 0, queried: true, ok: true, ids }], activeSlots: [0], authoritative: false }
+  }
+  // Every OTHER configured key is recorded as queried-but-unanswered, because that is the
+  // truth: this handler asked exactly one key. Claiming `allComplete` from a single answer
+  // while other keys are configured would let one key's list authorise a destructive reset
+  // of a model the untested keys can still see.
+  return {
+    slots: configured.map((k, i) => ({
+      slot: i,
+      queried: !!(k ?? '').trim(),
+      ok: i === slotIndex,
+      ids: i === slotIndex ? ids : []
+    })),
+    activeSlots: activeKeySlots(keySlotsFor(configured)),
+    authoritative: true
+  }
+}
+
+export interface ModelSelectionOutcome {
+  /** The model the app should now have selected (unchanged unless a rule fired). */
+  model: string
+  /** Non-empty when the user must be told something about that selection. */
+  notice: string
+  /** True when a rule changed the stored selection. */
+  changed: boolean
+}
+
+/**
+ * The three — and ONLY three — situations in which a refresh may touch the stored model.
+ * Everything else leaves the user's choice alone; a refresh otherwise only ADDS models.
+ *
+ * Each case is gated on a different refresh outcome because each carries a different
+ * consequence. Reads as a single function so the evidence bar for the one destructive
+ * case can be checked in one place rather than inferred from scattered conditions.
+ */
+export function applyModelSelectionRules(
+  stored: string,
+  prevCached: ModelInfo[],
+  next: { models: ModelInfo[]; unionIds: string[]; runnableIds: string[]; outcome: RefreshOutcome }
+): ModelSelectionOutcome {
+  const runnable = next.models.filter((m) => next.runnableIds.includes(m.id))
+  const newDefault = resolveDefaultModel(runnable)
+  const verified = next.outcome === 'allComplete' || next.outcome === 'activeComplete'
+
+  // 1. Nothing to protect.
+  if (!stored) {
+    return newDefault
+      ? { model: newDefault, notice: '', changed: true }
+      : { model: stored, notice: '', changed: false }
+  }
+
+  // 2. PROVEN absent — the only destructive case, so the bar is the strictest one:
+  // every configured slot answered, and the id is in none of their lists. A non-empty
+  // union is required because an "allComplete" refresh that returned nothing is a bug,
+  // not evidence that every model was withdrawn.
+  const provenAbsent =
+    next.outcome === 'allComplete' &&
+    next.unionIds.length > 0 &&
+    !next.unionIds.includes(stored)
+  if (provenAbsent && newDefault) {
+    return {
+      model: newDefault,
+      notice: `"${stored}" is no longer offered by your API key(s); switched to the newest available model.`,
+      changed: true
+    }
+  }
+
+  // 3. Auto-advance. Gated on activeComplete, NOT allComplete: an unused reserve key going
+  // stale is an expected steady state, and letting it veto this would permanently freeze
+  // everyone on an old model.
+  //
+  // The `basis` check is what keeps this from eating a deliberate override: if the
+  // previous list contained no flash-lite or flash at all, its "default" was just the
+  // newest of whatever was there, and matching against it would prove nothing about
+  // whether the user had chosen that model on purpose.
+  const prevRunnable = prevCached.filter((m) => m.source === 'live')
+  const prev = resolveDefaultModelWithBasis(prevRunnable.length ? prevRunnable : prevCached)
+  const prevWasRealDefault = prev.basis === 'flash-lite' || prev.basis === 'flash'
+  if (verified && newDefault && prevWasRealDefault && stored === prev.id && newDefault !== stored) {
+    return {
+      model: newDefault,
+      notice: `A newer model is available — switched to ${newDefault}.`,
+      changed: true
+    }
+  }
+
+  // Present somewhere, but not on every key this run may use. The model demonstrably
+  // exists, so this is a warning, never a reset.
+  if (verified && next.unionIds.includes(stored) && !next.runnableIds.includes(stored)) {
+    return {
+      model: stored,
+      notice: `"${stored}" is not available on every API key this run may use. If the engine switches keys mid-run, it may fail.`,
+      changed: false
+    }
+  }
+
+  if (next.outcome === 'partial' || next.outcome === 'failed') {
+    return {
+      model: stored,
+      notice: 'Some API keys could not be checked — showing the last known model list.',
+      changed: false
+    }
+  }
+
+  return { model: stored, notice: '', changed: false }
+}
+
 export function registerIpc(): void {
   // ---- Settings ----
   ipcMain.handle('settings:get', () => getSettings())
@@ -34,29 +179,129 @@ export function registerIpc(): void {
 
   // ---- Models ----
   ipcMain.handle('models:getCached', () => {
-    // Re-curate cached ids through the current rules so older caches get the
-    // corrected friendly names / filtering without forcing a re-fetch.
-    const cached = (store.get('cachedModels') as { id: string }[]) || []
-    const models = buildModelList(cached.map((m) => m.id))
+    // Re-curate cached ids through the current rules so older caches get the corrected
+    // friendly names / filtering without forcing a re-fetch. Provenance is fed back in so
+    // re-curation never upgrades a seed entry into a "live" one, nor forgets which key
+    // slots reported a live one.
+    const cached = (store.get('cachedModels') as ModelInfo[]) || []
+    const availability: ModelAvailability = {}
+    for (const m of cached) {
+      if (m?.source === 'live' && Array.isArray(m.availableOn) && m.availableOn.length) {
+        availability[m.id] = m.availableOn
+      }
+    }
+    const models = buildModelList(cached.map((m) => m.id), availability)
     return { models, updatedAt: store.get('modelsUpdatedAt') }
   })
+
+  // Single-key refresh (kept for callers that only have one key at hand). The list is
+  // curated from that one key's ids, so everything it reports is available on that slot
+  // and the runnable set is simply that list.
   ipcMain.handle('models:refresh', async (_e, apiKey: string) => {
-    const { models, keyValid, error } = await refreshModels(apiKey)
+    const { ids, keyValid, error } = await refreshModels(apiKey)
     const updatedAt = new Date().toISOString()
-    if (keyValid) setSettings({ cachedModels: models, modelsUpdatedAt: updatedAt })
-    return { models, updatedAt, keyValid, error }
+    if (!keyValid) return { models: [], updatedAt, keyValid, error, notice: '' }
+
+    const s = getSettings()
+    const prevCached = (s.cachedModels as ModelInfo[]) ?? []
+    const configured = s.apiKeys ?? []
+    const scope = singleKeyRefreshScope(configured, apiKey, ids)
+    const summary = summarizeRefresh(scope.slots, scope.activeSlots)
+
+    // A key that is not one of the configured slots speaks for nobody: none of the user's
+    // own keys were asked, so this list is display material only. Persisting it — or
+    // letting it run the selection rules — would let an arbitrary caller-supplied key
+    // authorise a "proven absent" reset of a model every configured key can still see.
+    if (!scope.authoritative) {
+      return { models: summary.models, updatedAt, keyValid, error, notice: '' }
+    }
+
+    const sel = applyModelSelectionRules(s.model, prevCached, {
+      models: summary.models,
+      unionIds: summary.unionIds,
+      runnableIds: summary.runnableIds,
+      outcome: summary.refreshOutcome
+    })
+    const verified =
+      summary.refreshOutcome === 'allComplete' || summary.refreshOutcome === 'activeComplete'
+
+    const patch: Partial<AppSettings> = {}
+    if (verified && summary.models.length > 0) {
+      patch.cachedModels = summary.models
+      patch.modelsUpdatedAt = updatedAt
+    }
+    if (sel.changed) patch.model = sel.model
+    if (verified && summary.unionIds.includes(sel.model)) patch.modelNeedsVerification = false
+    setSettings(patch)
+
+    return { models: summary.models, updatedAt, keyValid, error, notice: sel.notice }
   })
 
-  // Validate every provided key individually; model list comes from the first valid one.
+  // Validate EVERY provided key and keep each one's answer. The model list is the union,
+  // annotated with which slots reported each id; `runnableIds` is the subset available on
+  // every active-set key, which is what the picker may safely default to.
   ipcMain.handle('models:checkKeys', async (_e, keys: string[]) => {
-    const { results, models, anyValid } = await checkApiKeys(keys)
+    const res = await checkApiKeys(keys)
     const updatedAt = new Date().toISOString()
-    setSettings({
-      apiKeyValid: results.map((r) => r.valid),
-      apiKeyError: results.map((r) => r.error)
+
+    // Per-slot fetch diagnostics for the B3 persistence probe. Debug-gated rather than
+    // deleted: it is the only way to see which key answered when a refresh comes back
+    // partial, but it is per-key detail that should not run in production. Enable with
+    // SRT_DEBUG_MODELS=1. Prints slot INDICES and counts only — never key material.
+    if (process.env.SRT_DEBUG_MODELS) {
+      for (const s of res.slots) {
+        console.log(`[models] slot ${s.slot}: queried=${s.queried} ok=${s.ok} ids=${s.ids.length}`)
+      }
+      console.log(
+        `[models] outcome=${res.refreshOutcome} activeSlots=[${res.activeSlots.join(',')}] ` +
+          `union=${res.unionIds.length} runnable=${res.runnableIds.length} ` +
+          `persisted=${res.models.length > 0}`
+      )
+    }
+
+    // The previous cache must be read BEFORE the write below: the auto-advance rule
+    // compares the stored model against the PREVIOUS list's default.
+    const prevCached = (getSettings().cachedModels as ModelInfo[]) ?? []
+    const sel = applyModelSelectionRules(getSettings().model, prevCached, {
+      models: res.models,
+      unionIds: res.unionIds,
+      runnableIds: res.runnableIds,
+      outcome: res.refreshOutcome
     })
-    if (anyValid) setSettings({ cachedModels: models, modelsUpdatedAt: updatedAt })
-    return { results, models, updatedAt, anyValid }
+
+    const patch: Partial<AppSettings> = {
+      apiKeyValid: res.results.map((r) => r.valid),
+      apiKeyError: res.results.map((r) => r.error)
+    }
+    // Overwrite the cache ONLY at the activeComplete bar. On a partial or failed refresh
+    // the union is missing whatever the failed key alone could see, so writing it would
+    // quietly delete real models from the picker — and, because the pre-spawn guard reads
+    // this cache, could then block a selection that a transient network error caused to
+    // "disappear". The last known good list stays, marked stale in the UI instead.
+    const verified = res.refreshOutcome === 'allComplete' || res.refreshOutcome === 'activeComplete'
+    if (verified && res.models.length > 0) {
+      patch.cachedModels = res.models
+      patch.modelsUpdatedAt = updatedAt
+    }
+    if (sel.changed) patch.model = sel.model
+    // Advisory flag from migrations M1/M3: only live evidence may clear it, and only at
+    // the activeComplete bar. A partial refresh proves nothing about the stored id.
+    if (verified && res.unionIds.includes(sel.model)) patch.modelNeedsVerification = false
+    setSettings(patch)
+
+    return {
+      results: res.results,
+      slots: res.slots,
+      models: res.models,
+      unionIds: res.unionIds,
+      runnableIds: res.runnableIds,
+      activeSlots: res.activeSlots,
+      refreshOutcome: res.refreshOutcome,
+      model: sel.model,
+      notice: sel.notice,
+      updatedAt,
+      anyValid: res.anyValid
+    }
   })
 
   // ---- File dialogs ----
@@ -187,9 +432,44 @@ export function registerIpc(): void {
   )
 
   // ---- Translate / Transcribe ----
+
+  /**
+   * Check the chosen model against what the keys actually reported, just before spawning.
+   *
+   * Lives here rather than in `pythonBridge` on purpose: `modelsList` already imports the
+   * bridge for `resolveGstBin`, so calling the guard from inside the bridge would close an
+   * import cycle. `ipc` sits above both, so this is the natural seam — and it is the one
+   * point every run passes through.
+   *
+   * Returns false when the run must not start; the refusal is reported on the same output
+   * channel a failed run uses, so the UI needs no new path to surface it.
+   */
+  const passesModelGuard = (model: string, keys: string[]): boolean => {
+    const s = getSettings()
+    const verdict = guardModelForSpawn(
+      model,
+      (s.cachedModels as ModelInfo[]) ?? [],
+      activeKeySlots(keySlotsFor(keys))
+    )
+    if (verdict.warning) send('translate:output', { stream: 'stderr', line: verdict.warning })
+    if (!verdict.ok) {
+      send('translate:output', { stream: 'stderr', line: verdict.error ?? 'Model unavailable.' })
+      send('translate:done', { code: -1, outputPath: '' })
+      return false
+    }
+    return true
+  }
+
   ipcMain.handle('translate:start', (_e, args: TranslateArgs) => {
-    const { writeTokenReport, progressLog, thoughtsLog } = getSettings()
-    const fullArgs: TranslateArgs = { ...args, writeTokenReport, progressLog, thoughtsLog }
+    const { writeTokenReport, progressLog, thoughtsLog, resumeContextSize } = getSettings()
+    if (!passesModelGuard(args.model, args.apiKeys)) return ''
+    const fullArgs: TranslateArgs = {
+      ...args,
+      writeTokenReport,
+      progressLog,
+      thoughtsLog,
+      resumeContextSize
+    }
     const { outputPath, logPaths } = startTranslate(fullArgs, {
       onOutput: (stream, line) => send('translate:output', { stream, line }),
       onDone: (code, op) => send('translate:done', { code, outputPath: op, logPaths })
@@ -198,6 +478,7 @@ export function registerIpc(): void {
   })
 
   ipcMain.handle('transcribe:start', (_e, args: TranscribeArgs) => {
+    if (!passesModelGuard(args.model, args.apiKeys)) return ''
     return startTranscribe(args, {
       onOutput: (stream, line) => send('translate:output', { stream, line }),
       onDone: (code, outputPath) => send('translate:done', { code, outputPath })

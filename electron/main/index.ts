@@ -1,6 +1,7 @@
 import { app, shell, BrowserWindow } from 'electron'
 import path from 'path'
 import { registerIpc, setMainWindow } from './ipc'
+import { logResolvedGstBin } from './pythonBridge'
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -36,6 +37,10 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  // Record which engine binary this session will run before anything can use it. In dev
+  // `gst` resolves through PATH, so this is the only way to tell the bundled build apart
+  // from a globally installed one when interpreting any later result.
+  logResolvedGstBin()
   registerIpc()
   createWindow()
 
