@@ -3,8 +3,13 @@
  *
  * These are the checks `npm run test:gates` cannot make, because they need a real API
  * key and the real frozen engine: that the packed binary actually reaches Google, that a
- * translation round-trips, that Hebrew survives the frozen build's stdio, and that an
- * `.ass` file keeps its styling and leaves the user's original untouched.
+ * translation round-trips, that Hebrew survives the frozen build's stdio, that an `.ass`
+ * file keeps its styling and leaves the user's original untouched, that an embedded
+ * subtitle track can be probed, extracted and translated, and that transcription works.
+ *
+ * STAGE 1 runs on a key alone (L1-L5). STAGE 2 (L6-L7) needs media fixtures in
+ * `.secrets/fixtures/`; without them those probes report SKIP rather than failing, so a
+ * machine with no fixtures still gets a meaningful stage-1 result.
  *
  * WHAT THIS DOES NOT COVER. D1/D2 (the packaged build and its authoritative charmap
  * result) are deliberately out of scope: they only reproduce in a packaged app, so a dev
@@ -23,22 +28,48 @@ import { spawn } from 'child_process'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
-import { buildTranslateArgs, ensureUtf8Subtitle } from '../../electron/main/pythonBridge'
-import type { TranslateArgs } from '../../electron/shared/types'
+import {
+  buildTranscribeArgs,
+  buildTranslateArgs,
+  ensureUtf8Subtitle
+} from '../../electron/main/pythonBridge'
+import { envWithFfmpeg, extractTrack, probeTracks } from '../../electron/main/ffmpeg'
+import { modelCapabilities } from '../../electron/shared/modelCaps'
+import type { TranscribeArgs, TranslateArgs } from '../../electron/shared/types'
 
 // The bundle executes from a temp directory, so paths are resolved from the working
 // directory instead — `npm run` always sets that to the package root.
 const ROOT = process.cwd()
 const GST = path.join(ROOT, 'resources', 'bin', process.platform === 'win32' ? 'gst.exe' : 'gst')
 const KEY_FILE = path.join(ROOT, '.secrets', 'gemini-key.txt')
+const FIXTURE_DIR = path.join(ROOT, '.secrets', 'fixtures')
 const TIMEOUT_MS = 300_000
+
+/**
+ * Which ffmpeg the probes use.
+ *
+ * Production reads `getSettings().ffmpegPath`, which these probes cannot: they run outside
+ * Electron against stubbed settings. Undefined therefore means the bundled binaries, and
+ * these probes verify the DEFAULT environment only. Set `SRT_VERIFY_FFMPEG_PATH` to the
+ * value you configured in Settings to verify an override instead — it is then applied
+ * consistently to the spawn environment, `probeTracks` and `extractTrack`, because
+ * checking one of the three with an override and the others without would be worse than
+ * not checking at all.
+ */
+const FFMPEG_PATH = process.env.SRT_VERIFY_FFMPEG_PATH?.trim() || undefined
 
 let passes = 0
 let failures = 0
+let skipped = 0
 const failed: string[] = []
 
 function section(name: string): void {
   console.log(`\n=== ${name} ===`)
+}
+
+function skip(label: string, why: string): void {
+  skipped++
+  console.log(`  SKIP  ${label} — ${why}`)
 }
 
 function check(label: string, ok: boolean, detail = ''): boolean {
@@ -91,9 +122,25 @@ interface RunResult {
   timedOut: boolean
 }
 
+/**
+ * The environment the app really spawns with.
+ *
+ * `pythonBridge.run()` puts the bundled binaries on PATH and forces Python into UTF-8 mode
+ * so non-Latin output does not hit Windows' legacy charmap codec. A probe that spawned with
+ * a bare `process.env` would be testing a configuration the app never uses — and would be
+ * at its least trustworthy on exactly the check that matters most, the Hebrew one.
+ */
+function appEnv(): NodeJS.ProcessEnv {
+  return envWithFfmpeg(FFMPEG_PATH, {
+    PYTHONUNBUFFERED: '1',
+    PYTHONUTF8: '1',
+    PYTHONIOENCODING: 'utf-8'
+  })
+}
+
 function run(args: string[], env?: NodeJS.ProcessEnv): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = spawn(GST, args, { windowsHide: true, env: env ?? process.env })
+    const child = spawn(GST, args, { windowsHide: true, env: env ?? appEnv() })
     let stdout = ''
     let stderr = ''
     let timedOut = false
@@ -166,21 +213,73 @@ function translateArgs(over: Partial<TranslateArgs>, outputPath: string): string
   return buildTranslateArgs(base, outputPath)
 }
 
-/** Newest flash-lite in the fetched list, so the probes cost as little as possible. */
-function cheapestModel(ids: string[]): string | null {
-  const lite = ids.filter((id) => id.includes('flash-lite') && !id.includes('preview'))
-  const pool = lite.length ? lite : ids.filter((id) => id.includes('flash') && !id.includes('preview'))
-  if (!pool.length) return null
+/**
+ * Newest flash-lite in the fetched list, so the probes cost as little as possible.
+ *
+ * `eligible` exists because not every cheap model can do every job: transcription needs a
+ * 2.5 or 3.x model, and spawning a 2.0 model would produce an engine error the UI would
+ * never allow — a probe failure that says nothing about the app.
+ *
+ * `fallbackToAnyEligible` decides what "none of the cheap tiers qualify" means. For the
+ * translation probes it means stop: they are cost-driven and a `pro` model is not a
+ * silent substitute for one. For transcription it means widen, because a key exposing a
+ * capable `pro` model but no capable flash really does support the feature, and skipping
+ * it would report missing coverage that is not missing.
+ */
+function cheapestModel(
+  ids: string[],
+  eligible: (id: string) => boolean = () => true,
+  { fallbackToAnyEligible = false } = {}
+): string | null {
+  const usable = ids.filter(eligible)
+  const stable = (id: string): boolean => !id.includes('preview')
   const versionOf = (id: string): number[] => {
     const m = id.match(/(\d+)\.(\d+)/)
     return m ? [Number(m[1]), Number(m[2])] : [0, 0]
   }
-  return pool.sort((a, b) => {
-    const [am, an] = versionOf(a)
-    const [bm, bn] = versionOf(b)
-    return bm - am || bn - an
-  })[0]
+  const newest = (pool: string[]): string | null =>
+    pool.length
+      ? [...pool].sort((a, b) => {
+          const [am, an] = versionOf(a)
+          const [bm, bn] = versionOf(b)
+          return bm - am || bn - an
+        })[0]
+      : null
+
+  return (
+    newest(usable.filter((id) => id.includes('flash-lite') && stable(id))) ??
+    newest(usable.filter((id) => id.includes('flash') && stable(id))) ??
+    (fallbackToAnyEligible ? (newest(usable.filter(stable)) ?? newest(usable)) : null)
+  )
 }
+
+/**
+ * Independent expectations for L6's classification check, written from what the formats ARE
+ * rather than from `ffmpeg.ts`'s own list — an oracle copied from the code under test cannot
+ * disagree with it. `dvb_subtitle` is deliberately included: it is a bitmap format, so if a
+ * fixture carries one and this check fails, that is a real gap in the app's `IMAGE_CODECS`,
+ * not a bad expectation.
+ */
+const IMAGE_SUBTITLE_CODECS = new Set([
+  'hdmv_pgs_subtitle',
+  'pgssub',
+  'dvd_subtitle',
+  'dvdsub',
+  'dvb_subtitle',
+  'dvbsub',
+  'xsub'
+])
+const TEXT_SUBTITLE_CODECS = new Set([
+  'subrip',
+  'srt',
+  'ass',
+  'ssa',
+  'mov_text',
+  'webvtt',
+  'text',
+  'subviewer',
+  'microdvd'
+])
 
 function hasHebrew(text: string): boolean {
   return /[\u0590-\u05FF]/.test(text)
@@ -188,6 +287,81 @@ function hasHebrew(text: string): boolean {
 
 function cueCount(srt: string): number {
   return (srt.match(/-->/g) ?? []).length
+}
+
+/** First N cues of an SRT, so a stage-2 translation stays cheap. */
+function firstCues(srt: string, n: number): string {
+  const blocks = srt.split(/\r?\n\r?\n/).filter((b) => b.includes('-->'))
+  return blocks.slice(0, n).join('\n\n') + '\n'
+}
+
+/** Stage-2 fixtures the user drops in; absent means the probe skips, never fails. */
+function fixtures(exts: string[]): string[] {
+  if (!fs.existsSync(FIXTURE_DIR)) return []
+  return fs
+    .readdirSync(FIXTURE_DIR)
+    .filter((f) => exts.includes(path.extname(f).toLowerCase()))
+    .map((f) => path.join(FIXTURE_DIR, f))
+    .sort()
+}
+
+interface AssEvent {
+  fields: Map<string, string>
+  text: string
+}
+
+/**
+ * Split an ASS record into exactly `count` fields, keeping everything after the last
+ * separator as one field. Text is the final column *because* it may legally contain commas
+ * and override tags such as `{\i1}`, so a plain `split(',')` would shred it.
+ */
+function splitRecord(record: string, count: number): string[] {
+  const out: string[] = []
+  let rest = record
+  for (let i = 0; i < count - 1; i++) {
+    const comma = rest.indexOf(',')
+    if (comma === -1) break
+    out.push(rest.slice(0, comma))
+    rest = rest.slice(comma + 1)
+  }
+  out.push(rest)
+  return out
+}
+
+/**
+ * Parse `[Events]` rows using the file's OWN `Format:` line rather than assuming a layout.
+ *
+ * This exists to make the positional-field regression detectable. Matching Hebrew anywhere
+ * in a `Dialogue:` row cannot tell "translated dialogue in the Text column" apart from
+ * "dialogue shifted into the Name column with Text left empty" — which is precisely the
+ * failure the ASS fixture correction was written to catch.
+ */
+function parseAssEvents(body: string): { format: string[]; events: AssEvent[] } {
+  let format: string[] = []
+  const events: AssEvent[] = []
+  let inEvents = false
+
+  for (const line of body.split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) {
+      inEvents = /^\s*\[Events\]/i.test(line)
+      continue
+    }
+    if (!inEvents) continue
+
+    const fmt = line.match(/^Format:\s*(.+)$/i)
+    if (fmt) {
+      format = fmt[1].split(',').map((f) => f.trim())
+      continue
+    }
+    const dialogue = line.match(/^Dialogue:\s*(.*)$/i)
+    if (!dialogue || !format.length) continue
+
+    const parts = splitRecord(dialogue[1], format.length)
+    const fields = new Map<string, string>()
+    format.forEach((name, i) => fields.set(name.toLowerCase(), (parts[i] ?? '').trim()))
+    events.push({ fields, text: fields.get('text') ?? '' })
+  }
+  return { format, events }
 }
 
 async function main(): Promise<void> {
@@ -205,6 +379,9 @@ async function main(): Promise<void> {
   console.log(`Engine:    ${GST}`)
   console.log(`Workspace: ${work}`)
   console.log('Key:       loaded (never printed)')
+  console.log(
+    `ffmpeg:    ${FFMPEG_PATH ?? 'bundled/default (set SRT_VERIFY_FFMPEG_PATH to verify an override)'}`
+  )
 
   // ── B1 / C19 — the frozen binary reaches Google and the model list is honest ──
   section('L1 — list-models against a real key (B1, C19)')
@@ -230,6 +407,25 @@ async function main(): Promise<void> {
     process.exit(1)
   }
   console.log(`        Using ${model} for the translation probes`)
+
+  // Selection self-checks. These settle the cases a normal account never exercises — a key
+  // with a capable pro model but no capable flash — without waiting for such a key to exist.
+  const capable = (id: string): boolean => modelCapabilities(id).supportsTranscription
+  check(
+    'transcription falls back to a capable pro model when no capable flash exists',
+    cheapestModel(['gemini-2.0-flash', 'gemini-2.5-pro'], capable, { fallbackToAnyEligible: true }) ===
+      'gemini-2.5-pro'
+  )
+  check(
+    'the cost-driven translation probes still refuse to substitute a pro model',
+    cheapestModel(['gemini-2.5-pro']) === null
+  )
+  check(
+    'flash-lite still wins on cost whenever it qualifies',
+    cheapestModel(['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'], capable, {
+      fallbackToAnyEligible: true
+    }) === 'gemini-2.5-flash-lite'
+  )
 
   // ── A3 — a real translation round-trips through the frozen engine ──
   section('L2 — five-cue SRT translation (A3)')
@@ -267,6 +463,30 @@ async function main(): Promise<void> {
 
   // ── C20 — ASS round trip, the runtime half of gate G2 ──
   section('L4 — ASS round trip (C20, G2 runtime half)')
+
+  // The detector must be able to FAIL. This is the exact record shape the shortened-Format
+  // bug produced — Hebrew in Name, Text empty — and it is what a "Hebrew anywhere in the
+  // row" check happily accepted. If this ever reads as translated text, every assertion
+  // below it is decorative.
+  const shifted = parseAssEvents(
+    '[Events]\n' +
+      'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n' +
+      'Dialogue: 0,0:00:01.00,0:00:03.00,Default,\u05e9\u05dc\u05d5\u05dd,0,0,0,,\n'
+  ).events[0]
+  check(
+    'the Text-column detector rejects a field-shifted record',
+    !!shifted && !hasHebrew(shifted.text) && hasHebrew(shifted.fields.get('name') ?? '')
+  )
+  const wellFormed = parseAssEvents(
+    '[Events]\n' +
+      'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n' +
+      'Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\i1}\u05e9\u05dc\u05d5\u05dd, \u05e2\u05d5\u05dc\u05dd\n'
+  ).events[0]
+  check(
+    'the Text column survives commas and override tags intact',
+    !!wellFormed && hasHebrew(wellFormed.text) && wellFormed.text.includes(',')
+  )
+
   const srcAss = path.join(work, 'styled.ass')
   fs.writeFileSync(srcAss, ASS_FIXTURE, 'utf8')
   const originalBytes = fs.readFileSync(srcAss)
@@ -285,11 +505,19 @@ async function main(): Promise<void> {
     check('[V4+ Styles] survives', body.includes('[V4+ Styles]'))
     check('both style definitions survive', body.includes('Default') && body.includes('Émphase'))
     check('the non-ASCII style name is not mangled', body.includes('Émphase') && !body.includes('\uFFFD'))
-    check('all five dialogue lines survive', (body.match(/^Dialogue:/gm) ?? []).length === 5)
-    check('the dialogue was translated', hasHebrew(body))
+
+    const { format, events } = parseAssEvents(body)
+    check('the events still declare Text as the final column', format.at(-1)?.toLowerCase() === 'text')
+    check('all five dialogue lines survive', events.length === 5, `${events.length} events`)
     check(
-      'the translated text is in the Text field, not swallowed by another column',
-      (body.match(/^Dialogue:.*,.*[\u0590-\u05FF]/gm) ?? []).length === 5
+      'every line was translated IN THE TEXT COLUMN',
+      events.length === 5 && events.every((e) => hasHebrew(e.text)),
+      events.map((e) => `text="${e.text}"`).join(' | ')
+    )
+    check(
+      'no dialogue leaked into the Name column',
+      events.every((e) => !hasHebrew(e.fields.get('name') ?? '')),
+      'dialogue in Name means the fields shifted'
     )
   } else {
     console.log(mask(ass.stdout + ass.stderr).split('\n').slice(-15).join('\n'))
@@ -315,14 +543,149 @@ async function main(): Promise<void> {
       noFfmpeg.code === 0
   )
 
-  console.log(`\n${passes} passed, ${failures} failed`)
+  // ── C21 — embedded subtitle track: probe, extract, translate (stage 2) ──
+  section('L6 — embedded subtitle track (C21, stage 2)')
+  const videos = fixtures(['.mkv', '.mp4', '.mov', '.webm', '.m4v'])
+  if (!videos.length) {
+    skip('embedded-track probe, extraction and translation', `no video in ${FIXTURE_DIR}`)
+  } else {
+    for (const video of videos) {
+      const label = path.basename(video)
+      const tracks = await probeTracks(video, FFMPEG_PATH)
+      check(`${label}: ffprobe reports its subtitle tracks`, tracks.length > 0, `${tracks.length} tracks`)
+      if (!tracks.length) continue
+
+      console.log(
+        `        tracks: ${tracks.map((t) => `${t.index}:${t.codec}${t.lang ? `/${t.lang}` : ''}`).join(', ')}`
+      )
+      const text = tracks.filter((t) => !t.isImage)
+
+      // Judge the classification against the codec name, which is ground truth from ffprobe
+      // and NOT derived from the app's own list — a check written from the code under test
+      // can only ever agree with it. Getting this wrong is not cosmetic: `extractTrack`
+      // remuxes an image track and transcodes a text one, so a bitmap stream misread as text
+      // is handed to `-c:s srt` and fails.
+      const knownImage = tracks.filter((t) => IMAGE_SUBTITLE_CODECS.has(t.codec.toLowerCase()))
+      const knownText = tracks.filter((t) => TEXT_SUBTITLE_CODECS.has(t.codec.toLowerCase()))
+      if (knownImage.length) {
+        check(
+          `${label}: bitmap tracks (${knownImage.map((t) => t.codec).join(', ')}) are marked as image`,
+          knownImage.every((t) => t.isImage)
+        )
+      } else {
+        skip(`${label}: image-track classification`, 'this file has no bitmap subtitle track')
+      }
+      if (knownText.length) {
+        check(
+          `${label}: text tracks (${knownText.map((t) => t.codec).join(', ')}) are NOT marked as image`,
+          knownText.every((t) => !t.isImage)
+        )
+      }
+      const unclassified = tracks.filter(
+        (t) =>
+          !IMAGE_SUBTITLE_CODECS.has(t.codec.toLowerCase()) &&
+          !TEXT_SUBTITLE_CODECS.has(t.codec.toLowerCase())
+      )
+      if (unclassified.length) {
+        console.log(
+          `        note: ${unclassified.map((t) => t.codec).join(', ')} — codec not in the probe's ` +
+            `reference sets, so its classification is unverified here`
+        )
+      }
+
+      if (!text.length) {
+        skip(`${label}: text-track extraction`, 'this file has only image/PGS tracks')
+      } else {
+        const track = text[0]
+        const extracted = path.join(work, `${path.parse(video).name}_t${track.index}.srt`)
+        const res = await extractTrack(video, track.index, extracted, false, FFMPEG_PATH)
+        check(`${label}: the text track extracts to .srt`, res.ok, res.error ?? '')
+        if (res.ok && check(`${label}: the extracted file exists`, fs.existsSync(extracted))) {
+          const body = fs.readFileSync(extracted, 'utf8')
+          check(`${label}: the extraction contains cues`, cueCount(body) > 0, `${cueCount(body)} cues`)
+
+          // Translate only a trimmed copy: a full track would be slow and costly, and C21
+          // is about the extract-then-translate path, not about volume.
+          const trimmed = path.join(work, `${path.parse(video).name}_trimmed.srt`)
+          fs.writeFileSync(trimmed, firstCues(body, 5), 'utf8')
+          const outTrack = path.join(work, `${path.parse(video).name}_he.srt`)
+          const tr = await run(translateArgs({ inputFile: trimmed, targetLang: 'he', model }, outTrack))
+          check(`${label}: the extracted track translates`, tr.code === 0, `exit ${tr.code}`)
+          if (fs.existsSync(outTrack)) {
+            check(`${label}: the translation contains Hebrew`, hasHebrew(fs.readFileSync(outTrack, 'utf8')))
+          }
+        }
+      }
+    }
+  }
+
+  // ── Transcription — the third top-level feature, previously untested (stage 2) ──
+  section('L7 — transcription (stage 2)')
+  const media = fixtures(['.mp3', '.m4a', '.wav', '.flac', '.ogg', '.mkv', '.mp4', '.mov', '.webm'])
+  // The translation model is chosen purely on cost and may be a 2.0 model, which cannot
+  // transcribe. TranscribePage blocks that before spawning; the probe must apply the same
+  // rule from the same source, or it reports an app failure the UI would never permit.
+  const txModel = cheapestModel(unique, (id) => modelCapabilities(id).supportsTranscription, {
+    fallbackToAnyEligible: true
+  })
+  if (!media.length) {
+    skip('transcription end to end', `no audio or video in ${FIXTURE_DIR}`)
+  } else if (!txModel) {
+    skip(
+      'transcription end to end',
+      'this key exposes no transcription-capable model at any tier: coverage unavailable, not failing'
+    )
+  } else {
+    const source = media[0]
+    const label = path.basename(source)
+    if (txModel !== model) {
+      console.log(`        Using ${txModel} — the cheapest transcription-capable model this key exposes`)
+    }
+    const outTx = path.join(work, 'transcribed.srt')
+    const txArgs = buildTranscribeArgs(
+      {
+        mediaFile: source,
+        outputFile: outTx,
+        targetLang: 'en',
+        model: txModel,
+        apiKeys: [secret],
+        thinkingLevel: 'low',
+        thinkingBudget: 512,
+        customGenerationParams: false,
+        temperature: 1,
+        topP: 0.95,
+        topK: null
+      } satisfies TranscribeArgs,
+      outTx
+    )
+    check(
+      `${label}: the media flag matches the file type`,
+      txArgs.includes(/\.(mp4|mkv|mov|avi|webm|m4v|ts|wmv|flv)$/i.test(source) ? '-v' : '-a')
+    )
+    const tx = await run(txArgs)
+    check(`${label}: transcribe exits 0`, tx.code === 0 && !tx.timedOut, `exit ${tx.code}`)
+    if (check(`${label}: an .srt is written`, fs.existsSync(outTx))) {
+      const body = fs.readFileSync(outTx, 'utf8')
+      check(`${label}: the transcript contains cues`, cueCount(body) > 0, `${cueCount(body)} cues`)
+      check(`${label}: cues carry text, not just timestamps`, /-->.*\r?\n\s*\S+/.test(body))
+      check(`${label}: no replacement characters`, !body.includes('\uFFFD'))
+    } else {
+      console.log(mask(tx.stdout + tx.stderr).split('\n').slice(-15).join('\n'))
+    }
+  }
+
+  console.log(`\n${passes} passed, ${failures} failed${skipped ? `, ${skipped} skipped` : ''}`)
   if (failures) {
     console.log('\nFailed checks:')
     for (const f of failed) console.log(`  - ${f}`)
     console.log(`\nArtifacts kept for inspection: ${work}`)
     process.exit(1)
   }
-  console.log('\nALL LIVE PROBES PASSED')
+  console.log(
+    skipped
+      ? `\nALL RUNNABLE PROBES PASSED (${skipped} skipped — drop fixtures in ${FIXTURE_DIR} to run stage 2)`
+      : '\nALL LIVE PROBES PASSED'
+  )
   console.log(`Artifacts: ${work}`)
   console.log('Remember to revoke the verification key when you are done.')
 }
