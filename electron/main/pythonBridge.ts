@@ -3,13 +3,81 @@ import { app } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import { gstLanguageName } from '../shared/languages'
-import { envWithFfmpeg } from './ffmpeg'
+import { convertAudioToMp3, envWithFfmpeg } from './ffmpeg'
 import { getSettings } from './store'
 import { orderKeySlots, type KeySlot } from '../shared/keyOrder'
 import { effectiveThinkingLevel, modelCapabilities } from '../shared/modelCaps'
 import { DEFAULT_RESUME_CONTEXT_SIZE, type TranslateArgs, type TranscribeArgs } from '../shared/types'
 
-let current: ChildProcessWithoutNullStreams | null = null
+/**
+ * The one job the app runs at a time.
+ *
+ * This used to be a bare `ChildProcessWithoutNullStreams | null`, which was sufficient only
+ * while "a job" and "a spawned process" were the same thing. Transcription now has a
+ * preparation step (audio conversion) that runs BEFORE anything is spawned, and during that
+ * window a process-shaped lock reports idle: Stop would find nothing to kill and the job
+ * would carry on into the API, and a second job could start and later be refused with no
+ * terminal event, leaving its page running forever.
+ *
+ * So the slot is reserved for the whole lifetime of a job, and every terminal path goes
+ * through `finish()`, which fires `onDone` exactly once, releases the slot, and deletes the
+ * scratch files the job created.
+ */
+interface Job {
+  /** The gst child once spawned; null while preparing. */
+  proc: ChildProcessWithoutNullStreams | null
+  /** Aborts an in-flight preparation step. Null when nothing is being prepared. */
+  prep: AbortController | null
+  cancelled: boolean
+  /** Temp files this job created and owns. Deleted when it ends, whatever the outcome. */
+  scratch: string[]
+  finished: boolean
+  handlers: SpawnHandlers
+  outputPath: string
+}
+
+let job: Job | null = null
+
+/** Reserve the single job slot, or return null if one is already held. */
+function beginJob(handlers: SpawnHandlers, outputPath: string): Job | null {
+  if (job) return null
+  job = {
+    proc: null,
+    prep: null,
+    cancelled: false,
+    scratch: [],
+    finished: false,
+    handlers,
+    outputPath
+  }
+  return job
+}
+
+/**
+ * End a job exactly once: release the slot, remove its scratch files, emit the terminal
+ * event. Idempotent, because several paths can race to end the same job (a Stop that kills
+ * the child, and the child's own `close`).
+ */
+function finish(j: Job, code: number | null): void {
+  if (j.finished) return
+  j.finished = true
+  if (job === j) job = null
+  for (const file of j.scratch) {
+    try {
+      fs.unlinkSync(file)
+    } catch {
+      /* best effort: a temp file we cannot delete must not fail the job */
+    }
+  }
+  j.scratch = []
+  j.handlers.onDone(code, j.outputPath)
+}
+
+/** Refuse a start request without leaving the caller's page spinning forever. */
+function refuseStart(handlers: SpawnHandlers, outputPath: string): void {
+  handlers.onOutput('stderr', 'A process is already running.')
+  handlers.onDone(-1, outputPath)
+}
 
 /** Resolve the bundled `gst` executable, or fall back to PATH in dev. */
 export function resolveGstBin(): string {
@@ -319,12 +387,62 @@ export function buildTranslateArgs(a: TranslateArgs, outputPath: string): string
   return args
 }
 
+/** Containers the engine treats as video, i.e. `-v` rather than `-a`. */
+const VIDEO_MEDIA_RE = /\.(mp4|mkv|mov|avi|webm|m4v|ts|wmv|flv)$/i
+
+export function isVideoMedia(mediaFile: string): boolean {
+  return VIDEO_MEDIA_RE.test(mediaFile)
+}
+
+/**
+ * Audio containers the frozen engine can actually read. Verified against gst 3.7.0 on
+ * 2026-08-19 with a dummy key, so the result is local and precedes any API call: `.mp3`
+ * and `.wav` pass pydub's conversion step; `.m4a`, `.aac` and `.flac` do not.
+ */
+const ENGINE_AUDIO_EXTS = ['.mp3', '.wav']
+
+export function needsAudioConversion(mediaFile: string): boolean {
+  if (isVideoMedia(mediaFile)) return false
+  return !ENGINE_AUDIO_EXTS.includes(path.extname(mediaFile).toLowerCase())
+}
+
+export type AudioNormalizeResult =
+  | { ok: true; path: string; converted: boolean }
+  | { ok: false; error: string }
+
+/**
+ * Give the engine an audio file it can read, converting only when it must.
+ *
+ * Same contract as `ensureUtf8Subtitle`, for the same class of reason: the user's original
+ * file is NEVER modified, and this returns either the input path untouched or the path of a
+ * separate temp copy. Video is passed straight through — the engine extracts and compresses
+ * its audio itself, which is why video never hit this defect.
+ */
+export async function ensureEngineReadableAudio(
+  mediaFile: string,
+  ffmpegPath?: string,
+  signal?: AbortSignal
+): Promise<AudioNormalizeResult> {
+  if (!needsAudioConversion(mediaFile)) return { ok: true, path: mediaFile, converted: false }
+
+  const outPath = tempOutputPath('.mp3')
+  const res = await convertAudioToMp3(mediaFile, outPath, ffmpegPath, signal)
+  if (!res.ok) {
+    return {
+      ok: false,
+      error:
+        `Could not prepare "${path.basename(mediaFile)}" for transcription: ${res.error}\n` +
+        'Convert it to MP3 or WAV and try again. Your original file was not modified.'
+    }
+  }
+  return { ok: true, path: outPath, converted: true }
+}
+
 export function buildTranscribeArgs(a: TranscribeArgs, outputPath: string): string[] {
   const args: string[] = ['transcribe', '-o', outputPath]
 
   // transcribe requires -v (video) or -a (audio)
-  const isVideo = /\.(mp4|mkv|mov|avi|webm|m4v|ts|wmv|flv)$/i.test(a.mediaFile)
-  args.push(isVideo ? '-v' : '-a', a.mediaFile)
+  args.push(isVideoMedia(a.mediaFile) ? '-v' : '-a', a.mediaFile)
 
   const { keys } = orderKeysByValidity(a.apiKeys)
   if (keys[0]) args.push('-k', keys[0])
@@ -338,9 +456,15 @@ export function buildTranscribeArgs(a: TranscribeArgs, outputPath: string): stri
   return args
 }
 
-function run(args: string[], outputPath: string, handlers: SpawnHandlers): void {
-  if (current) {
-    handlers.onOutput('stderr', 'A process is already running.')
+/** Spawn gst for a job whose slot the caller has already reserved. */
+function run(j: Job, args: string[]): void {
+  const { handlers, outputPath } = j
+  if (j.finished) return
+  // A Stop during preparation must not be followed by a spawn: the window between the two
+  // is exactly where a cancelled job would otherwise still reach the API and spend quota.
+  if (j.cancelled) {
+    handlers.onOutput('stderr', 'Stopped before the engine started.')
+    finish(j, -1)
     return
   }
   const bin = resolveGstBin()
@@ -356,10 +480,10 @@ function run(args: string[], outputPath: string, handlers: SpawnHandlers): void 
     proc = spawn(bin, args, { env })
   } catch (err) {
     handlers.onOutput('stderr', `Failed to start gst: ${(err as Error).message}`)
-    handlers.onDone(-1, outputPath)
+    finish(j, -1)
     return
   }
-  current = proc
+  j.proc = proc
 
   let stdoutBuf = ''
   let stderrBuf = ''
@@ -385,8 +509,7 @@ function run(args: string[], outputPath: string, handlers: SpawnHandlers): void 
   proc.on('close', (code) => {
     if (stdoutBuf) handlers.onOutput('stdout', stdoutBuf)
     if (stderrBuf) handlers.onOutput('stderr', stderrBuf)
-    current = null
-    handlers.onDone(code, outputPath)
+    finish(j, code)
   })
 }
 
@@ -403,14 +526,22 @@ export function startTranslate(a: TranslateArgs, handlers: SpawnHandlers): Start
   const inExt = path.extname(a.inputFile).toLowerCase()
   const outputPath = tempOutputPath(SUBTITLE_EXTS.includes(inExt) ? inExt : '.srt')
 
+  const j = beginJob(handlers, outputPath)
+  if (!j) {
+    refuseStart(handlers, outputPath)
+    return { outputPath, logPaths: [] }
+  }
+
   const norm = ensureUtf8Subtitle(a.inputFile)
   if (!norm.ok) {
     handlers.onOutput('stderr', norm.error)
-    handlers.onDone(-1, outputPath)
+    finish(j, -1)
     return { outputPath, logPaths: [] }
   }
   const normalized: TranslateArgs = { ...a, inputFile: norm.path }
-  run(buildTranslateArgs(normalized, outputPath), outputPath, handlers)
+  // The normalized subtitle is deliberately NOT scratch: gst names the progress and thoughts
+  // logs from this path, and TranslatePage copies those sidecars after the job ends.
+  run(j, buildTranslateArgs(normalized, outputPath))
 
   const logPaths: string[] = []
   // The token report is written to the explicit --token-report path we pass
@@ -426,25 +557,83 @@ export function startTranslate(a: TranslateArgs, handlers: SpawnHandlers): Start
   return { outputPath, logPaths }
 }
 
-export function startTranscribe(a: TranscribeArgs, handlers: SpawnHandlers): string {
-  run(buildTranscribeArgs(a, a.outputFile), a.outputFile, handlers)
+export async function startTranscribe(a: TranscribeArgs, handlers: SpawnHandlers): Promise<string> {
+  // The slot is taken BEFORE the conversion, not after it. Otherwise the app reports idle
+  // for the length of the conversion, and a second job started in that window would later
+  // be refused by a `run()` that had no way to tell this page it had ended.
+  const j = beginJob(handlers, a.outputFile)
+  if (!j) {
+    refuseStart(handlers, a.outputFile)
+    return a.outputFile
+  }
+
+  let mediaFile = a.mediaFile
+  if (needsAudioConversion(a.mediaFile)) {
+    // Announced before the work starts, because on a long file this is a visible pause and
+    // the user is otherwise looking at a window that appears to be doing nothing.
+    handlers.onOutput(
+      'stdout',
+      `Preparing ${path.basename(a.mediaFile)} — converting to MP3, which is the format the engine reads…`
+    )
+    j.prep = new AbortController()
+    const prepared = await ensureEngineReadableAudio(
+      a.mediaFile,
+      getSettings().ffmpegPath,
+      j.prep.signal
+    )
+    j.prep = null
+
+    // A Stop that landed in the gap after the conversion finished has already ended the
+    // job; saying anything more here would follow a terminal event with stray output.
+    if (j.finished) return a.outputFile
+    // Cancellation is checked first: an aborted conversion also reports failure, and
+    // "Could not prepare…" would be a confusing thing to say to someone who pressed Stop.
+    if (j.cancelled) {
+      handlers.onOutput('stderr', 'Stopped while preparing the audio.')
+      finish(j, -1)
+      return a.outputFile
+    }
+    if (!prepared.ok) {
+      handlers.onOutput('stderr', prepared.error)
+      finish(j, -1)
+      return a.outputFile
+    }
+    if (prepared.converted) j.scratch.push(prepared.path)
+    mediaFile = prepared.path
+  }
+
+  run(j, buildTranscribeArgs({ ...a, mediaFile }, a.outputFile))
   return a.outputFile
 }
 
 export function stopCurrent(): void {
-  if (!current) return
+  const j = job
+  if (!j) return
+  j.cancelled = true
+
+  // Cancel a conversion that has not finished. The awaiting `startTranscribe` sees
+  // `cancelled` and ends the job, so this path still produces exactly one terminal event.
+  j.prep?.abort()
+
+  const proc = j.proc
+  if (!proc) {
+    // Nothing spawned yet. If a preparation step is in flight it owns the terminal event;
+    // if there is none, end the job here so the slot is not held by a job with no work.
+    if (!j.prep) finish(j, -1)
+    return
+  }
   try {
-    if (process.platform === 'win32' && current.pid) {
-      spawn('taskkill', ['/pid', String(current.pid), '/f', '/t'])
+    if (process.platform === 'win32' && proc.pid) {
+      spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t'])
     } else {
-      current.kill('SIGTERM')
+      proc.kill('SIGTERM')
     }
   } catch {
-    /* ignore */
+    // The kill itself failed, so no `close` is coming to release the slot.
+    finish(j, -1)
   }
-  current = null
 }
 
 export function isRunning(): boolean {
-  return current !== null
+  return job !== null
 }

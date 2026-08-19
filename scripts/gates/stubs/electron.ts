@@ -22,9 +22,28 @@ export const app = {
   quit: (): void => {}
 }
 
+type IpcHandler = (event: unknown, ...args: unknown[]) => unknown
+const ipcHandlers = new Map<string, IpcHandler>()
+
 export const ipcMain = {
-  handle: (): void => {},
+  handle: (channel: string, handler: IpcHandler): void => {
+    ipcHandlers.set(channel, handler)
+  },
   on: (): void => {}
+}
+
+/**
+ * Test-only: call a registered handler the way Electron would.
+ *
+ * Handlers are closures, and a closure can be wrong in ways the function it calls is not —
+ * REG-1 was a temporal-dead-zone read inside `translate:start`'s `onDone`, invisible to any
+ * test that called `startTranslate` directly. Reaching the real handler is the only way to
+ * cover that.
+ */
+export function __invokeIpc(channel: string, ...args: unknown[]): unknown {
+  const handler = ipcHandlers.get(channel)
+  if (!handler) throw new Error(`No IPC handler registered for "${channel}"`)
+  return handler({}, ...args)
 }
 
 export const dialog = {

@@ -31,9 +31,19 @@ import path from 'path'
 import {
   buildTranscribeArgs,
   buildTranslateArgs,
-  ensureUtf8Subtitle
+  ensureEngineReadableAudio,
+  ensureUtf8Subtitle,
+  isRunning,
+  needsAudioConversion,
+  startTranscribe,
+  startTranslate,
+  stopCurrent,
+  tempOutputPath
 } from '../../electron/main/pythonBridge'
 import { envWithFfmpeg, extractTrack, probeTracks } from '../../electron/main/ffmpeg'
+import { getSettings, setSettings } from '../../electron/main/store'
+import { registerIpc } from '../../electron/main/ipc'
+import { __invokeIpc } from '../gates/stubs/electron'
 import { modelCapabilities } from '../../electron/shared/modelCaps'
 import type { TranscribeArgs, TranslateArgs } from '../../electron/shared/types'
 
@@ -188,6 +198,10 @@ Dialogue: 0,0:00:13.00,0:00:15.00,Émphase,,0,0,0,,It is on the left.
 `
 
 function translateArgs(over: Partial<TranslateArgs>, outputPath: string): string[] {
+  return buildTranslateArgs(translateFixtureArgs(over), outputPath)
+}
+
+function translateFixtureArgs(over: Partial<TranslateArgs> = {}): TranslateArgs {
   const base: TranslateArgs = {
     inputFile: '',
     sourceLang: 'en',
@@ -210,7 +224,23 @@ function translateArgs(over: Partial<TranslateArgs>, outputPath: string): string
     thoughtsLog: false,
     ...over
   }
-  return buildTranslateArgs(base, outputPath)
+  return base
+}
+
+function transcribeArgs(mediaFile: string, model: string, outputFile: string): TranscribeArgs {
+  return {
+    mediaFile,
+    outputFile,
+    targetLang: 'en',
+    model,
+    apiKeys: [secret],
+    thinkingLevel: 'low',
+    thinkingBudget: 512,
+    customGenerationParams: false,
+    temperature: 1,
+    topP: 0.95,
+    topK: null
+  }
 }
 
 /**
@@ -293,6 +323,74 @@ function cueCount(srt: string): number {
 function firstCues(srt: string, n: number): string {
   const blocks = srt.split(/\r?\n\r?\n/).filter((b) => b.includes('-->'))
   return blocks.slice(0, n).join('\n\n') + '\n'
+}
+
+const CLIP_SECONDS = 30
+/**
+ * A copied video clip can be large without being expensive: for video input the engine
+ * extracts and compresses the audio itself and uploads only that. This ceiling exists to
+ * catch a clip that failed to trim, not to control upload size.
+ */
+const CLIP_MAX_BYTES = 200_000_000
+
+function ffmpegBinary(): string {
+  const exe = process.platform === 'win32' ? '.exe' : ''
+  if (FFMPEG_PATH) return path.join(path.dirname(FFMPEG_PATH), `ffmpeg${exe}`)
+  const bundled = path.join(ROOT, 'resources', 'bin', `ffmpeg${exe}`)
+  return fs.existsSync(bundled) ? bundled : 'ffmpeg'
+}
+
+function ffmpegRun(args: string[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    let proc
+    try {
+      proc = spawn(ffmpegBinary(), args, { windowsHide: true })
+    } catch {
+      resolve(false)
+      return
+    }
+    proc.on('error', () => resolve(false))
+    proc.on('close', (code) => resolve(code === 0))
+  })
+}
+
+/**
+ * A short stream-copied clip of a fixture, or null if ffmpeg cannot produce one.
+ *
+ * Video is preferred, and stream-copied rather than re-encoded, because that is the path a
+ * user actually takes: the engine extracts and compresses the audio itself, so what it
+ * receives is the fixture's own bytes and a failure implicates the app rather than a
+ * transcoding step the app never performs.
+ *
+ * The audio fallback is deliberately **MP3, mono**, not m4a. The engine loads audio through
+ * pydub, which hands the file to ffmpeg with a forced format; an AAC/MP4 clip is decoded as
+ * mp3float, yields no packets, and fails with "Conversion failed!". MP3 is also exactly what
+ * the engine's own `extract_audio_from_video` produces, so the fallback stays inside the
+ * range of inputs the engine is built to read.
+ */
+async function makeClip(source: string, work: string): Promise<string | null> {
+  const clip = path.join(work, `clip${path.extname(source).toLowerCase()}`)
+  // `-t` goes AFTER `-i`: as an input option it limits how much is *read*, which a
+  // stream copy of an mkv can ignore — the first attempt at this produced a "clip" the
+  // size of the whole film.
+  const copied = await ffmpegRun([
+    '-y', '-i', source, '-t', String(CLIP_SECONDS),
+    '-map', '0:v:0?', '-map', '0:a:0?', '-c', 'copy', clip
+  ])
+  if (copied && fs.existsSync(clip) && fs.statSync(clip).size <= CLIP_MAX_BYTES) return clip
+
+  const audio = path.join(work, 'clip.mp3')
+  const extracted = await ffmpegRun([
+    '-y', '-i', source, '-t', String(CLIP_SECONDS),
+    '-vn', '-sn', '-dn', '-map', '0:a:0', '-map_metadata', '-1',
+    '-ac', '1', '-ar', '22050', '-c:a', 'libmp3lame', '-b:a', '48k', audio
+  ])
+  if (extracted && fs.existsSync(audio)) {
+    console.log('        note: no usable video clip, so this runs the audio (-a) path')
+    return audio
+  }
+  console.log('        note: could not clip the fixture; transcribing it whole (this will be slow)')
+  return null
 }
 
 /** Stage-2 fixtures the user drops in; absent means the probe skips, never fails. */
@@ -383,12 +481,19 @@ async function main(): Promise<void> {
     `ffmpeg:    ${FFMPEG_PATH ?? 'bundled/default (set SRT_VERIFY_FFMPEG_PATH to verify an override)'}`
   )
 
+  // An override has to reach the app the way a user's does — through the persisted setting —
+  // or `startTranscribe` reads the stub's empty default and the end-to-end probes quietly run
+  // on a different binary than the direct calls, which is worse than not offering the mode.
+  if (FFMPEG_PATH) setSettings({ ffmpegPath: FFMPEG_PATH })
+
   // ── B1 / C19 — the frozen binary reaches Google and the model list is honest ──
   section('L1 — list-models against a real key (B1, C19)')
   const list = await run(['list-models', '-k', secret, '--skip-upgrade'])
   const listOut = mask(list.stdout + list.stderr)
   const ids = Array.from(listOut.matchAll(/\b(gemini-[a-z0-9.\-]+)/gi)).map((m) => m[1])
   const unique = Array.from(new Set(ids))
+  const model = cheapestModel(unique)
+  const capable = (id: string): boolean => modelCapabilities(id).supportsTranscription
 
   const listOk = check('list-models exits 0 with --skip-upgrade', list.code === 0, `exit ${list.code}`)
   if (!listOk) console.log(listOut.split('\n').slice(-12).join('\n'))
@@ -401,7 +506,6 @@ async function main(): Promise<void> {
       : '        (B1: no aliases returned on this account)'
   )
 
-  const model = cheapestModel(unique)
   if (!model) {
     console.error('\nNo usable model returned; cannot run the translation probes.\n')
     process.exit(1)
@@ -410,7 +514,6 @@ async function main(): Promise<void> {
 
   // Selection self-checks. These settle the cases a normal account never exercises — a key
   // with a capable pro model but no capable flash — without waiting for such a key to exist.
-  const capable = (id: string): boolean => modelCapabilities(id).supportsTranscription
   check(
     'transcription falls back to a capable pro model when no capable flash exists',
     cheapestModel(['gemini-2.0-flash', 'gemini-2.5-pro'], capable, { fallbackToAnyEligible: true }) ===
@@ -636,28 +739,21 @@ async function main(): Promise<void> {
       'this key exposes no transcription-capable model at any tier: coverage unavailable, not failing'
     )
   } else {
-    const source = media[0]
+    // Real fixtures are feature-length. Transcribing 340 MB uploads 340 MB and buys no
+    // coverage the first minute does not: L7 is about the transcribe path, exactly as L6
+    // trims to five cues. The clip is a stream copy, so the bytes the engine sees are the
+    // fixture's own — a re-encode would be testing ffmpeg, not the app.
+    const smallest = [...media].sort((a, b) => fs.statSync(a).size - fs.statSync(b).size)[0]
+    const source = (await makeClip(smallest, work)) ?? smallest
     const label = path.basename(source)
+    console.log(
+      `        ${path.basename(smallest)} -> ${label} (${(fs.statSync(source).size / 1e6).toFixed(1)} MB)`
+    )
     if (txModel !== model) {
       console.log(`        Using ${txModel} — the cheapest transcription-capable model this key exposes`)
     }
     const outTx = path.join(work, 'transcribed.srt')
-    const txArgs = buildTranscribeArgs(
-      {
-        mediaFile: source,
-        outputFile: outTx,
-        targetLang: 'en',
-        model: txModel,
-        apiKeys: [secret],
-        thinkingLevel: 'low',
-        thinkingBudget: 512,
-        customGenerationParams: false,
-        temperature: 1,
-        topP: 0.95,
-        topK: null
-      } satisfies TranscribeArgs,
-      outTx
-    )
+    const txArgs = buildTranscribeArgs(transcribeArgs(source, txModel, outTx), outTx)
     check(
       `${label}: the media flag matches the file type`,
       txArgs.includes(/\.(mp4|mkv|mov|avi|webm|m4v|ts|wmv|flv)$/i.test(source) ? '-v' : '-a')
@@ -674,6 +770,216 @@ async function main(): Promise<void> {
     }
   }
 
+  // ── ENG-1 — audio the engine cannot read is normalised before it is spawned ──
+  section('L8 — unreadable audio is converted (ENG-1)')
+  check('.m4a is recognised as needing conversion', needsAudioConversion('a.m4a'))
+  check('.aac and .flac too', needsAudioConversion('a.aac') && needsAudioConversion('a.flac'))
+  check(
+    'the formats the engine reads are left alone',
+    !needsAudioConversion('a.mp3') && !needsAudioConversion('a.wav')
+  )
+  check('video is left alone — it never had this problem', !needsAudioConversion('a.mkv'))
+
+  if (!media.length) {
+    skip('the ENG-1 round trip', `no media in ${FIXTURE_DIR} to build an .m4a from`)
+  } else if (!txModel) {
+    skip('the ENG-1 round trip', 'no transcription-capable model on this key')
+  } else {
+    const rawM4a = path.join(work, 'unreadable.m4a')
+    const built = await ffmpegRun([
+      '-y', '-i', [...media].sort((a, b) => fs.statSync(a).size - fs.statSync(b).size)[0],
+      '-t', String(CLIP_SECONDS), '-vn', '-sn', '-dn', '-map', '0:a:0',
+      '-c:a', 'aac', '-b:a', '96k', rawM4a
+    ])
+    if (!built || !fs.existsSync(rawM4a)) {
+      skip('the ENG-1 round trip', 'ffmpeg could not build an .m4a fixture')
+    } else {
+      // The defect must still be demonstrable, or the conversion below proves nothing.
+      // This costs no quota: the engine dies in its own ffmpeg step, before any API call.
+      const rawOut = path.join(work, 'raw.srt')
+      const raw = await run(buildTranscribeArgs(transcribeArgs(rawM4a, txModel, rawOut), rawOut))
+      const rawLog = mask(raw.stdout + raw.stderr)
+      // A bare non-zero exit is not evidence: a missing engine, a bad key, a timeout or any
+      // unrelated crash would satisfy it just as well as the decoder defect, and the probe
+      // would then certify the workaround while never having exercised what it works around.
+      const decoderFailure = /Conversion failed/i.test(rawLog)
+      const unrelated = /API[_ ]?KEY|api key|quota|ModuleNotFoundError|is not recognized|No such file/i.test(
+        rawLog
+      )
+      check(
+        'the raw .m4a still fails in the engine, in its pre-API decode step',
+        !raw.timedOut && raw.code !== 0 && decoderFailure && !unrelated,
+        `exit ${raw.code}${raw.timedOut ? ', timed out' : ''}` +
+          (decoderFailure ? '' : ', no "Conversion failed" in the log') +
+          (unrelated ? ', failed for an unrelated reason' : '') +
+          ' — if the decode now succeeds, ENG-1 is fixed upstream and the workaround can be deleted'
+      )
+
+      const before = fs.readFileSync(rawM4a)
+      // Same ffmpeg the app would use: production passes `getSettings().ffmpegPath`, so a
+      // probe that silently used a different binary would certify a path nobody ships.
+      const prepared = await ensureEngineReadableAudio(rawM4a, FFMPEG_PATH)
+      if (check('the app converts it', prepared.ok && prepared.converted)) {
+        const preparedPath = prepared.ok ? prepared.path : rawM4a
+        check('the converted file is an .mp3', path.extname(preparedPath) === '.mp3')
+        check(
+          "the user's original .m4a is byte-identical afterwards",
+          Buffer.compare(before, fs.readFileSync(rawM4a)) === 0
+        )
+        // This probe owns the file it just made; the app's own copy is what the round trip
+        // below is about, and leaving this one behind would corrupt its cleanup baseline.
+        try {
+          fs.unlinkSync(preparedPath)
+        } catch {
+          /* best effort */
+        }
+
+        // The round trip goes through the PRODUCTION entry point, not a hand-built argv, so
+        // it covers the conversion, the spawn and the scratch cleanup as one path.
+        const tempDir = path.dirname(tempOutputPath('.mp3'))
+        const mp3sBefore = fs.readdirSync(tempDir).filter((f) => f.endsWith('.mp3')).length
+        const outFixed = path.join(work, 'converted.srt')
+        const log: string[] = []
+        const closed = new Promise<number | null>((resolve) => {
+          void startTranscribe(transcribeArgs(rawM4a, txModel, outFixed), {
+            onOutput: (_s, line) => log.push(line),
+            onDone: (code) => resolve(code)
+          })
+        })
+        const code = await closed
+        check('the app transcribes the .m4a end to end', code === 0, `exit ${code}`)
+        check(
+          'it announces the conversion before the pause',
+          log.some((l) => /Preparing .*converting to MP3/i.test(l))
+        )
+        if (check('an .srt is written for the converted audio', fs.existsSync(outFixed))) {
+          const body = fs.readFileSync(outFixed, 'utf8')
+          check('it contains cues with text', cueCount(body) > 0 && /-->.*\r?\n\s*\S+/.test(body))
+        } else {
+          console.log(mask(log.join('\n')).split('\n').slice(-15).join('\n'))
+        }
+        check(
+          'the temporary MP3 is deleted once the job ends',
+          fs.readdirSync(tempDir).filter((f) => f.endsWith('.mp3')).length === mp3sBefore,
+          'a converted copy of the user\u2019s audio must not outlive the job'
+        )
+
+        // The round trip above only verifies the CONFIGURED ffmpeg if `startTranscribe` reads
+        // the setting at all — and it would pass either way while a bundled binary is on hand.
+        // Pointing the setting at a path that cannot exist settles it: the conversion must
+        // fail. If it succeeds, Settings is being ignored and this probe's override mode is a
+        // fiction.
+        const configuredFfmpeg = getSettings().ffmpegPath
+        setSettings({ ffmpegPath: path.join(work, 'no-such-ffmpeg.exe') })
+        const bogusOut = path.join(work, 'bogus-ffmpeg.srt')
+        const bogusLog: string[] = []
+        const bogusCode = await new Promise<number | null>((resolve) => {
+          void startTranscribe(transcribeArgs(rawM4a, txModel, bogusOut), {
+            onOutput: (_s, line) => bogusLog.push(line),
+            onDone: (c) => resolve(c)
+          })
+        })
+        setSettings({ ffmpegPath: configuredFfmpeg })
+        check(
+          'the conversion uses the FFmpeg configured in Settings',
+          bogusCode !== 0 && !fs.existsSync(bogusOut),
+          `exit ${bogusCode} — a broken configured path must not silently fall back`
+        )
+        check(
+          'and a broken one is reported as a conversion failure',
+          bogusLog.some((l) => /convert/i.test(l)),
+          mask(bogusLog.slice(-3).join(' | '))
+        )
+      }
+    }
+  }
+
+  // ── The job lifecycle around that conversion (ENG-1, ENG-2, ENG-3) ──
+  // Free: every assertion here is settled during the conversion, before gst is ever spawned.
+  section('L9 — Stop and the single-job lock during preparation')
+  const m4aForStop = path.join(work, 'lifecycle.m4a')
+  if (!media.length) {
+    skip('the preparation lifecycle', `no media in ${FIXTURE_DIR} to build an .m4a from`)
+  } else if (
+    !(await ffmpegRun([
+      '-y', '-i', [...media].sort((a, b) => fs.statSync(a).size - fs.statSync(b).size)[0],
+      '-t', String(CLIP_SECONDS), '-vn', '-sn', '-dn', '-map', '0:a:0',
+      '-c:a', 'aac', '-b:a', '96k', m4aForStop
+    ]))
+  ) {
+    skip('the preparation lifecycle', 'ffmpeg could not build an .m4a fixture')
+  } else {
+    const tempDir = path.dirname(tempOutputPath('.mp3'))
+    const mp3sBefore = fs.readdirSync(tempDir).filter((f) => f.endsWith('.mp3')).length
+
+    const done: Array<number | null> = []
+    const stderrLines: string[] = []
+    const outPath = path.join(work, 'lifecycle.srt')
+    const pending = startTranscribe(transcribeArgs(m4aForStop, txModel ?? 'gemini-2.5-flash-lite', outPath), {
+      onOutput: (stream, line) => {
+        if (stream === 'stderr') stderrLines.push(line)
+      },
+      onDone: (code) => done.push(code)
+    })
+
+    // Synchronous, so this lands mid-conversion by construction.
+    check('the job slot is held while the audio is being prepared', isRunning())
+
+    const refusedDone: Array<number | null> = []
+    startTranslate(translateFixtureArgs({ inputFile: srcSrt, model }), {
+      onOutput: () => {},
+      onDone: (code) => refusedDone.push(code)
+    })
+    check(
+      'a second job started during preparation is refused',
+      refusedDone.length === 1 && refusedDone[0] !== 0,
+      `${refusedDone.length} terminal events — a refusal with none leaves that page running forever`
+    )
+
+    // Through the REAL IPC handler, not just the function it calls. The refusal fires
+    // `onDone` synchronously, so the handler's closure runs before its own `const` bindings
+    // exist — a defect that lives in the closure and is invisible to a direct call.
+    registerIpc()
+    let handlerError: string | null = null
+    let handlerResult: unknown = undefined
+    try {
+      handlerResult = __invokeIpc('translate:start', translateFixtureArgs({ inputFile: srcSrt, model }))
+    } catch (err) {
+      handlerError = (err as Error).message
+    }
+    check(
+      'the production translate:start survives a synchronous refusal',
+      handlerError === null,
+      handlerError ?? ''
+    )
+    // Without this the check above could pass vacuously: if the model guard rejected first,
+    // the handler would return '' having never reached the refusal that fires `onDone`.
+    check(
+      'and it really did reach that refusal, rather than stopping at the model guard',
+      typeof handlerResult === 'string' && handlerResult !== '',
+      `returned ${JSON.stringify(handlerResult)}`
+    )
+    check('the refused translate did not take the slot', isRunning())
+
+    stopCurrent()
+    await pending
+    await new Promise((r) => setTimeout(r, 250))
+
+    check('Stop during preparation ends the job', done.length === 1, `${done.length} terminal events`)
+    check('it does not report success', done[0] !== 0, `code ${done[0]}`)
+    check('no transcript is produced after a Stop', !fs.existsSync(outPath))
+    check('the slot is released', !isRunning())
+    check(
+      'the temporary MP3 is not left behind',
+      fs.readdirSync(tempDir).filter((f) => f.endsWith('.mp3')).length === mp3sBefore
+    )
+    check(
+      'the user is told why it stopped',
+      stderrLines.some((l) => /stopped/i.test(l)),
+      stderrLines.join(' | ')
+    )
+  }
+
   console.log(`\n${passes} passed, ${failures} failed${skipped ? `, ${skipped} skipped` : ''}`)
   if (failures) {
     console.log('\nFailed checks:')
@@ -683,7 +989,7 @@ async function main(): Promise<void> {
   }
   console.log(
     skipped
-      ? `\nALL RUNNABLE PROBES PASSED (${skipped} skipped — drop fixtures in ${FIXTURE_DIR} to run stage 2)`
+      ? `\nALL RUNNABLE PROBES PASSED (${skipped} skipped — see the SKIP lines above for why)`
       : '\nALL LIVE PROBES PASSED'
   )
   console.log(`Artifacts: ${work}`)

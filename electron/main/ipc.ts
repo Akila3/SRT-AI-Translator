@@ -470,16 +470,26 @@ export function registerIpc(): void {
       thoughtsLog,
       resumeContextSize
     }
-    const { outputPath, logPaths } = startTranslate(fullArgs, {
+    // Declared and initialised BEFORE the call, because several failure paths inside
+    // `startTranslate` — a busy slot, a refused non-UTF-8 `.ass`, a spawn that throws —
+    // invoke `onDone` synchronously, i.e. before this statement's own binding exists.
+    // Destructuring straight into the closure put `logPaths` in the temporal dead zone and
+    // turned every one of those refusals into a ReferenceError. There are no sidecars to
+    // report when a job never started, so an empty list is the correct value for them.
+    let logPaths: string[] = []
+    const started = startTranslate(fullArgs, {
       onOutput: (stream, line) => send('translate:output', { stream, line }),
       onDone: (code, op) => send('translate:done', { code, outputPath: op, logPaths })
     })
-    return outputPath
+    logPaths = started.logPaths
+    return started.outputPath
   })
 
-  ipcMain.handle('transcribe:start', (_e, args: TranscribeArgs) => {
+  ipcMain.handle('transcribe:start', async (_e, args: TranscribeArgs) => {
     if (!passesModelGuard(args.model, args.apiKeys)) return ''
-    return startTranscribe(args, {
+    // Awaited because unreadable audio is converted first; the renderer's contract is
+    // unchanged, since `startTranscribe` was already a Promise across the IPC boundary.
+    return await startTranscribe(args, {
       onOutput: (stream, line) => send('translate:output', { stream, line }),
       onDone: (code, outputPath) => send('translate:done', { code, outputPath })
     })

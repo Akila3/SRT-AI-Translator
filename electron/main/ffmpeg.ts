@@ -57,13 +57,17 @@ export function envWithFfmpeg(ffmpegPath?: string, extra?: NodeJS.ProcessEnv): N
   return { ...process.env, ...extra, PATH }
 }
 
-function execCapture(cmd: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function execCapture(
+  cmd: string,
+  args: string[],
+  signal?: AbortSignal
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     let stdout = ''
     let stderr = ''
     let proc
     try {
-      proc = spawn(cmd, args)
+      proc = spawn(cmd, args, signal ? { signal } : {})
     } catch (err) {
       resolve({ code: -1, stdout: '', stderr: (err as Error).message })
       return
@@ -109,6 +113,50 @@ export async function probeTracks(filePath: string, ffmpegPath?: string): Promis
       isImage
     }
   })
+}
+
+/**
+ * Transcode an audio file to mono MP3 for the engine.
+ *
+ * The engine loads audio with pydub, which hands ffmpeg a forced input format; an
+ * AAC/M4A/FLAC file is then decoded as `mp3float`, produces no packets, and dies with
+ * "Conversion failed!" — reported by the frozen build as `name 'exit' is not defined`,
+ * because PyInstaller omits the `site` builtin that `exit()` comes from. Verified against
+ * gst 3.7.0 on 2026-08-19: of the formats the picker offers, only `.mp3` and `.wav` survive.
+ *
+ * MP3 is not an arbitrary choice — it is what the engine's own `extract_audio_from_video`
+ * produces for video input, so this hands it a shape it already reads. Mono at 64 kbps
+ * matches its own downmix-and-compress step and keeps the upload small; speech does not
+ * benefit from more.
+ */
+export async function convertAudioToMp3(
+  inputPath: string,
+  outPath: string,
+  ffmpegPath?: string,
+  signal?: AbortSignal
+): Promise<{ ok: boolean; error?: string }> {
+  const ffmpeg = resolveTool('ffmpeg', ffmpegPath)
+  const { code, stderr } = await execCapture(
+    ffmpeg,
+    [
+      '-y', '-i', inputPath,
+      '-vn', '-sn', '-dn', '-map', '0:a:0', '-map_metadata', '-1',
+      '-ac', '1', '-ar', '22050', '-c:a', 'libmp3lame', '-b:a', '64k',
+      outPath
+    ],
+    signal
+  )
+  if (code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) return { ok: true }
+
+  // A failed or cancelled conversion still leaves a partial file behind, and nothing
+  // downstream knows about a path that was never returned to it.
+  try {
+    if (fs.existsSync(outPath)) fs.unlinkSync(outPath)
+  } catch {
+    /* best effort */
+  }
+  const detail = stderr.trim().split(/\r?\n/).slice(-3).join(' ').trim()
+  return { ok: false, error: detail || `ffmpeg exited with code ${code}` }
 }
 
 export async function extractTrack(
