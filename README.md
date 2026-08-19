@@ -108,6 +108,10 @@ Subtitle files must be UTF-8. A non-UTF-8 `.srt` is converted automatically to a
 
 ## Development
 
+Before changing anything, read [ARCHITECTURE.md](ARCHITECTURE.md). It covers how the pieces fit
+together, which modules ripple when you touch them, what the translation engine guarantees about its
+arguments and its output, and the hazards that have caused real bugs here.
+
 ### Requirements
 
 - Node.js 18 or newer.
