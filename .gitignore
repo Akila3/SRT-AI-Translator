@@ -4,7 +4,12 @@ release/
 dist/
 .venv-build/
 resources/bin/
+# Engineering process, deliberately not published: agent instructions, prompt docs and the
+# planning/handoff notes. The architecture they describe is published as ARCHITECTURE.md instead.
 .cursor/
+AGENTS.md
+SETUP.md
+docs/
 Source Codes/
 # Local verification secrets. Never commit an API key: git history is permanent and a key
 # pushed once must be treated as burned even if the next commit removes it.
