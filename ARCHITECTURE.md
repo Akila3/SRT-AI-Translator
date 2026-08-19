@@ -220,6 +220,22 @@ Notable helpers, and the promise each makes:
 | `generationParamArgs()` | Emits temperature/top-p/top-k only when the custom-parameters toggle is on, and never emits a zero — the engine's truthiness check would drop it silently, so the UI would be claiming to send something it did not. |
 | `envWithFfmpeg()` | **Appends** the bundled bin directory to PATH, never prepends. See hazard 2. |
 
+### Three contracts that cross the process boundary
+
+These are produced in the main process and change renderer behaviour, so they are as load-bearing as
+any function signature.
+
+| Contract | Shape | Persisted? |
+|---|---|---|
+| `modelNeedsVerification` | `boolean` on settings. Set when a stored model id looks suspicious but is unproven | **Yes.** Advisory only — it must never authorise a reset. Cleared by the first complete refresh that finds the id |
+| `refreshOutcome` | `allComplete` / `activeComplete` / `partial` / `failed` | **No.** It describes one fetch attempt, not stored state. Persisting it would let a stale outcome authorise a later reset |
+| The **active set** | The ranked key slots truncated to two, exactly matching what the argument builder emits as `-k` / `-k2` | Derived, never stored |
+
+The active set has one property worth stating explicitly, because assuming otherwise breaks the most
+common setup: **its size comes from the ranked list, not from how many slots are configured.** The
+ranking drops invalid slots whenever a usable one exists, so one valid key plus two dead reserves
+gives an active set of **one**. Any code assuming a length of two breaks single-key users.
+
 Import graph, main process — no cycles:
 
 ```
