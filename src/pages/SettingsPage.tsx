@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
 import {
   Label,
@@ -11,6 +11,12 @@ import {
   Divider,
   Pill
 } from '../components/ui'
+import {
+  countKeyStates,
+  keyHeadline,
+  keyStateOf,
+  uncheckedNote
+} from '../lib/keyStatus'
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from '../data/languages'
 import { THINKING_LEVELS, SERVICE_TIERS, paidQuotaTooltip, RATE_LIMITS_URL } from '../data/freeTier'
 import {
@@ -30,6 +36,7 @@ import {
 import {
   DEFAULT_RESUME_CONTEXT_SIZE,
   type AppSettings,
+  type EngineInfo,
   type ModelInfo
 } from '../../electron/shared/types'
 
@@ -108,6 +115,11 @@ function KeyStatus({
   } else if (state === false) {
     content = <span className="text-red-500 dark:text-red-400">✗</span>
     title = error || 'Invalid key'
+  } else if (hasKey && error) {
+    // Asked, and learned nothing — offline, out of quota, or an error we do not recognise.
+    // A ✗ here is what MAN-4 was: an accusation the evidence did not support.
+    content = <span className="text-amber-500 dark:text-amber-400">?</span>
+    title = `Could not be checked. ${error}`
   }
   return (
     <span className="flex h-9 w-5 flex-shrink-0 items-center justify-center text-sm font-bold" title={title}>
@@ -275,7 +287,9 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
   const [refreshing, setRefreshing] = useState(false)
   const [modelCount, setModelCount] = useState<number | null>(null)
   const [notice, setNotice] = useState('')
-  const [failedSlots, setFailedSlots] = useState<number[]>([])
+  // Which slots could not be checked is no longer local state: it is read from the same
+  // persisted verdict the ✗/? marks use, so the summary cannot disagree with the marks — which
+  // is precisely how MAN-4's two contradictory sentences came to be shown side by side.
   const [revealed, setRevealed] = useState<Record<number, boolean>>({})
   const keys = settings.apiKeys.length ? settings.apiKeys : ['']
   const tiers = keys.map((_, i) => settings.apiKeyTiers?.[i] ?? 'free')
@@ -350,22 +364,32 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
       await reload()
       // Report a count only for a refresh that was actually persisted. An incomplete
       // refresh keeps the previous list, so quoting the number it happened to return
-      // would claim a fetch succeeded when the picker did not change.
-      const persisted = res.refreshOutcome === 'allComplete' || res.refreshOutcome === 'activeComplete'
+      // would claim a fetch succeeded when the picker did not change. A DISCARDED result
+      // is the same situation arrived at differently: the fetch may have been complete,
+      // but it described keys that are no longer the ones on screen.
+      const persisted =
+        !res.discarded &&
+        (res.refreshOutcome === 'allComplete' || res.refreshOutcome === 'activeComplete')
       setModelCount(persisted ? res.models.length : null)
-      setFailedSlots(res.slots.filter((s) => s.queried && !s.ok).map((s) => s.slot))
       setNotice(res.notice)
     } finally {
       setRefreshing(false)
     }
   }
 
-  const nonEmptyCount = keys.filter((k) => k.trim()).length
-  const validCount = valids.filter((v) => v === true).length
-  // Only keys explicitly checked and rejected count as invalid — a freshly added
-  // (or edited) key has status `null` (unchecked) and must not be reported as bad.
-  const invalidCount = valids.filter((v, i) => v === false && keys[i].trim()).length
-  const checkedAny = valids.some((v) => v !== null)
+  // Counting moved into `src/lib/keyStatus.ts`, where it can be gated: every one of MAN-4's
+  // three faults was a sentence, and a sentence is exactly what a type checker cannot judge.
+  // `false` now means the API refused the key; `null` means we did not find out.
+  const states = keys.map((k, i) => keyStateOf(!!k.trim(), valids[i]))
+  const counts = countKeyStates(states)
+  const headline = keyHeadline(counts, modelCount)
+  const uncheckedSlots = states
+    .map((s, i) => (s === 'unchecked' && errs[i] ? i : -1))
+    .filter((i) => i >= 0)
+  // `notice` is part of this: it is the only place a discarded check can announce itself, and
+  // that message must not be invisible to the one user guaranteed to need it — someone whose
+  // keys have no verdict yet, which is exactly when nothing else here has anything to say.
+  const reportedAny = counts.valid > 0 || counts.rejected > 0 || uncheckedSlots.length > 0 || !!notice
   // Read from the ranking, not from slot 0: an invalid first key is skipped at spawn time
   // and the promoted key's tier is what decides `--paid-quota`.
   const { slot: primarySlot, paid: primaryPaid } = effectivePrimary(settings)
@@ -392,6 +416,13 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
                   value={k}
                   placeholder={i === 0 ? 'Primary API key' : `Fallback key ${i}`}
                   onChange={(e) => updateKey(i, e.target.value)}
+                  // Locked for the length of the check, because everything the check produces
+                  // is addressed by slot number and none of it carries the key it came from:
+                  // change a key mid-flight and its predecessor's verdict, error and model
+                  // evidence land on the new one. The main process discards such a result as
+                  // well; this is what stops the user losing a minute's checking to it.
+                  disabled={refreshing}
+                  title={refreshing ? 'Locked while your keys are being checked.' : undefined}
                   className="w-full pr-9"
                 />
                 <button
@@ -417,8 +448,11 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
               {keys.length > 1 && (
                 <button
                   onClick={() => removeKey(i)}
-                  className="flex h-9 w-9 items-center justify-center rounded-md border border-gray-300 text-gray-500 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-400 dark:hover:bg-gray-700"
-                  title="Remove key"
+                  // Removing is the sharpest edge of the same race: it renumbers every slot
+                  // above it, so an in-flight result would land wholesale on the wrong keys.
+                  disabled={refreshing}
+                  className="flex h-9 w-9 items-center justify-center rounded-md border border-gray-300 text-gray-500 hover:bg-gray-50 disabled:opacity-40 dark:border-gray-600 dark:text-gray-400 dark:hover:bg-gray-700"
+                  title={refreshing ? 'Locked while your keys are being checked.' : 'Remove key'}
                 >
                   ✕
                 </button>
@@ -427,7 +461,12 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
           ))}
         </div>
         {keys.length < 5 && (
-          <button onClick={addKey} className="mt-2 text-sm font-medium text-brand hover:underline">
+          <button
+            onClick={addKey}
+            disabled={refreshing}
+            className="mt-2 text-sm font-medium text-brand hover:underline disabled:opacity-40 disabled:hover:no-underline"
+            title={refreshing ? 'Locked while your keys are being checked.' : undefined}
+          >
             + Add another key
           </button>
         )}
@@ -470,36 +509,34 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
           )}
         </div>
 
-        {checkedAny && (
+        {reportedAny && (
           <div className="mt-2 space-y-0.5 text-xs">
-            {validCount > 0 ? (
-              <p className="font-medium text-green-700 dark:text-green-400">
-                ✓ {validCount} of {nonEmptyCount} key{nonEmptyCount > 1 ? 's' : ''} valid
-                {modelCount !== null ? ` — ${modelCount} models available.` : '.'}
-              </p>
-            ) : (
-              <p className="text-red-600 dark:text-red-400">
-                ✗ No valid keys — check the key(s) marked ✗ above.
-              </p>
-            )}
-            {invalidCount > 0 && (
+            <p
+              className={
+                headline.tone === 'good'
+                  ? 'font-medium text-green-700 dark:text-green-400'
+                  : headline.tone === 'bad'
+                    ? 'text-red-600 dark:text-red-400'
+                    : 'text-amber-600 dark:text-amber-400'
+              }
+            >
+              {headline.text}
+            </p>
+            {counts.rejected > 0 && (
               <p className="text-amber-600 dark:text-amber-400">
-                {invalidCount} key{invalidCount > 1 ? 's' : ''} invalid
+                {counts.rejected} key{counts.rejected > 1 ? 's' : ''} rejected by the API
                 (marked ✗ — hover for details).
               </p>
             )}
-            {valids[0] === false && validCount > 0 && (
+            {valids[0] === false && counts.valid > 0 && (
               <p className="text-brand">
                 Your first key is invalid — translations will automatically use your first valid
                 key instead.
               </p>
             )}
-            {failedSlots.length > 0 && (
+            {uncheckedSlots.length > 0 && (
               <p className="text-amber-600 dark:text-amber-400">
-                Key {failedSlots.map((i) => i + 1).join(', ')} could not be checked
-                {failedSlots.every((i) => !active.includes(i))
-                  ? ' — it is a reserve key, so this does not affect runs.'
-                  : ' — it is one of the two keys a run would use.'}
+                {uncheckedNote(uncheckedSlots, active)}
               </p>
             )}
             {notice && <p className="text-brand">{notice}</p>}
@@ -918,6 +955,13 @@ function SectionOutput({ settings, set }: SectionProps): React.JSX.Element {
 }
 
 function SectionAdvanced({ settings, set }: SectionProps): React.JSX.Element {
+  // Read once when Advanced is opened. The answer cannot change while the app runs — it is
+  // decided by where this build was installed and what is on PATH at launch.
+  const [engine, setEngine] = useState<EngineInfo | null>(null)
+  useEffect(() => {
+    void window.api.getEngineInfo().then(setEngine)
+  }, [])
+
   async function pickFfmpeg(): Promise<void> {
     const p = await window.api.openFile([{ name: 'Executable', extensions: ['exe', '*'] }])
     if (p) set('ffmpegPath', p)
@@ -925,6 +969,34 @@ function SectionAdvanced({ settings, set }: SectionProps): React.JSX.Element {
   return (
     <div className="max-w-2xl space-y-5">
       <SectionTitle>Advanced</SectionTitle>
+      <div>
+        <Label tip="The translation engine this app will run, resolved the same way a real job resolves it. It is read-only because it is not a setting: a packaged build uses the copy shipped inside it, and a development build falls back to whatever 'gst' is on your PATH — which is exactly the difference this line exists to make visible. Quote it in any bug report.">
+          Engine
+        </Label>
+        <div className="flex items-center gap-2">
+          <TextInput
+            readOnly
+            value={engine ? engine.path : 'Checking…'}
+            className={`flex-1 font-mono text-xs ${engine && !engine.found ? 'text-red-600 dark:text-red-400' : ''}`}
+          />
+          <Button
+            variant="secondary"
+            disabled={!engine?.found}
+            onClick={() => engine && void window.api.showItemInFolder(engine.path)}
+          >
+            Show in folder
+          </Button>
+        </div>
+        {engine && (
+          <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+            {engine.bundled
+              ? 'Bundled with this app — this is the engine a release is meant to run.'
+              : engine.found
+                ? 'Found on your system PATH, not inside this app. Expected in development; in a packaged build it means the bundled copy is missing.'
+                : 'Not found. Runs will fail to start until a gst executable is on your PATH.'}
+          </p>
+        )}
+      </div>
       <div>
         <Label tip="Path to the FFmpeg executable. Only needed for video/audio features: the Transcribe tab, the Video File field, and the Audio File field on the Translate tab. Not required for plain subtitle translation.
 

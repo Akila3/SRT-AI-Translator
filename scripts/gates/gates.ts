@@ -29,13 +29,17 @@ import {
 import { DEFAULT_MODELS, DEFAULT_MODEL_ID, store, setSettings } from '../../electron/main/store'
 import {
   buildModelList,
+  classifyFetchFailure,
   compareVersions,
   guardModelForSpawn,
+  keepProvenRejections,
   resolveDefaultModel,
-  summarizeRefresh
+  summarizeRefresh,
+  type PriorVerdict
 } from '../../electron/main/modelsList'
 import {
   applyModelSelectionRules,
+  keySnapshotChanged,
   retargetTokenReport,
   scanOutputFiles,
   singleKeyRefreshScope
@@ -79,7 +83,21 @@ import {
 } from '../../electron/shared/modelCaps'
 import { valueOnBlur, valueWhileTyping, type NumberFieldRules } from '../../src/lib/numberField'
 import { companionName, extractedTrackName } from '../../src/lib/outputName'
+import {
+  countKeyStates,
+  keyHeadline,
+  keyStateOf,
+  listKeyNumbers,
+  uncheckedNote
+} from '../../src/lib/keyStatus'
+import { maskCommandLine } from '../../electron/shared/maskedCommand'
+import {
+  TIER1_LINES,
+  TIER1_QUIET_MS,
+  createStallWatch
+} from '../../electron/shared/stallBudget'
 import type {
+  KeyCheck,
   ModelInfo,
   SlotFetchResult,
   SubtitleTrack,
@@ -1475,6 +1493,378 @@ section('G7 — ffmpeg progress is read, never invented (REP-11)')
   eq('G7 nor beyond it', percentOf(9999, 5405.28), 99)
   eq('G7 no duration means no percentage', percentOf(120, null), null)
   eq('G7 a nonsense duration means the same', percentOf(120, 0), null)
+}
+
+section('G8a — the command line is shown, the keys are not (MAN-7)')
+{
+  const KEY = 'AIzaSyD-1234567890abcdefghijklmnopqrstu'
+  const KEY2 = 'AIzaSyC-0987654321zyxwvutsrqponmlkjihg'
+
+  const line = maskCommandLine('C:\\App\\resources\\bin\\gst.exe', [
+    'translate', '-i', 'C:\\Subs\\My Show.srt', '-o', 'C:\\out.srt',
+    '-k', KEY, '-k2', KEY2, '-m', 'gemini-3.7-flash', '--paid-quota', '--no-resume'
+  ])
+  check('G8a neither key appears anywhere in the line', !line.includes(KEY) && !line.includes(KEY2), line)
+  check('G8a both are shown as masked', (line.match(/\*\*\*/g) ?? []).length === 2, line)
+  check('G8a the flags themselves are still visible', line.includes('-k ***') && line.includes('-k2 ***'), line)
+  // The whole point of the line: these are the questions three checklist rows ask and the app
+  // has never been able to answer.
+  check('G8a --paid-quota is observable', line.includes('--paid-quota'), line)
+  check('G8a so is the model', line.includes('-m gemini-3.7-flash'), line)
+  check('G8a and the engine that will run it', line.startsWith('C:\\App\\resources\\bin\\gst.exe'), line)
+  check('G8a a path with spaces stays one argument', line.includes('"C:\\Subs\\My Show.srt"'), line)
+
+  // Masking is POSITIONAL. A key of an unexpected shape — Google has changed key formats
+  // before — must be masked because of where it sits, never because of what it looks like.
+  const odd = maskCommandLine('gst', ['transcribe', '-k', 'not-a-key-at-all'])
+  check('G8a a key that does not look like one is still masked', !odd.includes('not-a-key-at-all'), odd)
+
+  // …and the converse: nothing is masked for merely resembling a key.
+  const description = maskCommandLine('gst', ['translate', '-d', 'Set in AIzaSy, a fictional town'])
+  check(
+    'G8a an argument that merely resembles a key is left alone',
+    description.includes('AIzaSy, a fictional town'),
+    description
+  )
+
+  // The exact-match sweep: a user who pasted their key into the description would otherwise
+  // have it printed back at them in full, positional masking notwithstanding.
+  const pasted = maskCommandLine('gst', ['translate', '-k', KEY, '-d', `use ${KEY} please`])
+  check('G8a a key repeated elsewhere is redacted there too', !pasted.includes(KEY), pasted)
+  check('G8a and the rest of that argument survives', pasted.includes('use *** please'), pasted)
+
+  // Short values are masked positionally but never swept, because blanket-replacing two
+  // characters would corrupt unrelated arguments and protect nothing that could be a key.
+  const shortKey = maskCommandLine('gst', ['translate', '-k', 'ab', '-m', 'gemini-flash-ab'])
+  check('G8a a short key is still masked in place', !/-k ab\b/.test(shortKey), shortKey)
+  check('G8a but an unrelated argument is not mangled', shortKey.includes('gemini-flash-ab'), shortKey)
+
+  // Malformed argv must not consume what is not there: a trailing -k would otherwise swallow
+  // the next flag and print the key that follows it.
+  const trailing = maskCommandLine('gst', ['translate', '-k'])
+  eq('G8a a flag with no value masks nothing', trailing, 'gst translate -k')
+  const joined = maskCommandLine('gst', ['translate', `-k=${KEY}`])
+  check('G8a the -k=value form is masked too', !joined.includes(KEY), joined)
+
+  // The real argv, from the real builder, is the only fixture that proves the emitted line is
+  // safe — a hand-written array cannot notice a future flag that carries a credential.
+  setSettings({ apiKeys: [KEY, KEY2], apiKeyValid: [true, true], apiKeyTiers: ['paid', 'free'] })
+  const realArgs = buildTranslateArgs(
+    {
+      inputFile: 'in.srt', sourceLang: 'auto', targetLang: 'he', model: 'gemini-2.5-flash',
+      apiKeys: [KEY, KEY2], batchSize: 100, batchContext: true, customGenerationParams: false,
+      temperature: 0.7, topP: 0.95, topK: 40, thinkingLevel: 'default', thinkingBudget: 0,
+      serviceTier: 'standard', paidQuota: true, disableStreaming: false,
+      writeTokenReport: false, progressLog: false, thoughtsLog: false
+    } as TranslateArgs,
+    'out.srt'
+  )
+  const realLine = maskCommandLine('gst', realArgs)
+  check('G8a the real argv builder leaks no key either', !realLine.includes(KEY) && !realLine.includes(KEY2), realLine)
+  check('G8a and its --paid-quota is visible', realLine.includes('--paid-quota'), realLine)
+  setSettings({ apiKeys: [], apiKeyValid: [], apiKeyTiers: [] })
+}
+
+section('G8b — a run that stops getting anywhere is ended (REP-2)')
+{
+  /** The measured storm: an alternating block, in more than one wording, forever. */
+  const STORM = [
+    '\x1b[F\x1b[K\x1b[F\x1b[KTranscribing: |████| 0% (00:00:00,000/00:00:10,001) gemini-2.5-flash-lite',
+    'Transcribing audio segment 00:00 to 00:10.',
+    "An unexpected error occurred: 400 invalid_argument. {'error': {'code': 400, 'message': 'api key not valid. please pass a valid api key.', 'status': 'invalid_argument'}}. Retrying immediately...",
+    'Transcribing: |████| 0% (00:00:00,000/00:00:10,001) gemini-2.5-flash-lite',
+    "An unexpected error occurred: 401 UNAUTHENTICATED. {'error': {'code': 401, 'reason': 'ACCESS_TOKEN_TYPE_UNSUPPORTED'}}. Retrying immediately..."
+  ]
+
+  // The rule the first design got wrong, and the reason this is a gate rather than a manual
+  // check: no two error lines are ever adjacent, so a consecutive-identical counter never
+  // reaches 2 — let alone N — against this exact input.
+  {
+    let adjacent = 0
+    for (let i = 1; i < 400; i++) if (STORM[i % STORM.length] === STORM[(i - 1) % STORM.length]) adjacent++
+    eq('G8b no line in the storm ever repeats consecutively', adjacent, 0)
+  }
+
+  {
+    const watch = createStallWatch()
+    let verdict: ReturnType<typeof watch.observe> = null
+    let at = 0
+    // 25 lines per second, which is the measured rate. The loop has to outlast the QUIET
+    // period rather than the line count — at this rate 500 lines is twenty seconds, so the
+    // minute of silence is what decides, and a shorter loop reports a false failure.
+    for (let i = 0; i < TIER1_LINES * 5 && !verdict; i++) {
+      verdict = watch.observe(STORM[i % STORM.length], i * 40)
+      if (verdict) at = i
+    }
+    check('G8b the recorded storm is caught', verdict !== null)
+    eq('G8b by tier 1, because the cause is recognised', verdict?.tier, 1)
+    check('G8b and the message names it', /invalid/i.test(verdict?.message ?? ''), verdict?.message)
+    // Both conditions must hold: at 40 ms a line, 500 lines is 20 seconds, so the minute of
+    // quiet is what decides. A cheaper budget would kill a slow but working run.
+    check('G8b not before the quiet period has elapsed', at * 40 >= TIER1_QUIET_MS, `${at} lines`)
+    check('G8b and only once', watch.observe(STORM[0], (at + 1) * 40) === null)
+  }
+
+  // Tier 1 needs a recognised marker. The same shape of loop without one survives to tier 2.
+  {
+    const watch = createStallWatch()
+    const dull = ['Working…', 'Still working…', 'Working…']
+    let verdict: ReturnType<typeof watch.observe> = null
+    for (let i = 0; i < TIER1_LINES * 2 && !verdict; i++) verdict = watch.observe(dull[i % dull.length], i * 1000)
+    check('G8b an unrecognised loop is not caught by tier 1', verdict === null)
+  }
+  {
+    const watch = createStallWatch()
+    const dull = ['Working…', 'Still working…']
+    let verdict: ReturnType<typeof watch.observe> = null
+    // Ten minutes at ten lines a second is 6,000 lines, which passes both tier-2 conditions.
+    for (let i = 0; i < 7000 && !verdict; i++) verdict = watch.observe(dull[i % dull.length], i * 100)
+    check('G8b but tier 2 catches it with no pattern at all', verdict !== null)
+    eq('G8b as tier 2', verdict?.tier, 2)
+  }
+
+  // The false positives that would destroy a paid, half-finished run.
+  {
+    const watch = createStallWatch()
+    let verdict: ReturnType<typeof watch.observe> = null
+    // A healthy run: the same status block redrawn, but with a new segment each cycle.
+    for (let i = 0; i < 20_000 && !verdict; i++) {
+      const cycle = i % 4
+      const line =
+        cycle === 3
+          ? `Transcribing audio segment ${String(i).padStart(6, '0')}.`
+          : STORM[cycle]
+      verdict = watch.observe(line, i * 40)
+    }
+    check('G8b a run that keeps producing new lines is never ended', verdict === null)
+  }
+  {
+    const watch = createStallWatch()
+    // Silence: a long thinking pause or a slow API call produces NO lines, so no counter
+    // advances. Both tiers require a high line count precisely so this is safe.
+    const verdict = watch.observe('Waiting for the model…', 0)
+    check('G8b a run that goes quiet for an hour is untouched', verdict === null)
+    check('G8b even when the next line arrives an hour later', watch.observe('Waiting for the model…', 3_600_000) === null)
+  }
+  {
+    const watch = createStallWatch()
+    let verdict: ReturnType<typeof watch.observe> = null
+    // An auth error followed by real work is a run that recovered — the marker must not
+    // survive the novelty that follows it.
+    for (let i = 0; i < 400; i++) verdict = watch.observe(STORM[i % STORM.length], i * 40) ?? verdict
+    for (let i = 0; i < 400 && !verdict; i++) verdict = watch.observe(`Batch ${i} translated.`, 20_000 + i * 40)
+    for (let i = 0; i < 400 && !verdict; i++) verdict = watch.observe(STORM[i % 2], 40_000 + i * 40)
+    check('G8b a recovered run does not carry its old error into the budget', verdict === null)
+  }
+  {
+    // Only `user` reads as Stopped. A budget termination has to read as a failure with a
+    // cause, or the user is told they pressed a button they did not press.
+    eq('G8b a stalled run is reported as failed', terminalState(-1, 'stalled').statusText, 'Failed')
+    eq('G8b and a refused one too', terminalState(-1, 'guard').statusText, 'Failed')
+    eq('G8b while a real Stop still reads as Stopped', terminalState(-1, 'user').statusText, 'Stopped')
+  }
+}
+
+section('G8c — an unreachable key is not an invalid key (MAN-4)')
+{
+  // The persisted verdict is where MAN-4 began: every failure, including a DNS error, was
+  // stored as `false` — the identical value a rejected key gets.
+  eq('G8c a rejected key is rejected', classifyFetchFailure('400 api key not valid. please pass a valid api key.', false).verdict, 'rejected')
+  eq('G8c so is a 401', classifyFetchFailure('401 UNAUTHENTICATED', false).verdict, 'rejected')
+  eq('G8c and a 403', classifyFetchFailure('PERMISSION_DENIED: 403', false).verdict, 'rejected')
+  eq('G8c a DNS failure proves nothing about the key', classifyFetchFailure('getaddrinfo ENOTFOUND generativelanguage.googleapis.com', false).verdict, 'unchecked')
+  eq('G8c nor does a timeout', classifyFetchFailure('', true).verdict, 'unchecked')
+  // A 429 means the key is real, working, and merely busy. Calling that invalid would demote
+  // a perfectly good key in the spawn ranking.
+  eq('G8c nor does exhausted quota', classifyFetchFailure('429 RESOURCE_EXHAUSTED: quota', false).verdict, 'unchecked')
+  eq('G8c and an unrecognised failure defaults to proving nothing', classifyFetchFailure('something went sideways', false).verdict, 'unchecked')
+  check(
+    'G8c the offline message does not accuse the key',
+    !/invalid/i.test(classifyFetchFailure('getaddrinfo ENOTFOUND', false).error),
+    classifyFetchFailure('getaddrinfo ENOTFOUND', false).error
+  )
+
+  // The three keys of the report, offline: none rejected, none checked.
+  const offline = ['unchecked', 'unchecked', 'unchecked'] as const
+  const counts = countKeyStates([...offline])
+  eq('G8c nothing is counted as invalid', counts.rejected, 0)
+  const headline = keyHeadline(counts, null)
+  check('G8c and the headline does not say "no valid keys"', !/no valid keys/i.test(headline.text), headline.text)
+  check('G8c nor calls anything invalid', !/invalid/i.test(headline.text), headline.text)
+  // Both spellings are natural English and both appear — "None of your keys could be checked"
+  // in the plural, "This key could not be checked" in the singular. What is being asserted is
+  // that the sentence is about the CHECK, which is the fact, rather than about the keys.
+  check('G8c it says the check failed, not the keys', /be checked/i.test(headline.text), headline.text)
+  // One key offline is the same fact in the singular, and the old copy got that wrong too.
+  check(
+    'G8c a single unreachable key reads in the singular',
+    /^This key could not be checked/.test(keyHeadline(countKeyStates(['unchecked']), null).text),
+    keyHeadline(countKeyStates(['unchecked']), null).text
+  )
+
+  // The sentence that was ungrammatical for a list and wrong for a reserve.
+  eq(
+    'G8c two active keys are described in the plural',
+    uncheckedNote([0, 1], [0, 1]),
+    'Keys 1 and 2 could not be checked, and a run would use them.'
+  )
+  eq(
+    'G8c a lone reserve is described as a reserve',
+    uncheckedNote([2], [0, 1]),
+    'Key 3 could not be checked; it is a reserve, so runs are unaffected.'
+  )
+  check(
+    'G8c a mixed list splits rather than mislabelling either',
+    uncheckedNote([0, 2], [0, 1]) ===
+      'Key 1 could not be checked, and a run would use it. Key 3 could not be checked; it is a reserve, so runs are unaffected.',
+    uncheckedNote([0, 2], [0, 1])
+  )
+  eq('G8c the list grammar', listKeyNumbers([0, 1, 2]), '1, 2 and 3')
+
+  // The ordinary cases still read as they did.
+  eq('G8c a valid key still reports valid', keyStateOf(true, true), 'valid')
+  eq('G8c a rejected one still earns its ✗', keyStateOf(true, false), 'rejected')
+  eq('G8c an empty slot is not a state', keyStateOf(false, null), 'blank')
+  check(
+    'G8c a good check still reads as before',
+    keyHeadline(countKeyStates(['valid', 'valid', 'rejected']), 12).text === '✓ 2 of 3 keys valid — 12 models available.',
+    keyHeadline(countKeyStates(['valid', 'valid', 'rejected']), 12).text
+  )
+  eq('G8c and a genuinely rejected set still says so', keyHeadline(countKeyStates(['rejected']), null).tone, 'bad')
+}
+
+section('G8d — a check that proves nothing does not undo what was proven (FP7-V01)')
+{
+  const queried = (n: number): SlotFetchResult[] =>
+    Array.from({ length: n }, (_, slot) => ({ slot, queried: true, ok: false, ids: [] }))
+  const prior = (valid: boolean | null, error = '', sameKey = true): PriorVerdict => ({ valid, error, sameKey })
+  const unchecked: KeyCheck = { valid: null, error: 'Could not reach Google. Check your internet connection and try again.' }
+
+  // The defect: `false` is the one verdict that REMOVES a key from the pool, so erasing it
+  // without contrary evidence changes what a run does. Asserted through the ranking rather
+  // than through the field, because the ranking is what the defect was actually about.
+  const rank = (valid: boolean | null): number[] =>
+    orderKeySlots([{ index: 0, valid, tier: 'free' }, { index: 1, valid: null, tier: 'free' }])
+  eq('G8d a proven-dead key is dropped from the pool', JSON.stringify(rank(false)), JSON.stringify([1]))
+  eq('G8d and an unchecked one is not', JSON.stringify(rank(null)), JSON.stringify([0, 1]))
+
+  const kept = keepProvenRejections([unchecked], queried(1), [prior(false, 'Invalid API key.')])
+  eq('G8d so an offline check keeps the rejection', kept[0].valid, false)
+  eq('G8d with the refusal, not the network error, beside it', kept[0].error, 'Invalid API key.')
+  eq(
+    'G8d and the key stays out of the pool',
+    JSON.stringify(rank(kept[0].valid)),
+    JSON.stringify([1])
+  )
+
+  // The asymmetry, and the reason for it: retaining `true` would answer a failed check with
+  // "✓ N of N keys valid" — MAN-4's own report with the polarity flipped.
+  const decayed = keepProvenRejections([unchecked], queried(1), [prior(true, '')])
+  eq('G8d a valid verdict is allowed to decay to unchecked', decayed[0].valid, null)
+  check(
+    'G8d because retaining it would claim a check that did not happen',
+    /be checked/i.test(keyHeadline(countKeyStates([keyStateOf(true, decayed[0].valid)]), null).text),
+    keyHeadline(countKeyStates([keyStateOf(true, decayed[0].valid)]), null).text
+  )
+  eq(
+    'G8d and it costs nothing operationally — both are usable',
+    JSON.stringify(rank(decayed[0].valid)),
+    JSON.stringify([0, 1])
+  )
+
+  // Evidence always wins, in both directions.
+  eq(
+    'G8d a fresh rejection overwrites a stored pass',
+    keepProvenRejections([{ valid: false, error: 'Invalid API key.' }], queried(1), [prior(true)])[0].valid,
+    false
+  )
+  eq(
+    'G8d and a fresh pass clears a stored rejection',
+    keepProvenRejections([{ valid: true, error: '' }], queried(1), [prior(false, 'Invalid API key.')])[0].valid,
+    true
+  )
+  eq(
+    'G8d with its error',
+    keepProvenRejections([{ valid: true, error: '' }], queried(1), [prior(false, 'Invalid API key.')])[0].error,
+    ''
+  )
+
+  // A retained verdict must never outlive the credential it was about.
+  eq(
+    'G8d an edited key does not inherit the old key\u2019s rejection',
+    keepProvenRejections([unchecked], queried(1), [prior(false, 'Invalid API key.', false)])[0].valid,
+    null
+  )
+  eq(
+    'G8d and an emptied slot does not either',
+    keepProvenRejections([{ valid: null, error: '' }], [{ slot: 0, queried: false, ok: false, ids: [] }], [
+      prior(false, 'Invalid API key.')
+    ])[0].valid,
+    null
+  )
+  eq(
+    'G8d a slot with nothing stored is unaffected',
+    keepProvenRejections([unchecked], queried(1), [prior(null)])[0].valid,
+    null
+  )
+  eq(
+    'G8d as is one with no stored entry at all',
+    keepProvenRejections([unchecked], queried(1), [])[0].valid,
+    null
+  )
+
+  // MAN-4's actual report: three keys, all previously valid, one network outage. This is the
+  // case the fix must not disturb, and the one that rules out merging every verdict.
+  const outage = keepProvenRejections(
+    [unchecked, unchecked, unchecked],
+    queried(3),
+    [prior(true), prior(true), prior(true)]
+  )
+  check('G8d MAN-4 unchanged: nothing is branded invalid', outage.every((r) => r.valid !== false))
+  check('G8d MAN-4 unchanged: nothing claims to be valid either', outage.every((r) => r.valid === null))
+  const outageStates = outage.map((r) => keyStateOf(true, r.valid))
+  eq('G8d MAN-4 unchanged: the headline still reports on the check', keyHeadline(countKeyStates(outageStates), null).tone, 'warn')
+
+  // The mixed list, which is where a blanket merge and this rule differ most visibly.
+  const mixed = keepProvenRejections(
+    [unchecked, unchecked],
+    queried(2),
+    [prior(true), prior(false, 'Invalid API key.')]
+  )
+  eq('G8d a mixed list keeps only the rejection', JSON.stringify(mixed.map((r) => r.valid)), JSON.stringify([null, false]))
+  eq(
+    'G8d so the good key leads and the dead one is gone',
+    JSON.stringify(
+      orderKeySlots([
+        { index: 0, valid: mixed[0].valid, tier: 'free' },
+        { index: 1, valid: mixed[1].valid, tier: 'free' }
+      ])
+    ),
+    JSON.stringify([0])
+  )
+}
+
+section('G8e — a result may not be applied to keys it was not learned from (FP7-R01)')
+{
+  // Everything a check produces is addressed by SLOT INDEX and carries no trace of the key
+  // it came from, so applying it to a changed key set writes one credential's verdict, error
+  // and model evidence onto another.
+  const asked = ['AIzaKEY-one', 'AIzaKEY-two', '']
+
+  check('G8e an untouched snapshot is applied', !keySnapshotChanged(asked, [...asked]))
+  check('G8e an edited key discards the result', keySnapshotChanged(asked, ['AIzaKEY-one', 'AIzaKEY-CHANGED', '']))
+  check('G8e so does editing the one being checked first', keySnapshotChanged(asked, ['AIzaKEY-NEW', 'AIzaKEY-two', '']))
+  check('G8e a cleared key discards it', keySnapshotChanged(asked, ['AIzaKEY-one', '', '']))
+  check('G8e an added key discards it', keySnapshotChanged(asked, [...asked, 'AIzaKEY-three']))
+  // Removal is the sharpest case: every slot above it renumbers, so a late write lands
+  // wholesale on the wrong keys.
+  check('G8e and a removed key discards it', keySnapshotChanged(asked, ['AIzaKEY-two', '']))
+  // Reordering is not detectable by length, and it is exactly what "by slot index" breaks on.
+  check('G8e reordering the same keys still discards', keySnapshotChanged(asked, ['AIzaKEY-two', 'AIzaKEY-one', '']))
+  // Not over-eager: discarding a minute of checking needs a reason. A tier is not part of
+  // what a check learns, is not persisted by it, and is not ranked on.
+  check('G8e an empty configuration compares equal to itself', !keySnapshotChanged([], []))
+  check('G8e and a whitespace difference is a real difference', keySnapshotChanged([' k'], ['k']))
 }
 
 // ── result ─────────────────────────────────────────────────────────────────────

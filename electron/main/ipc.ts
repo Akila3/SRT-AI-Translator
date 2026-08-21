@@ -20,7 +20,9 @@ import {
   stopCurrent,
   isRunning,
   tempOutputPath,
-  keySlotsFor
+  describeEngine,
+  keySlotsFor,
+  type KeyPreflight
 } from './pythonBridge'
 import { activeKeySlots } from '../shared/keyOrder'
 import { scanTranslatedOutput } from '../shared/outputSanity'
@@ -131,6 +133,32 @@ export function singleKeyRefreshScope(
     activeSlots: activeKeySlots(keySlotsFor(configured)),
     authoritative: true
   }
+}
+
+/**
+ * Do these results still describe the keys the user has?
+ *
+ * A full check is a sequence of network round trips — up to a minute per key against the
+ * fetch timeout — and everything it produces is addressed **by slot index**: the verdicts,
+ * the error strings, and `ModelInfo.availableOn`, which `guardModelForSpawn` reads as proof
+ * that a model exists. Nothing in that payload carries the key it came from, so if a slot's
+ * key changed while the fetch was in flight, applying the result writes one key's evidence
+ * onto a different key: a brand-new key inherits a ✓ or a ✗ it never earned, and the
+ * pre-spawn guard starts vouching for models on a credential that never reported them.
+ * `SettingsPage` clears exactly this evidence when a key is edited, and the late write
+ * silently puts it back.
+ *
+ * Tiers are deliberately not compared. They are not part of what a check learns, this
+ * handler does not persist them, and `orderKeySlots` does not rank by them — so including
+ * them would discard good results for a change that could not have invalidated them.
+ *
+ * The counterpart in `models:refresh` needs no equivalent because it identifies its slot by
+ * key MATERIAL rather than by position (`singleKeyRefreshScope`): an edited key simply stops
+ * matching and the scope becomes non-authoritative.
+ */
+export function keySnapshotChanged(requested: readonly string[], current: readonly string[]): boolean {
+  if (requested.length !== current.length) return true
+  return requested.some((k, i) => (k ?? '') !== (current[i] ?? ''))
 }
 
 export interface ModelSelectionOutcome {
@@ -309,6 +337,34 @@ export function registerIpc(): void {
       )
     }
 
+    // Nothing here may be applied to a different set of keys than it was learned from.
+    // Discarded WHOLE, before the selection rules are even consulted: a partial apply is
+    // the worst of the three outcomes, because it would leave the verdicts, the model
+    // cache and the stored selection describing different moments.
+    if (keySnapshotChanged(keys, getSettings().apiKeys ?? [])) {
+      const s = getSettings()
+      return {
+        results: [],
+        slots: [],
+        // The persisted list, unchanged — this is what the picker is still showing.
+        models: (s.cachedModels as ModelInfo[]) ?? [],
+        unionIds: [],
+        runnableIds: [],
+        activeSlots: activeKeySlots(keySlotsFor(s.apiKeys ?? [])),
+        // Truthful about the fetch, which may well have been complete. `discarded` is what
+        // says the result was not used, rather than overloading this into a lie.
+        refreshOutcome: res.refreshOutcome,
+        discarded: true,
+        model: s.model,
+        notice:
+          'Your keys changed while they were being checked, so that result was discarded ' +
+          'rather than applied to the keys you have now. Press “Fetch Models & Check API ' +
+          'Keys” again.',
+        updatedAt,
+        anyValid: false
+      }
+    }
+
     // The previous cache must be read BEFORE the write below: the auto-advance rule
     // compares the stored model against the PREVIOUS list's default.
     const prevCached = (getSettings().cachedModels as ModelInfo[]) ?? []
@@ -347,6 +403,7 @@ export function registerIpc(): void {
       runnableIds: res.runnableIds,
       activeSlots: res.activeSlots,
       refreshOutcome: res.refreshOutcome,
+      discarded: false,
       model: sel.model,
       notice: sel.notice,
       updatedAt,
@@ -433,6 +490,12 @@ export function registerIpc(): void {
       return res.filePath
     }
   )
+
+  // ---- Engine ----
+  // Which binary a run will use, for Settings > Advanced. The only addition to the IPC method
+  // surface in this whole fix pass, and it exists because the previous answer was a console
+  // line that a packaged Windows build has nowhere to print (MAN-5).
+  ipcMain.handle('engine:info', () => describeEngine())
 
   // ---- Shell helpers ----
   ipcMain.handle('shell:showItem', (_e, p: string) => {
@@ -594,17 +657,48 @@ export function registerIpc(): void {
     return started.outputPath
   })
 
+  /**
+   * Ask one key whether it still works, for the transcription preflight (REP-2).
+   *
+   * Same seam and same reason as `passesModelGuard`: `modelsList` imports the bridge, so the
+   * bridge cannot import `modelsList` back. This is handed in as a function instead.
+   *
+   * It reuses `refreshModels`, which is the same call translation gets for free from the engine
+   * — one `list-models` round trip — so the classification of "rejected" versus "could not be
+   * checked" is shared with the Settings panel rather than re-derived here.
+   */
+  const keyPreflight = async (apiKey: string, signal: AbortSignal): Promise<KeyPreflight> => {
+    const res = await refreshModels(apiKey, signal)
+    if (res.verdict === 'valid') return { verdict: 'valid', message: '' }
+    if (res.verdict === 'rejected') {
+      return {
+        verdict: 'rejected',
+        message:
+          `The API rejected this key before the transcription started: ${res.error} ` +
+          'Nothing was sent and no quota was spent. Open Settings > Gemini API Keys to fix it.'
+      }
+    }
+    return {
+      verdict: 'unchecked',
+      message: `The API key could not be checked first: ${res.error} Starting anyway.`
+    }
+  }
+
   ipcMain.handle('transcribe:start', async (_e, args: TranscribeArgs) => {
     if (!passesModelGuard(args.model, args.apiKeys)) return ''
     // Awaited because unreadable audio is converted first; the renderer's contract is
     // unchanged, since `startTranscribe` was already a Promise across the IPC boundary.
-    return await startTranscribe(args, {
-      onOutput: (stream, line) => send('translate:output', { stream, line }),
-      onDone: (code, outputPath, reason) => send('translate:done', { code, outputPath, reason }),
-      // The payload is built by the bridge, which is the only thing that knows whether the
-      // conversion is still running; this just forwards it.
-      onProgress: (p) => send('ffmpeg:progress', p)
-    })
+    return await startTranscribe(
+      args,
+      {
+        onOutput: (stream, line) => send('translate:output', { stream, line }),
+        onDone: (code, outputPath, reason) => send('translate:done', { code, outputPath, reason }),
+        // The payload is built by the bridge, which is the only thing that knows whether the
+        // conversion is still running; this just forwards it.
+        onProgress: (p) => send('ffmpeg:progress', p)
+      },
+      keyPreflight
+    )
   })
 
   ipcMain.handle('translate:stop', () => {

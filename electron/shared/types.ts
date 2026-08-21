@@ -209,6 +209,23 @@ export interface FfmpegProgress {
 }
 
 /**
+ * Which `gst` binary a run will actually use.
+ *
+ * Shared rather than declared in the bridge because the preload must be able to type it without
+ * importing main-process code. It answers release-gate check D1 — "the packaged app runs the
+ * packaged engine" — which was unanswerable while the only report of it was a `console.log` that
+ * a packaged Windows build has no console to print to (MAN-5).
+ */
+export interface EngineInfo {
+  /** Absolute path when known; the bare name when PATH lookup found nothing. */
+  path: string
+  /** True when this is the copy shipped inside the app, i.e. what a release is supposed to run. */
+  bundled: boolean
+  /** False when the name could not be resolved at all — the run will fail at spawn. */
+  found: boolean
+}
+
+/**
  * Why a run ended, when something other than the engine decided it.
  *
  * A boolean would not do. A killed process and a crashed one both exit non-zero, so the

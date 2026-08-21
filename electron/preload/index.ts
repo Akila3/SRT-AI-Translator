@@ -9,6 +9,7 @@ import type {
   TmdbDetails,
   ProcOutput,
   ProcDone,
+  EngineInfo,
   FfmpegProgress,
   KeyCheck,
   SlotFetchResult,
@@ -28,6 +29,13 @@ export interface CheckKeysResponse {
   runnableIds: string[]
   activeSlots: number[]
   refreshOutcome: RefreshOutcome
+  /**
+   * True when the keys changed while they were being checked, so NOTHING from this result
+   * was applied. Separate from `refreshOutcome`, which describes how complete the fetch
+   * was — a discarded result can be perfectly complete and still describe keys that are no
+   * longer there. Treat every other field as informational when this is set.
+   */
+  discarded: boolean
   /** The selection after the Step 4a rules ran; may differ from what was stored. */
   model: string
   /** Human-readable explanation when a rule fired or the refresh was incomplete. */
@@ -69,6 +77,10 @@ const api = {
     /** The file the user chose to translate, so the token report can name it instead of a temp path. */
     inputPath?: string
   }): Promise<string> => ipcRenderer.invoke('dialog:saveFile', args),
+
+  // engine
+  /** Which gst binary a run will use — the answer to "am I running the packaged engine?". */
+  getEngineInfo: (): Promise<EngineInfo> => ipcRenderer.invoke('engine:info'),
 
   // shell
   showItemInFolder: (p: string): Promise<void> => ipcRenderer.invoke('shell:showItem', p),

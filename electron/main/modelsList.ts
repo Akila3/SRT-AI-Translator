@@ -212,27 +212,77 @@ export function resolveDefaultModelWithBasis(models: ModelInfo[]): {
   return { id: eligible[0].id, basis: 'fallback' }
 }
 
-/** Turn a raw CLI/API failure dump into a short, user-friendly message. */
-function friendlyError(out: string): string {
+/**
+ * What a failed fetch proves about the KEY, which is not the same as what it says.
+ *
+ * MAN-4: with the network down, three keys were branded invalid, and the panel then said both
+ * "3 keys invalid" and "could not be checked" about the same keys. The cause is that the verdict
+ * was binary — every failure, including a DNS error, was persisted as `false`, the identical
+ * value a rejected key gets — so a network outage accused the user's credentials.
+ *
+ * The rule is the one used everywhere else in this app: brand something only on positive
+ * evidence. `rejected` requires the API to have actually refused the credential. Everything
+ * else, INCLUDING an error we do not recognise, is `unchecked` — we learned nothing.
+ *
+ * Quota is deliberately `unchecked` rather than `rejected`: a 429 means the key is real and
+ * working and merely busy, and calling that invalid would demote a perfectly good key in the
+ * spawn ranking (`orderKeySlots` skips known-invalid keys).
+ */
+export type KeyVerdict = 'valid' | 'rejected' | 'unchecked'
+
+export function classifyFetchFailure(
+  out: string,
+  timedOut: boolean
+): { verdict: Exclude<KeyVerdict, 'valid'>; error: string } {
+  if (timedOut) {
+    return {
+      verdict: 'unchecked',
+      error:
+        `The model fetch gave up after ${Math.round(FETCH_TIMEOUT_MS / 1000)} seconds. ` +
+        'The engine may be waiting for input it will never receive, or the network may be unreachable. ' +
+        'This does not mean the key is invalid.'
+    }
+  }
   const clean = out.replace(/\u001b\[[0-9;]*m/g, ' ')
   if (/API_KEY_INVALID|api key not valid|invalid authentication|unauthenticated|\b401\b/i.test(clean)) {
-    return 'Invalid API key. Double-check the key from Google AI Studio and try again.'
+    return {
+      verdict: 'rejected',
+      error: 'Invalid API key. Double-check the key from Google AI Studio and try again.'
+    }
   }
   if (/permission_denied|\b403\b/i.test(clean)) {
-    return 'This API key is not authorized for the Gemini API. Enable it in Google AI Studio.'
+    return {
+      verdict: 'rejected',
+      error: 'This API key is not authorized for the Gemini API. Enable it in Google AI Studio.'
+    }
   }
   if (/resource_exhausted|quota|\b429\b/i.test(clean)) {
-    return 'Quota exceeded for this key. Wait a bit and retry, or use a paid key.'
+    return {
+      verdict: 'unchecked',
+      error:
+        'Quota exceeded for this key, so it could not be checked. The key itself is fine — wait a ' +
+        'bit and retry, or use a paid key.'
+    }
   }
   if (/getaddrinfo|enotfound|etimedout|econnrefused|network|failed to fetch|connection/i.test(clean)) {
-    return 'Could not reach Google. Check your internet connection and try again.'
+    return {
+      verdict: 'unchecked',
+      error: 'Could not reach Google. Check your internet connection and try again.'
+    }
   }
-  return 'Could not retrieve models. Check the API key and your internet connection.'
+  return {
+    verdict: 'unchecked',
+    error:
+      'Could not retrieve models — the reason was not recognised, so this says nothing about the ' +
+      'key itself. Check your internet connection and try again.'
+  }
 }
 
 export interface RefreshResult {
   /** Raw ids this key reported, alias-filtered. Empty when the fetch failed. */
   ids: string[]
+  verdict: KeyVerdict
+  /** True only for `valid`. Kept so callers that only care whether a list arrived read the same. */
   keyValid: boolean
   error: string
 }
@@ -262,9 +312,13 @@ const FETCH_TIMEOUT_MS = 60_000
  * never on what our display curation chose to keep. Curating first would let a cosmetic
  * filter masquerade as proof that a model no longer exists.
  */
-export async function refreshModels(apiKey: string): Promise<RefreshResult> {
+export async function refreshModels(apiKey: string, signal?: AbortSignal): Promise<RefreshResult> {
   if (!apiKey || !apiKey.trim()) {
-    return { ids: [], keyValid: false, error: 'No API key provided.' }
+    // Nothing was asked, so nothing was learned — an empty slot is not a rejected one.
+    return { ids: [], verdict: 'unchecked', keyValid: false, error: 'No API key provided.' }
+  }
+  if (signal?.aborted) {
+    return { ids: [], verdict: 'unchecked', keyValid: false, error: 'Cancelled.' }
   }
 
   const bin = resolveGstBin()
@@ -302,9 +356,9 @@ export async function refreshModels(apiKey: string): Promise<RefreshResult> {
       // The answer could not be delivered; the timeout below is what keeps this bounded.
     }
 
-    const timer = setTimeout(() => {
+    /** Kill the tree rather than the bootloader alone, for the reason `killJob()` documents. */
+    const kill = (): void => {
       try {
-        // Kill the tree rather than the bootloader alone, for the same reason `stopCurrent()` does.
         if (process.platform === 'win32' && child.pid) {
           spawn('taskkill', ['/pid', String(child.pid), '/f', '/t'])
         } else {
@@ -313,22 +367,47 @@ export async function refreshModels(apiKey: string): Promise<RefreshResult> {
       } catch {
         // A fetch that cannot be killed must still not hang the UI, so resolve either way.
       }
+    }
+
+    const timer = setTimeout(() => {
+      kill()
       resolve({ out: stdout, timedOut: true })
     }, FETCH_TIMEOUT_MS)
+
+    // Cancellation. The preflight added in FP-7 runs inside a transcription job, where Stop has
+    // to end the run promptly — sixty seconds of an unkillable fetch would hold the single job
+    // slot and make the button look broken, which is the shape of FP6-01 in a different file.
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      kill()
+      resolve({ out: stdout, timedOut: false })
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    const settle = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
 
     child.stdout.on('data', (d) => (stdout += d.toString()))
     child.stderr.on('data', (d) => (stdout += d.toString()))
     // Clearing the timer is not tidiness: a surviving timer would later fire `taskkill` at a pid
     // the OS may have recycled onto an unrelated process.
     child.on('error', () => {
-      clearTimeout(timer)
+      settle()
       resolve({ out: stdout, timedOut: false })
     })
     child.on('close', () => {
-      clearTimeout(timer)
+      settle()
       resolve({ out: stdout, timedOut: false })
     })
   })
+
+  // A cancelled fetch learned nothing, and must not be classified from the partial output it
+  // happened to have collected — an aborted read is not evidence about the key.
+  if (signal?.aborted) {
+    return { ids: [], verdict: 'unchecked', keyValid: false, error: 'Cancelled.' }
+  }
 
   const ids = new Set<string>()
   let aliasesSeen = 0
@@ -356,18 +435,11 @@ export async function refreshModels(apiKey: string): Promise<RefreshResult> {
   // A fetch that ran long but still produced ids is a success — the ids are the evidence, and
   // abandoning them because the process was slow to exit would discard a correct answer.
   if (ids.size === 0) {
-    return {
-      ids: [],
-      keyValid: false,
-      error: timedOut
-        ? `The model fetch gave up after ${Math.round(FETCH_TIMEOUT_MS / 1000)} seconds. ` +
-          'The engine may be waiting for input it will never receive, or the network may be unreachable. ' +
-          'This does not mean the key is invalid.'
-        : friendlyError(out)
-    }
+    const { verdict, error } = classifyFetchFailure(out, timedOut)
+    return { ids: [], verdict, keyValid: false, error }
   }
 
-  return { ids: Array.from(ids), keyValid: true, error: '' }
+  return { ids: Array.from(ids), verdict: 'valid', keyValid: true, error: '' }
 }
 
 export interface RefreshSummary {
@@ -432,6 +504,66 @@ export function summarizeRefresh(slots: SlotFetchResult[], activeSlots: number[]
   }
 }
 
+/** What was already known about one slot, before this check ran. */
+export interface PriorVerdict {
+  valid: boolean | null
+  error: string
+  /**
+   * Whether that verdict still describes the key sitting in this slot. Editing a key clears
+   * its verdict in `SettingsPage.updateKey`, so this is a belt-and-braces identity check
+   * rather than the only guard — but a retained rejection is exactly the thing that must
+   * never outlive the credential it was about.
+   */
+  sameKey: boolean
+}
+
+/**
+ * Carry a PROVEN rejection through a check that proved nothing.
+ *
+ * FP-7 made a failed fetch persist `null` instead of `false`, which is right for the key it
+ * learned nothing about — and wrong for a key already refused by the API, because `null` is
+ * usable. `orderKeySlots` drops `valid === false` and ranks `null` above it, so an offline
+ * check silently returned a dead credential to the pool, and it could be promoted to `-k`
+ * on the next run. FP-7's own transcription preflight then makes that worse rather than
+ * better: it reads the primary slot, so a resurrected dead key turns a run that used to
+ * succeed on the fallback into a run that is refused outright.
+ *
+ * ONLY a rejection is carried, and the asymmetry is the point:
+ *
+ *  - `false` is the one verdict with operational weight — it removes a key from the pool —
+ *    so erasing it without contrary evidence changes what a run does.
+ *  - `true` is deliberately allowed to decay to `unchecked`. The key stays usable either
+ *    way, so nothing operational turns on it, and the Settings panel reads the persisted
+ *    verdict for both its marks and its summary. Retaining `true` would answer a failed
+ *    check with "✓ N of N keys valid" — which is MAN-4's own report with the polarity
+ *    flipped, since the keys in that report had been valid before the network went down.
+ *
+ * This is also only sound because of FP-7: `false` now means the API refused the key and
+ * nothing else. Under the old binary verdict it could equally have meant a DNS failure, and
+ * carrying THAT forward would have made a network fault permanent.
+ */
+export function keepProvenRejections(
+  results: readonly KeyCheck[],
+  slots: readonly SlotFetchResult[],
+  prior: readonly PriorVerdict[]
+): KeyCheck[] {
+  return results.map((res, i) => {
+    // This round learned something. Evidence always wins, in both directions.
+    if (res.valid !== null) return res
+    // An empty slot was never asked, and must never inherit a verdict about a key that is
+    // no longer there — the user clearing a bad key is how they expect to clear its ✗.
+    if (!slots[i]?.queried) return res
+    const was = prior[i]
+    if (was?.sameKey && was.valid === false) {
+      // The error travels with the verdict. A ✗ carrying "Could not reach Google" would be
+      // MAN-4's confusion again: the mark says the API refused this key, so the sentence
+      // beside it has to be the refusal, not the network.
+      return { valid: false, error: was.error }
+    }
+    return res
+  })
+}
+
 /**
  * Validate every provided key individually and record what EACH one returned.
  *
@@ -455,20 +587,47 @@ export async function checkApiKeys(keys: string[]): Promise<CheckKeysResult> {
       continue
     }
     const res = await refreshModels(key)
-    results.push({ valid: res.keyValid, error: res.keyValid ? '' : res.error })
+    // `null` is the persisted spelling of "unchecked". It already meant "never checked", and
+    // "asked, learned nothing" is the same state as far as every consumer is concerned — which
+    // is what keeps this fix out of the settings schema and out of a migration.
+    results.push({
+      valid: res.verdict === 'valid' ? true : res.verdict === 'rejected' ? false : null,
+      error: res.error
+    })
     slots.push({ slot: i, queried: true, ok: res.keyValid, ids: res.ids })
   }
 
+  // A check that learned nothing must not undo what was already proven. Applied here rather
+  // than at the persistence site so main and the renderer are handed one story, and so the
+  // rule sits in a pure function a gate can reach.
+  //
+  // `slots` is deliberately NOT merged: a retained verdict is a statement about a key, never
+  // about the models it can see. Fabricating fetch evidence here would let a slot that
+  // answered nothing count towards `activeComplete` and overwrite the model cache.
+  const stored = getSettings()
+  const merged = keepProvenRejections(
+    results,
+    slots,
+    keys.map((key, i) => ({
+      valid: stored.apiKeyValid?.[i] ?? null,
+      error: stored.apiKeyError?.[i] ?? '',
+      sameKey: (stored.apiKeys?.[i] ?? '') === key
+    }))
+  )
+
   const summary = summarizeRefresh(slots, activeSlots)
   return {
-    results,
+    results: merged,
     slots,
     models: summary.models,
     unionIds: summary.unionIds,
     runnableIds: summary.runnableIds,
     activeSlots,
     refreshOutcome: summary.refreshOutcome,
-    anyValid: results.some((r) => r.valid === true)
+    // Read from the merged list so every consumer sees one verdict set. The two agree on
+    // `true` by construction — only a rejection is ever carried forward — but reading the
+    // pre-merge array here is the kind of near-miss that survives a later change to the rule.
+    anyValid: merged.some((r) => r.valid === true)
   }
 }
 

@@ -6,9 +6,12 @@ import { gstLanguageName } from '../shared/languages'
 import { convertAudioToMp3, envWithFfmpeg } from './ffmpeg'
 import { getSettings } from './store'
 import { orderKeySlots, type KeySlot } from '../shared/keyOrder'
+import { maskCommandLine } from '../shared/maskedCommand'
+import { createStallWatch } from '../shared/stallBudget'
 import { effectiveThinkingLevel, modelCapabilities } from '../shared/modelCaps'
 import {
   DEFAULT_RESUME_CONTEXT_SIZE,
+  type EngineInfo,
   type FfmpegProgress,
   type TerminalReason,
   type TranslateArgs,
@@ -90,6 +93,37 @@ function refuseStart(handlers: SpawnHandlers, outputPath: string): void {
   handlers.onDone(-1, outputPath)
 }
 
+/**
+ * Kill the job's child process, whoever asked.
+ *
+ * One code path for a user's Stop and for the app's own termination, because the two differ
+ * only in the reason recorded — and a second copy of this would eventually diverge on the part
+ * that matters: the tree kill. A frozen PyInstaller build is a bootloader that spawns the real
+ * interpreter as a child, so killing the pid we hold leaves the engine running, still talking to
+ * the API and still writing output nobody is reading.
+ *
+ * The caller sets `endReason` BEFORE calling this: `close` fires asynchronously and reads it.
+ */
+function killJob(j: Job): void {
+  const proc = j.proc
+  if (!proc) {
+    // Nothing spawned yet. A preparation step in flight owns the terminal event; with none,
+    // end the job here so the slot is not held by a job that has no work to interrupt.
+    if (!j.prep) finish(j, -1)
+    return
+  }
+  try {
+    if (process.platform === 'win32' && proc.pid) {
+      spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t'])
+    } else {
+      proc.kill('SIGTERM')
+    }
+  } catch {
+    // The kill itself failed, so no `close` is coming to release the slot.
+    finish(j, -1)
+  }
+}
+
 /** Resolve the bundled `gst` executable, or fall back to PATH in dev. */
 export function resolveGstBin(): string {
   if (app.isPackaged) {
@@ -126,25 +160,41 @@ function resolveOnPath(name: string): string | null {
 }
 
 /**
- * Log which `gst` binary this process will actually run.
+ * Which `gst` binary this process will actually run, as a fact the UI can show.
  *
- * This is permanent by design. `resolveGstBin()` returns a bare `gst` unless packaged,
- * and `envWithFfmpeg` deliberately APPENDS the bundled dir to PATH, so a globally pip
- * installed engine silently wins in dev — which would make every dev-run test measure a
- * different binary from the one that ships. Without this line, "which binary am I
- * running" is unanswerable at runtime.
+ * The question is permanent: `resolveGstBin()` returns a bare `gst` unless packaged, and
+ * `envWithFfmpeg` deliberately APPENDS the bundled directory to PATH, so a globally pip-installed
+ * engine silently wins in dev — which would make every dev-run measurement describe a different
+ * binary from the one that ships.
+ *
+ * MAN-5 is why this returns a value rather than only printing one. The answer was a `console.log`,
+ * and a packaged Electron app on Windows is a GUI-subsystem binary with no console attached, so
+ * the single most useful diagnostic in the app was readable everywhere except where it mattered.
+ * That left release-gate check D1 — "the packaged app runs the packaged engine" — impossible for
+ * the person holding the checklist. The payload lives in `shared/types` so the preload can type
+ * it without importing main-process code.
  */
-export function logResolvedGstBin(): void {
+export function describeEngine(): EngineInfo {
   const bin = resolveGstBin()
-  if (path.isAbsolute(bin)) {
-    console.log(`[gst] resolveGstBin() -> ${bin} (bundled, packaged build)`)
-    return
-  }
+  if (path.isAbsolute(bin)) return { path: bin, bundled: true, found: true }
   const resolved = resolveOnPath(bin)
+  return {
+    path: resolved ?? bin,
+    // A dev machine can have the bundled copy on PATH; what makes it "bundled" is where it
+    // lives, never how it was found.
+    bundled: !!resolved && resolved.toLowerCase().includes(`${path.sep}resources${path.sep}bin${path.sep}`),
+    found: !!resolved
+  }
+}
+
+/** The same answer on the console at startup, which is still the right place in dev. */
+export function logResolvedGstBin(): void {
+  const info = describeEngine()
   console.log(
-    `[gst] resolveGstBin() -> "${bin}" (resolved via PATH to: ${resolved ?? 'NOT FOUND ON PATH'})`
+    `[gst] resolveGstBin() -> ${info.path}` +
+      (info.bundled ? ' (bundled)' : info.found ? ' (resolved via PATH)' : ' (NOT FOUND ON PATH)')
   )
-  if (resolved && !resolved.toLowerCase().includes(`${path.sep}resources${path.sep}bin${path.sep}`)) {
+  if (info.found && !info.bundled) {
     console.warn(
       '[gst] WARNING: the resolved binary is not the bundled resources/bin copy. ' +
         'Dev runs are exercising a different engine build than the one that ships.'
@@ -301,6 +351,18 @@ function generationParamArgs(a: {
   push('--top-p', a.topP)
   if (a.topK != null) push('--top-k', a.topK)
   return args
+}
+
+/**
+ * What a key preflight can conclude, and what to tell the user.
+ *
+ * Asymmetric on purpose, exactly like `guardModelForSpawn`: only `rejected` stops a run.
+ * "I could not reach Google" is not evidence against the key, and refusing to start because the
+ * network blinked would be a worse failure than letting the engine report the truth.
+ */
+export interface KeyPreflight {
+  verdict: 'valid' | 'rejected' | 'unchecked'
+  message: string
 }
 
 export interface SpawnHandlers {
@@ -514,6 +576,13 @@ function run(j: Job, args: string[]): void {
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8'
   })
+  // What this run actually is, in one line, before it can fail to start (MAN-7). It names the
+  // binary — which answers "is the packaged app running the packaged engine" from the log as
+  // well as from Settings — and every flag, so `--paid-quota`, the model and the thinking
+  // budget are observable instead of inferred. `maskCommandLine` is the ONLY thing permitted
+  // to turn an argv into text; nothing else may hand this array to a log, a file or a console.
+  handlers.onOutput('stdout', `$ ${maskCommandLine(describeEngine().path, args)}`)
+
   let proc: ChildProcessWithoutNullStreams
   try {
     proc = spawn(bin, args, { env })
@@ -532,6 +601,28 @@ function run(j: Job, args: string[]): void {
   let stdoutBuf = ''
   let stderrBuf = ''
 
+  /**
+   * End a run the engine will not end itself (REP-2).
+   *
+   * Only the engine's own output is measured. The lines this file emits — the command line
+   * above, `Starting engine…`, and this message itself — are the app talking to the user and
+   * would otherwise be counted as the engine making progress.
+   *
+   * The message is emitted BEFORE the kill so it precedes the terminal event, and the reason
+   * is `stalled` rather than `user`: FP-3 renders `user` as "Stopped", and reporting an auth
+   * failure as though the user had pressed the button would bury the cause this exists to give
+   * them.
+   */
+  const stall = createStallWatch()
+  const observe = (line: string): void => {
+    if (j.finished || j.endReason) return
+    const verdict = stall.observe(line, Date.now())
+    if (!verdict) return
+    j.endReason = 'stalled'
+    handlers.onOutput('stderr', verdict.message)
+    killJob(j)
+  }
+
   proc.stdout.setEncoding('utf-8')
   proc.stderr.setEncoding('utf-8')
 
@@ -539,13 +630,19 @@ function run(j: Job, args: string[]): void {
     stdoutBuf += chunk
     const lines = stdoutBuf.split(/\r?\n/)
     stdoutBuf = lines.pop() ?? ''
-    for (const l of lines) handlers.onOutput('stdout', l)
+    for (const l of lines) {
+      handlers.onOutput('stdout', l)
+      observe(l)
+    }
   })
   proc.stderr.on('data', (chunk: string) => {
     stderrBuf += chunk
     const lines = stderrBuf.split(/\r?\n/)
     stderrBuf = lines.pop() ?? ''
-    for (const l of lines) handlers.onOutput('stderr', l)
+    for (const l of lines) {
+      handlers.onOutput('stderr', l)
+      observe(l)
+    }
   })
   proc.on('error', (err) => {
     handlers.onOutput('stderr', `Process error: ${err.message}`)
@@ -601,7 +698,21 @@ export function startTranslate(a: TranslateArgs, handlers: SpawnHandlers): Start
   return { outputPath, logPaths }
 }
 
-export async function startTranscribe(a: TranscribeArgs, handlers: SpawnHandlers): Promise<string> {
+export async function startTranscribe(
+  a: TranscribeArgs,
+  handlers: SpawnHandlers,
+  /**
+   * Ask the API whether the key is any good, before a transcription commits to it.
+   *
+   * Injected rather than imported: `modelsList` already imports this file for `resolveGstBin`,
+   * so calling it from here would close an import cycle. `ipc` sits above both and supplies it.
+   *
+   * It runs INSIDE the job, with the job's abort signal, for the reason FP6-01 taught: work
+   * placed in front of cancellable work inherits its cancellation, or Stop does nothing while
+   * it runs and the single job slot stays held.
+   */
+  preflight?: (apiKey: string, signal: AbortSignal) => Promise<KeyPreflight>
+): Promise<string> {
   // The slot is taken BEFORE the conversion, not after it. Otherwise the app reports idle
   // for the length of the conversion, and a second job started in that window would later
   // be refused by a `run()` that had no way to tell this page it had ended.
@@ -609,6 +720,57 @@ export async function startTranscribe(a: TranscribeArgs, handlers: SpawnHandlers
   if (!j) {
     refuseStart(handlers, a.outputFile)
     return a.outputFile
+  }
+
+  // REP-2's cheaper half. Translation gets this free — the engine's own `ListModels` call
+  // rejects a bad key and exits 1 — while transcription hands the same credential straight to
+  // the per-segment retry loop, which has no ceiling and answers a permanent 400 with
+  // `Retrying immediately...` for as long as it is left alone. The measured result was 97 GB.
+  const primaryKey = orderKeysByValidity(a.apiKeys).keys[0] ?? ''
+  if (preflight && primaryKey) {
+    handlers.onOutput('stdout', 'Checking the API key…')
+    j.prep = new AbortController()
+    let verdict: KeyPreflight
+    try {
+      verdict = await preflight(primaryKey, j.prep.signal)
+    } catch (err) {
+      // A preflight that THROWS has learned nothing about the key, so it is treated as
+      // exactly that and the run continues. Two reasons this is the safe direction:
+      //
+      //  - Refusing here would let a fault in the check make transcription impossible,
+      //    which is a worse outcome than the runaway it guards against — and that runaway
+      //    is already covered by the stall budget in `run()`, which needs no cooperation
+      //    from this path.
+      //  - Letting it propagate is worse still, and is what this guard exists for: the
+      //    rejection would escape `startTranscribe` with the job slot reserved and
+      //    `finish()` never called, so `isRunning()` would stay true for the life of the
+      //    process and every later run — of either kind — would be refused.
+      verdict = {
+        verdict: 'unchecked',
+        message: `Could not check the API key: ${err instanceof Error ? err.message : String(err)}`
+      }
+    } finally {
+      // In `finally` so a throw cannot leave a used controller behind. Stop would then abort
+      // a signal nobody is listening to and conclude a preparation step was still running.
+      j.prep = null
+    }
+    if (j.finished) return a.outputFile
+    if (j.endReason) {
+      handlers.onOutput('stderr', 'Stopped while checking the API key.')
+      finish(j, -1)
+      return a.outputFile
+    }
+    if (verdict.verdict === 'rejected') {
+      handlers.onOutput('stderr', verdict.message)
+      j.endReason = 'guard'
+      finish(j, -1)
+      return a.outputFile
+    }
+    // Unreachable is a warning, never a refusal: the run may well succeed, and the stall
+    // budget in `run()` is what catches a key that turns out to be bad after all.
+    if (verdict.verdict === 'unchecked' && verdict.message) {
+      handlers.onOutput('stderr', verdict.message)
+    }
   }
 
   let mediaFile = a.mediaFile
@@ -677,24 +839,7 @@ export function stopCurrent(): void {
   // Cancel a conversion that has not finished. The awaiting `startTranscribe` sees the reason
   // and ends the job, so this path still produces exactly one terminal event.
   j.prep?.abort()
-
-  const proc = j.proc
-  if (!proc) {
-    // Nothing spawned yet. If a preparation step is in flight it owns the terminal event;
-    // if there is none, end the job here so the slot is not held by a job with no work.
-    if (!j.prep) finish(j, -1)
-    return
-  }
-  try {
-    if (process.platform === 'win32' && proc.pid) {
-      spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t'])
-    } else {
-      proc.kill('SIGTERM')
-    }
-  } catch {
-    // The kill itself failed, so no `close` is coming to release the slot.
-    finish(j, -1)
-  }
+  killJob(j)
 }
 
 export function isRunning(): boolean {

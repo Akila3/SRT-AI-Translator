@@ -23,6 +23,7 @@ electron/
   main/      index.ts ipc.ts store.ts migrations.ts pythonBridge.ts ffmpeg.ts modelsList.ts tmdb.ts
   preload/   contextBridge -> window.api, plus its .d.ts contract
   shared/    types.ts languages.ts modelCaps.ts keyOrder.ts   (imported by BOTH processes)
+             outputSanity.ts ffmpegProgress.ts maskedCommand.ts stallBudget.ts   (pure, gate-tested)
 src/
   App.tsx    pages/  components/  lib/useRunner.ts  store/useStore.ts  data/
 scripts/
@@ -39,8 +40,10 @@ resources/bin/      gst, ffmpeg, ffprobe  (git-ignored; see "Getting the binarie
 
 1. `app.whenReady()`
 2. `logResolvedGstBin()` — prints which `gst` this session will run, resolving a bare name against
-   the same PATH a child process would see. Permanent by design; see hazard 2.
-3. `registerIpc()` — registers all 19 channels. **Side effect:** importing `./ipc` transitively
+   the same PATH a child process would see. Permanent by design; see hazard 2. It formats
+   `describeEngine()`, which is also what `engine:info` returns, so the console and the UI cannot
+   report different binaries.
+3. `registerIpc()` — registers all 20 channels. **Side effect:** importing `./ipc` transitively
    imports `./store`, which runs the settings migration chain at module load.
 4. `createWindow()` — one `BrowserWindow`, external links routed to the system browser.
 
@@ -120,6 +123,12 @@ Two properties here are load-bearing and easy to break by accident:
   what the API said, not from what the picker chose to display.
 - **A partial or failed refresh does not touch the cache.** Overwriting on a partial result drops
   models that only a currently-unreachable key can see.
+- **A refresh may only be applied to the keys it asked about.** Verdicts, errors and
+  `ModelInfo.availableOn` are all addressed by *slot index* and carry no trace of the key that
+  produced them, while a full check is a sequence of network round trips lasting up to a minute per
+  key. So the key fields are locked while one runs, and a result whose key snapshot has moved is
+  discarded whole — never applied in part, which would leave the verdicts, the cache and the stored
+  selection describing three different moments.
 
 The evidence bar is deliberately asymmetric: an `allComplete` refresh is required to *delete* a
 user's selection, while `activeComplete` is enough to advance a default nobody chose. That is what
@@ -189,6 +198,40 @@ measured?**
 - **The spawn itself gets a line.** A frozen build unpacks before it runs any of our code, measured
   at ~9 seconds cold, so `Starting engine…` is emitted the moment the process is created.
 
+### Ending a run the engine will not end itself
+
+The engine treats every failed request as retryable, including the ones that are permanent by
+nature. A transcription started with a rejected key was measured retrying for **6 hours 40 minutes**
+and writing **97 GB** of identical complaint before the disk filled; nothing in the app would ever
+have stopped it. Two independent defences now bound that, and each covers what the other cannot.
+
+**A preflight, before anything is converted or spawned.** `startTranscribe` asks the API whether the
+key works — the same `ListModels` check the translate path gets free from the engine, whose absence
+is exactly why the two features behaved so differently. It runs *inside* the job with the job's
+abort signal, so Stop still works during it, and it is **asymmetric like the model guard**: only a
+*rejected* key refuses the run. "Could not reach Google" warns and continues, because refusing to
+start over a network blink is a worse failure than letting the engine report the truth.
+
+**A stall budget in `run()`, as the backstop.** A preflight cannot foresee a key revoked mid-run, a
+quota withdrawn, or an error class that does not exist yet, so `electron/shared/stallBudget.ts`
+watches the output of every run for the loop that never ends. Three properties define it, and each
+one exists because the obvious alternative is wrong:
+
+- **It counts absence of novelty, never repetition.** The engine redraws its live display, so a
+  storm arrives as an *alternating* block — in the recorded evidence no two error lines are ever
+  adjacent, and a counter of repeated lines would not have fired once.
+- **A recognised error never terminates on its own.** A known-permanent marker only selects the
+  faster tier and names the cause; the budget still has to be exhausted. An unrecognised storm dies
+  anyway, more slowly, which is what keeps this from being a list that has to predict the future.
+- **Silence trips nothing, and any novel line resets everything** — including the marker, so an auth
+  error followed by real work reads as a run that recovered. Both tiers need thousands or hundreds
+  of lines *and* minutes of no progress, because the cost of a false positive is somebody's
+  half-finished paid run.
+
+A budget termination reads as **Failed** with its cause. It deliberately does not borrow the `user`
+reason: telling someone they pressed a Stop they never pressed would bury the very cause this is
+here to deliver.
+
 ### Transcribe job
 
 Shares the same IPC events, but writes directly to the user's chosen file: there is no save step.
@@ -196,7 +239,7 @@ Shares the same IPC events, but writes directly to the user's chosen file: there
 `startTranscribe` is async, because the engine only reads `.mp3` and `.wav` audio. Anything else
 (`.m4a`, `.aac`, `.flac`) is converted to a temporary MP3 with the bundled ffmpeg first, announced on
 stdout so the pause is explained. Video passes straight through — the engine extracts its own audio.
-The user's original file is never modified.
+The user's original file is never modified. Before any of that, the key preflight above runs.
 
 ### The job lock is a *job*, not a process
 
@@ -210,8 +253,19 @@ Rules to preserve when touching `pythonBridge.ts`:
 
 - `finish()` is the **only** terminal path. It is idempotent, fires the completion callback exactly
   once, releases the slot and deletes the job's scratch files.
+- `killJob()` is the only place a child is killed, and the kill is a **tree** kill: a frozen
+  PyInstaller build is a bootloader that spawns the real interpreter as a child, so killing the pid
+  we hold would leave the engine running, still calling the API. Every caller sets its own reason
+  *before* calling it — `stopCurrent()` sets `user`, the stall budget sets `stalled`, a refused
+  preflight sets `guard` — because `close` fires asynchronously and reads that field.
 - `stopCurrent()` marks the job cancelled and aborts an in-flight conversion through an
   `AbortController`; the spawn path re-checks cancellation and refuses to start after a Stop.
+- **Nothing may throw out of a start function.** Preparation runs inside the reserved slot, so an
+  escaping rejection leaves the slot held with `finish()` never called — `isRunning()` then stays
+  true for the life of the process and every later run of either kind is refused. Anything added
+  ahead of the spawn is caught, and leans towards *continuing*: the injected key preflight treats
+  its own failure as "not checked", because a fault in a check must not be able to make
+  transcription impossible.
 - A refused start emits a terminal event, never a bare stderr line.
 - Scratch is the converted **audio** only. The normalised subtitle must not be added to it: the
   engine names its progress and thoughts logs from that path, and the page copies those sidecars
@@ -219,7 +273,7 @@ Rules to preserve when touching `pythonBridge.ts`:
 
 ## IPC surface
 
-Nineteen request/response channels plus two push events, registered in `main/ipc.ts`, exposed
+Twenty request/response channels plus two push events, registered in `main/ipc.ts`, exposed
 through the preload bridge and typed in `electron/preload/index.d.ts`.
 
 | `window.api` | Channel | Notes |
@@ -235,6 +289,7 @@ through the preload bridge and typed in `electron/preload/index.d.ts`.
 | `startTranslate` / `startTranscribe` | `translate:start` / `transcribe:start` | return the output path |
 | `stop` | `translate:stop` | Windows uses `taskkill /f /t` |
 | `isRunning` | `translate:isRunning` | exposed but unused by the renderer |
+| `getEngineInfo` | `engine:info` | which `gst` will actually run, and whether it is the bundled copy |
 | `onOutput` / `onDone` | `translate:output` / `translate:done` | shared by translate **and** transcribe |
 | `onFfmpegProgress` | `ffmpeg:progress` | deliberately **not** the output stream — see "Saying that long work is progressing" |
 
@@ -271,6 +326,11 @@ Notable helpers, and the promise each makes:
 | `readProgressChunk()` / `percentOf()` (`electron/shared/ffmpegProgress.ts`) | Report what ffmpeg said, or nothing. `out_time_ms` is never read — it has carried *microseconds* for years, a bug preserved for compatibility. `N/A` is not zero. The percentage is capped at 99 while the process is alive, because a bar that reads 100% and keeps working is the same complaint in a different costume. |
 | `probeDuration()` (`electron/main/ffmpeg.ts`) | The one `ffprobe` that turns a position into a percentage. It runs *before* the work it measures, so it takes the caller's `AbortSignal` and forwards it: without that, Stop cannot end a job until an unbounded read on an unreachable path finishes by itself. A file that will not state its duration costs a percentage, never an error. |
 | `companionName()` / `extractedTrackName()` (`src/lib/outputName.ts`) | The single definition of what a written file is called: `<source stem>_<suffix><ext>`. A saved translation is named from its source and the target language; an extracted track is named from **its own** language, never the target — which is the same name for a track that happens to match, and a correct one for every other track. An untagged track falls back to its index, and only tracks alike in language *and* type need one, since the extension already separates `.srt` from `.sup`. |
+| `maskCommandLine()` (`electron/shared/maskedCommand.ts`) | The **only** thing permitted to turn an argv array into text. Keys are masked by **position** — the element after `-k`/`-k2` — never by recognising something that looks like a key, because the key that does not look like one is exactly the one that would be printed in full. A value already known to be a secret is then swept from the rest of the line by exact match, so a key pasted into the description field does not come back out. |
+| `createStallWatch()` (`electron/shared/stallBudget.ts`) | Decides when a run has stopped getting anywhere. Counts *absence of novelty*, never repetition; takes the clock as a parameter so the shipped thresholds are testable without a ten-minute test; and returns its verdict exactly once. |
+| `describeEngine()` (`electron/main/pythonBridge.ts`) | Which `gst` will actually run, and whether it is the bundled copy. The same answer feeds the startup console line, every run's command line and Settings > Advanced, so the three cannot disagree. Worth knowing: in a **dev** run this resolves through PATH, where a pip-installed engine can win over `resources/bin` — a packaged build always uses the bundled absolute path. |
+| `classifyFetchFailure()` (`electron/main/modelsList.ts`) / `src/lib/keyStatus.ts` | A key is only ever branded invalid when **the API refused it**. A DNS failure, a timeout, an exhausted quota and an error we do not recognise all mean *unchecked* — which is persisted as `null`, not `false`, because a false rejection silently demotes a working key at spawn time. `keyStatus.ts` owns every sentence the panel says about a check, since the failure mode here is wording rather than logic. |
+| `keepProvenRejections()` (`electron/main/modelsList.ts`) | The same rule running backwards: a check that proved nothing may not **erase** a rejection either. Only a rejection is carried forward, never a pass — `orderKeySlots` drops `false` and treats `true` and `null` alike, so `false` is the only verdict with operational weight, and retaining a `true` would let a failed check report "✓ N of N keys valid". A retained verdict is dropped the moment the key is edited or cleared, and it never implies anything about which models that key can see. |
 
 ### Three contracts that cross the process boundary
 
@@ -294,10 +354,14 @@ Import graph, main process — no cycles:
 index.ts     -> ipc.ts, pythonBridge
 ipc.ts       -> store, ffmpeg, tmdb, modelsList, pythonBridge, shared/{types,outputSanity}
 modelsList   -> pythonBridge, ffmpeg, store, shared/types
-pythonBridge -> ffmpeg, store, shared/{languages,types,keyOrder,modelCaps}
+pythonBridge -> ffmpeg, store, shared/{languages,types,keyOrder,modelCaps,maskedCommand,stallBudget}
 store.ts     -> shared/types, migrations
 migrations   -> shared/types            (no electron import, deliberately)
 ```
+
+`modelsList -> pythonBridge` is why the transcription key preflight is a **parameter** rather than an
+import: `pythonBridge` calling `refreshModels` directly would close that arrow into a cycle. `ipc.ts`
+already imports both, so it supplies the check and the bridge stays unaware of who answers it.
 
 ## The engine contract
 
@@ -347,7 +411,11 @@ waiting on stdin. Making that flag conditional would immediately make it reachab
    precisely so it does not shadow a developer's intended binary. Consequence: with the package
    pip-installed, development runs use *that*, not `resources/bin/`. An encoding test in development
    against a pip package is therefore a false pass — the frozen executable is the thing at risk.
-   `logResolvedGstBin()` prints the answer at every startup so this is observable rather than assumed.
+   This is not hypothetical: a pip-installed `gst.exe` was found winning that lookup on a development
+   machine, and it was an older build whose `list-models` rejects `--skip-upgrade` outright. The
+   answer is now visible in three places rather than assumed — the startup console line, **every run's
+   first log line**, and **Settings > Advanced**. A verification script that means to measure the
+   *release* must put `resources/bin` on PATH itself, as `scripts/verify/badkey.ts` does.
 3. **One job at a time**, enforced in the main process. The UI has no separate guard.
 4. **`resources/bin/` is git-ignored.** A fresh clone has no binaries; see below.
 5. **No test framework, no ESLint, no Prettier** — but three automated checks, described next.
@@ -363,6 +431,7 @@ waiting on stdin. Making that flag conditional would immediately make it reachab
 | `npm run typecheck` | `tsc --noEmit` over the node and web projects |
 | `npm run test:gates` | The check suite — migrations, model ordering and selection, key ranking, argv construction, subtitle normalisation. No API key, about a second |
 | `npm run check:bin` | Release preflight: the packaged binaries are present, real files and non-empty |
+| `node scripts/verify/run-badkey.mjs` | Runs the real engine with a **deliberately rejected** key, and asserts that the run ends. **No API key needed** — that is the point. About two minutes, because the budget requires a full minute of no progress by design |
 | `npm run verify:live` | Optional. Runs the real engine against a **real API key** — spends quota, never wired into another script |
 | `npm run build:python` | Freezes the engine with PyInstaller into `resources/bin/` |
 | `npm run build:win` | Builds and packages the portable Windows zip |
