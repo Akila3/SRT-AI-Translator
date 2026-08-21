@@ -129,6 +129,10 @@ keeps a bad network from quietly resetting someone's model.
 1. `TranslatePage` gathers input (an SRT/ASS file, or a video plus a chosen track), languages and an
    optional TMDB description.
 2. From a video track, ffmpeg extracts to a temp subtitle file first.
+   Any track can also be extracted to a file of the user's choosing, including an image-based (PGS)
+   one, which is exported as `.sup` because it is a bitmap and cannot be translated at all. The two
+   acts are separate controls: the radio chooses what to *translate*, the button on each row saves
+   that track out.
 3. `translate:start` runs the pre-spawn model guard, merges log flags from settings, and calls
    `startTranslate`.
 4. `startTranslate` normalises the input encoding, builds the argv, and spawns `gst`.
@@ -239,6 +243,7 @@ Notable helpers, and the promise each makes:
 | `ensureEngineReadableAudio()` | Same contract for audio: returns the untouched path, or a temp MP3. |
 | `generationParamArgs()` | Emits temperature/top-p/top-k only when the custom-parameters toggle is on **and the model still honours them**, and never emits a zero — the engine's truthiness check would drop it silently, so the UI would be claiming to send something it did not. |
 | `envWithFfmpeg()` | **Appends** the bundled bin directory to PATH, never prepends. See hazard 2. |
+| `companionName()` / `extractedTrackName()` (`src/lib/outputName.ts`) | The single definition of what a written file is called: `<source stem>_<suffix><ext>`. A saved translation is named from its source and the target language; an extracted track is named from **its own** language, never the target — which is the same name for a track that happens to match, and a correct one for every other track. An untagged track falls back to its index, and only tracks alike in language *and* type need one, since the extension already separates `.srt` from `.sup`. |
 
 ### Three contracts that cross the process boundary
 

@@ -16,6 +16,7 @@ import { SubTrackPanel } from '../components/SubTrackPanel'
 import { TmdbSearch } from '../components/TmdbSearch'
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from '../data/languages'
 import { retryIsCurrent } from '../lib/logView'
+import { companionName } from '../lib/outputName'
 import { useRunner } from '../lib/useRunner'
 import type { SubtitleTrack, TranslateArgs } from '../../electron/shared/types'
 
@@ -52,6 +53,16 @@ export default function TranslatePage(): React.JSX.Element {
   const [runSource, setRunSource] = useState('')
   const [startError, setStartError] = useState('')
   const [showLog, setShowLog] = useState(false)
+  /**
+   * Whether an extraction started from the track panel is still running.
+   *
+   * It is held here rather than in the panel because the panel is keyed by `videoFile` and so
+   * does not survive a video change — while the ffmpeg process it started does, and nothing in
+   * the main process serialises `video:extractTrack`. Kept in the child, the lock was released
+   * by the remount and a second extraction could start beside the first (validator finding
+   * FP5-01). The panel takes and releases it; the promise that releases it outlives the panel.
+   */
+  const [extracting, setExtracting] = useState(false)
 
   // Seed the language pickers from saved defaults once. We intentionally don't
   // re-run on every settings change: the page stays mounted across tabs, and
@@ -100,7 +111,40 @@ export default function TranslatePage(): React.JSX.Element {
   if (!settings) return <div className="p-6 text-sm text-gray-500 dark:text-gray-400">Loading…</div>
 
   const isRunning = state.status === 'running'
-  const canStart = !isRunning && (srtFile !== '' || (videoFile !== '' && selectedTrack !== null)) && tgtLang !== ''
+
+  /**
+   * Why this run cannot start, or an empty string when it can.
+   *
+   * Every one of these used to be a silently disabled button (REP-10). A control that refuses
+   * without saying what would enable it is indistinguishable from a broken one — the tester
+   * reported Start as "not responding" — and the sentence explaining the commonest case was
+   * already written inside `handleStart`, where the disabled gate guaranteed nobody would ever
+   * see it.
+   */
+  function whyCannotStart(): string {
+    if (!tgtLang) return 'Choose a target language first.'
+    if (srtFile) return ''
+    if (!videoFile) {
+      return 'Provide a subtitle file (.srt or .ass), or a video with a selectable text track.'
+    }
+    if (selectedTrack !== null) return ''
+    // A video whose tracks are still being read has no tracks yet, and saying it contains none
+    // would be a wrong answer rather than a slow one.
+    if (probing) return 'Still scanning this video’s subtitle tracks — try again in a moment.'
+    if (tracks.length === 0) {
+      return 'No subtitle tracks were found in this video. Provide a subtitle file instead.'
+    }
+    // The reported case, which had no message anywhere: every track is a bitmap, so there is
+    // no text to translate. Reading one would need OCR, which is a feature rather than a flag,
+    // so the honest answer is to say so and point at what IS possible.
+    if (tracks.every((t) => t.isImage)) {
+      return (
+        'This video’s subtitles are image-based (PGS) and cannot be translated — ' +
+        'extract one as a .sup instead, or provide a subtitle file.'
+      )
+    }
+    return 'Choose which subtitle track to translate.'
+  }
 
   async function handleStart(): Promise<void> {
     setStartError('')
@@ -108,6 +152,12 @@ export default function TranslatePage(): React.JSX.Element {
     setShowLog(false)
     const cfg = settings
     if (!cfg) return
+
+    const refusal = whyCannotStart()
+    if (refusal) {
+      setStartError(refusal)
+      return
+    }
 
     // Read before the first await, not after: extracting a track from a large video runs for
     // minutes, and nothing stops the user editing the pickers while it does.
@@ -124,6 +174,8 @@ export default function TranslatePage(): React.JSX.Element {
       inputFile = res.path
     }
     if (!inputFile) {
+      // Unreachable while `whyCannotStart` covers every path above. Kept so that a later edit
+      // to those rules cannot end with the engine spawned against no input at all.
       setStartError('Provide a subtitle file (.srt or .ass), or a video with a selectable text track.')
       return
     }
@@ -160,13 +212,13 @@ export default function TranslatePage(): React.JSX.Element {
 
   async function handleSave(): Promise<void> {
     if (!state.outputPath) return
-    // Same snapshot, same reason: the proposed filename must describe the run being saved, not
-    // whatever happens to be in the pickers now.
-    const base = (runSource || 'subtitle').replace(/\.[^.]+$/, '')
     // Keep the format the engine actually produced. It writes according to the output
     // path's extension, so proposing ".srt" for an ASS job would mislabel the file.
     const ext = /\.ass$/i.test(state.outputPath) ? '.ass' : '.srt'
-    const name = `${base.split(/[\\/]/).pop()}_${tgtLang}${ext}`
+    // Same snapshot, same reason: the proposed filename must describe the run being saved, not
+    // whatever happens to be in the pickers now. The convention itself now lives in one place,
+    // shared with track extraction — see `outputName.ts`.
+    const name = companionName(runSource, tgtLang, ext)
     const saved = await window.api.saveFile({
       srcPath: state.outputPath,
       defaultName: name,
@@ -217,12 +269,22 @@ export default function TranslatePage(): React.JSX.Element {
             />
             {probing && <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">Scanning subtitle tracks…</p>}
             <div className="mt-2">
+              {/*
+                REP-9: the key is what clears the panel's extraction result when a different
+                video is loaded. Without it React keeps the same instance, and the previous
+                film's "Saved → …" survives — pointing at a real file, so the panel actively
+                asserts that THIS video's subtitles were extracted. Resetting by `key` cannot
+                miss a field the way a hand-written reset of three named values can.
+              */}
               <SubTrackPanel
+                key={videoFile}
                 videoFile={videoFile}
                 tracks={tracks}
                 targetLang={tgtLang}
                 selectedIndex={selectedTrack}
                 onSelect={setSelectedTrack}
+                busy={extracting}
+                onBusy={setExtracting}
               />
             </div>
           </div>
@@ -276,7 +338,13 @@ export default function TranslatePage(): React.JSX.Element {
         {startError && <p className="mb-3 text-sm text-red-600 dark:text-red-400">{startError}</p>}
         <div className="flex items-center gap-2">
           {!isRunning ? (
-            <Button onClick={handleStart} disabled={!canStart}>
+            /*
+              Disabled only while a job is running — and even that is belt-and-braces, since
+              this branch is not rendered then. Everything else that would prevent a run is
+              now reported by `handleStart` in words rather than by a button that does
+              nothing. See `whyCannotStart`.
+            */
+            <Button onClick={handleStart} disabled={isRunning}>
               Start Translation
             </Button>
           ) : (

@@ -72,7 +72,13 @@ import {
   samplingDefaults
 } from '../../electron/shared/modelCaps'
 import { valueOnBlur, valueWhileTyping, type NumberFieldRules } from '../../src/lib/numberField'
-import type { ModelInfo, SlotFetchResult, TranslateArgs } from '../../electron/shared/types'
+import { companionName, extractedTrackName } from '../../src/lib/outputName'
+import type {
+  ModelInfo,
+  SlotFetchResult,
+  SubtitleTrack,
+  TranslateArgs
+} from '../../electron/shared/types'
 
 // ── harness ────────────────────────────────────────────────────────────────────
 
@@ -1339,6 +1345,51 @@ section('G5c — a number field can be typed into (REP-4)')
   eq('G5c batch size still commits while typing', typing('100', { min: 1, max: 1000 }), [1, 10, 100])
   eq('G5c resume context accepts zero', valueWhileTyping('0', { min: 0, max: 1000 }), 0)
   eq('G5c and blur leaves it alone', valueOnBlur('0', { min: 0, max: 1000 }, 50), 0)
+}
+
+section('G6 — an extracted track is named after itself, not after the target (REP-8)')
+{
+  const track = (
+    index: number,
+    lang: string,
+    isImage = false
+  ): SubtitleTrack => ({ index, lang, name: `Track ${index}`, codec: isImage ? 'hdmv_pgs_subtitle' : 'subrip', isImage })
+
+  const video = 'C:\\Media\\Lone.Survivor.2013.UHD.BluRay.REMUX.mkv'
+  const stem = 'Lone.Survivor.2013.UHD.BluRay.REMUX'
+
+  // The reported file: English and Spanish PGS, translating into Hebrew. Before per-track
+  // extraction existed, the only reachable track was one whose language equalled the target,
+  // which is the sole reason naming the file after the target ever looked right. Opening the
+  // feature is what breaks that, so the two land together.
+  const reported = [track(2, 'en', true), track(3, 'es', true)]
+  eq('G6 an English PGS track is not named after Hebrew', extractedTrackName(video, reported[0], reported), `${stem}_en.sup`)
+  eq('G6 the Spanish one carries its own language too', extractedTrackName(video, reported[1], reported), `${stem}_es.sup`)
+
+  // Type is already encoded by the extension, so a text and an image track of the same
+  // language do not collide and neither needs an index.
+  const mixed = [track(0, 'en'), track(2, 'en', true)]
+  eq('G6 a text track of the same language', extractedTrackName(video, mixed[0], mixed), `${stem}_en.srt`)
+  eq('G6 does not collide with the image one', extractedTrackName(video, mixed[1], mixed), `${stem}_en.sup`)
+
+  // The narrow real collision: two English PGS streams, full and SDH, as Blu-ray remuxes
+  // commonly carry. The first keeps the plain name; later ones carry their index.
+  const twoEnglish = [track(2, 'en', true), track(3, 'en', true)]
+  eq('G6 the first of two alike tracks keeps the plain name', extractedTrackName(video, twoEnglish[0], twoEnglish), `${stem}_en.sup`)
+  eq('G6 the second is distinguished by its index', extractedTrackName(video, twoEnglish[1], twoEnglish), `${stem}_en_3.sup`)
+
+  // An untagged track shows '—' in the panel and would otherwise be saved as `..._.srt`.
+  const untagged = [track(1, '')]
+  eq('G6 an untagged track falls back to its index', extractedTrackName(video, untagged[0], untagged), `${stem}_track1.srt`)
+
+  // Only the last extension is dropped, so a release name full of dots survives intact.
+  eq('G6 a POSIX path keeps only the file name', extractedTrackName('/home/u/My Film (2019).mkv', reported[0], reported), 'My Film (2019)_en.sup')
+  eq('G6 a bare file name needs no directory', extractedTrackName('clip.mkv', reported[0], reported), 'clip_en.sup')
+
+  // The translated-subtitle save shares this convention — that is why it is one helper.
+  eq('G6 the save path builds the same shape', companionName('C:\\Subs\\Pachinko.S01E01.eng.srt', 'he', '.srt'), 'Pachinko.S01E01.eng_he.srt')
+  eq('G6 an ASS job keeps its format', companionName('/x/Show.ass', 'he', '.ass'), 'Show_he.ass')
+  eq('G6 and a run with no source path still proposes something', companionName('', 'he', '.srt'), 'subtitle_he.srt')
 }
 
 // ── result ─────────────────────────────────────────────────────────────────────
