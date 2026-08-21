@@ -9,6 +9,7 @@ import { orderKeySlots, type KeySlot } from '../shared/keyOrder'
 import { effectiveThinkingLevel, modelCapabilities } from '../shared/modelCaps'
 import {
   DEFAULT_RESUME_CONTEXT_SIZE,
+  type FfmpegProgress,
   type TerminalReason,
   type TranslateArgs,
   type TranscribeArgs
@@ -305,6 +306,12 @@ function generationParamArgs(a: {
 export interface SpawnHandlers {
   onOutput: (stream: 'stdout' | 'stderr', line: string) => void
   onDone: (code: number | null, outputPath: string, reason?: TerminalReason) => void
+  /**
+   * How far the job's ffmpeg preparation has got. Optional: it is a second channel, not a
+   * second meaning for the first, so every existing caller — including the verification
+   * probes, which have no window to send to — stays valid by simply not listening.
+   */
+  onProgress?: (p: FfmpegProgress) => void
 }
 
 /**
@@ -452,12 +459,13 @@ export type AudioNormalizeResult =
 export async function ensureEngineReadableAudio(
   mediaFile: string,
   ffmpegPath?: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (pct: number | null, elapsedMs: number) => void
 ): Promise<AudioNormalizeResult> {
   if (!needsAudioConversion(mediaFile)) return { ok: true, path: mediaFile, converted: false }
 
   const outPath = tempOutputPath('.mp3')
-  const res = await convertAudioToMp3(mediaFile, outPath, ffmpegPath, signal)
+  const res = await convertAudioToMp3(mediaFile, outPath, ffmpegPath, signal, onProgress)
   if (!res.ok) {
     return {
       ok: false,
@@ -515,6 +523,11 @@ function run(j: Job, args: string[]): void {
     return
   }
   j.proc = proc
+  // The gap between this spawn and the engine's first line is not nothing: a frozen build
+  // unpacks itself into a temp directory before it runs any of our code, which on a cold
+  // start is seconds of a window that says absolutely nothing. One line, once, at the only
+  // moment the app knows something the engine cannot yet report about itself.
+  handlers.onOutput('stdout', 'Starting engine…')
 
   let stdoutBuf = ''
   let stderrBuf = ''
@@ -607,12 +620,24 @@ export async function startTranscribe(a: TranscribeArgs, handlers: SpawnHandlers
       `Preparing ${path.basename(a.mediaFile)} — converting to MP3, which is the format the engine reads…`
     )
     j.prep = new AbortController()
+    const startedAt = Date.now()
     const prepared = await ensureEngineReadableAudio(
       a.mediaFile,
       getSettings().ffmpegPath,
-      j.prep.signal
+      j.prep.signal,
+      (pct, elapsedMs) => handlers.onProgress?.({ kind: 'convert', pct, elapsedMs })
     )
     j.prep = null
+    // Emitted on EVERY outcome, including an abort and a failure: the page showing this
+    // conversion has no promise of its own to wait on, so this event is the only thing that
+    // can tell it the conversion is over. It is sent before any terminal event below, so a
+    // stopped run never leaves a bar behind.
+    handlers.onProgress?.({
+      kind: 'convert',
+      pct: null,
+      elapsedMs: Date.now() - startedAt,
+      done: true
+    })
 
     // A Stop that landed in the gap after the conversion finished has already ended the
     // job; saying anything more here would follow a terminal event with stray output.

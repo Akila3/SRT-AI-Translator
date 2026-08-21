@@ -28,6 +28,8 @@ import type {
   TranslateArgs,
   TranscribeArgs,
   AppSettings,
+  FfmpegProgress,
+  FfmpegTaskKind,
   ModelInfo,
   RefreshOutcome,
   SlotFetchResult
@@ -444,14 +446,41 @@ export function registerIpc(): void {
     return probeTracks(filePath, ffmpegPath)
   })
 
-  // Silent extraction to a temp .srt (used as translation input for a chosen track)
+  /**
+   * Report an ffmpeg task's progress on its OWN channel.
+   *
+   * Deliberately not `translate:output`: the renderer treats that stream as engine log lines,
+   * so a tick every half second would become a log row, and a long extraction would bury the
+   * run in noise that FP-3 exists to prevent.
+   */
+  const progressTo =
+    (kind: FfmpegTaskKind) =>
+    (pct: number | null, elapsedMs: number): void =>
+      send('ffmpeg:progress', { kind, pct, elapsedMs } satisfies FfmpegProgress)
+
+  const endProgress = (kind: FfmpegTaskKind): void =>
+    send('ffmpeg:progress', { kind, pct: null, elapsedMs: 0, done: true } satisfies FfmpegProgress)
+
+  // Extraction to a temp .srt (used as translation input for a chosen track). No longer
+  // silent: on a large container this is the minutes-long pause REP-11 was reported against.
   ipcMain.handle(
     'video:extractToTemp',
     async (_e, args: { filePath: string; subtitleIndex: number }) => {
       const { ffmpegPath } = getSettings()
       const out = tempOutputPath('.srt')
-      const res = await extractTrack(args.filePath, args.subtitleIndex, out, false, ffmpegPath)
-      return res.ok ? { ok: true, path: out } : { ok: false, error: res.error }
+      try {
+        const res = await extractTrack(
+          args.filePath,
+          args.subtitleIndex,
+          out,
+          false,
+          ffmpegPath,
+          progressTo('prepare')
+        )
+        return res.ok ? { ok: true, path: out } : { ok: false, error: res.error }
+      } finally {
+        endProgress('prepare')
+      }
     }
   )
 
@@ -468,14 +497,19 @@ export function registerIpc(): void {
         : args.defaultName
       const res = await dialog.showSaveDialog(win, { defaultPath })
       if (res.canceled || !res.filePath) return { ok: false, canceled: true }
-      const out = await extractTrack(
-        args.filePath,
-        args.subtitleIndex,
-        res.filePath,
-        args.isImage,
-        ffmpegPath
-      )
-      return { ...out, path: res.filePath }
+      try {
+        const out = await extractTrack(
+          args.filePath,
+          args.subtitleIndex,
+          res.filePath,
+          args.isImage,
+          ffmpegPath,
+          progressTo('export')
+        )
+        return { ...out, path: res.filePath }
+      } finally {
+        endProgress('export')
+      }
     }
   )
 
@@ -566,7 +600,10 @@ export function registerIpc(): void {
     // unchanged, since `startTranscribe` was already a Promise across the IPC boundary.
     return await startTranscribe(args, {
       onOutput: (stream, line) => send('translate:output', { stream, line }),
-      onDone: (code, outputPath, reason) => send('translate:done', { code, outputPath, reason })
+      onDone: (code, outputPath, reason) => send('translate:done', { code, outputPath, reason }),
+      // The payload is built by the bridge, which is the only thing that knows whether the
+      // conversion is still running; this just forwards it.
+      onProgress: (p) => send('ffmpeg:progress', p)
     })
   })
 

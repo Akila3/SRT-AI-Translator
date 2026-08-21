@@ -59,3 +59,27 @@ html.dark .thin-scroll::-webkit-scrollbar-thumb {
   content-visibility: auto;
   contain-intrinsic-size: auto 16px;
 }
+
+/*
+ * The indeterminate progress bar: a segment sweeping the track.
+ *
+ * It carries one meaning only — "this is still alive" — for the ffmpeg work that reports
+ * nothing until it exits. Transform-only, so it animates on the compositor and costs
+ * nothing during a run that is already re-rendering a log panel.
+ */
+@keyframes progress-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+.progress-sweep {
+  animation: progress-sweep 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .progress-sweep {
+    animation-duration: 3s;
+  }
+}

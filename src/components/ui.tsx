@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react'
+import React, { useEffect, useState, useRef } from 'react'
 import type { LogRow, RetryState } from '../lib/logView'
 import { valueOnBlur, valueWhileTyping } from '../lib/numberField'
 
@@ -311,13 +311,92 @@ export function FilePicker({
 }
 
 // ─── Progress bar ────────────────────────────────────────────────────────────
-export function ProgressBar({ pct }: { pct: number }): React.JSX.Element {
+/**
+ * `indeterminate` is for work that is genuinely happening but cannot be measured — the
+ * engine's own ffmpeg calls report nothing until they finish, and a bar frozen at 0% is
+ * indistinguishable from a hung app, which is precisely what REP-11 was reported as. It
+ * moves to say "alive", and says nothing about how far along it is, which is the truth.
+ */
+export function ProgressBar({
+  pct,
+  indeterminate = false
+}: {
+  pct: number
+  indeterminate?: boolean
+}): React.JSX.Element {
   return (
     <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
-      <div
-        className="h-full rounded-full bg-brand transition-all duration-300"
-        style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
-      />
+      {indeterminate ? (
+        <div className="progress-sweep h-full w-1/3 rounded-full bg-brand" />
+      ) : (
+        <div
+          className="h-full rounded-full bg-brand transition-all duration-300"
+          style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+        />
+      )}
+    </div>
+  )
+}
+
+// ─── Elapsed clock ───────────────────────────────────────────────────────────
+/** `m:ss`, or `h:mm:ss` once it has been running long enough to need the hours. */
+export function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const s = total % 60
+  const m = Math.floor(total / 60) % 60
+  const h = Math.floor(total / 3600)
+  const mm = h > 0 ? String(m).padStart(2, '0') : String(m)
+  return `${h > 0 ? `${h}:` : ''}${mm}:${String(s).padStart(2, '0')}`
+}
+
+/**
+ * A clock that counts up from a moment.
+ *
+ * The one thing an app can always honestly say about work it cannot measure is how long it
+ * has been going. It ticks once a second, and only while mounted — it is rendered only
+ * during the work it describes, so there is no interval left running afterwards.
+ */
+export function Elapsed({ since }: { since: number }): React.JSX.Element {
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    setNow(Date.now())
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [since])
+  return <>{formatElapsed(now - since)}</>
+}
+
+// ─── "This is taking a while, and here is proof it is alive" ──────────────────
+/**
+ * One line of reassurance plus a bar, for work that takes minutes and used to say nothing.
+ *
+ * `pct` is null when the duration is unknown, and then the elapsed clock carries the whole
+ * message. That fallback is not a rare edge: the engine's internal extraction cannot report
+ * progress at all, so for transcription it is the normal case.
+ */
+export function Working({
+  label,
+  pct,
+  since,
+  note
+}: {
+  label: string
+  pct: number | null
+  since: number
+  note?: string
+}): React.JSX.Element {
+  return (
+    <div className="space-y-1.5 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-900/40">
+      <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+        <Spinner />
+        <span>{label}</span>
+        <span className="ml-auto font-mono text-xs text-gray-500 dark:text-gray-400">
+          {pct !== null && `${pct}% · `}
+          <Elapsed since={since} />
+        </span>
+      </div>
+      <ProgressBar pct={pct ?? 0} indeterminate={pct === null} />
+      {note && <p className="text-xs text-gray-500 dark:text-gray-400">{note}</p>}
     </div>
   )
 }

@@ -9,6 +9,7 @@ import type {
   TmdbDetails,
   ProcOutput,
   ProcDone,
+  FfmpegProgress,
   KeyCheck,
   SlotFetchResult,
   RefreshOutcome
@@ -113,6 +114,18 @@ const api = {
     const listener = (_e: unknown, payload: ProcDone): void => cb(payload)
     ipcRenderer.on('translate:done', listener)
     return () => ipcRenderer.removeListener('translate:done', listener)
+  },
+  /**
+   * How far an ffmpeg task has got — a channel of its own, separate from the engine's output
+   * stream, so that a tick every half second never lands in the log panel.
+   *
+   * Every page receives every task, because a transcription's audio conversion and a track
+   * export can genuinely overlap; the `kind` field is what lets a page recognise its own.
+   */
+  onFfmpegProgress: (cb: (p: FfmpegProgress) => void): (() => void) => {
+    const listener = (_e: unknown, payload: FfmpegProgress): void => cb(payload)
+    ipcRenderer.on('ffmpeg:progress', listener)
+    return () => ipcRenderer.removeListener('ffmpeg:progress', listener)
   }
 }
 

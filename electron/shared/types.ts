@@ -172,6 +172,43 @@ export interface ProcOutput {
 }
 
 /**
+ * Which piece of ffmpeg work a progress report belongs to.
+ *
+ * This is what correlates a report with the thing on screen that is waiting for it, and it is
+ * an enumeration rather than a generated id because the three are already mutually exclusive
+ * in practice: `export` and `prepare` share the Translate page's single ffmpeg lock, and
+ * `convert` can only run inside a transcription job, of which there is at most one. A page
+ * therefore ignores any kind it did not start — which matters, because a transcription's
+ * conversion and a track export CAN overlap, being on different pages under different locks.
+ *
+ * - `export`  — a subtitle track written to a file the user chose.
+ * - `prepare` — a track extracted to a temp file so it can be translated.
+ * - `convert` — audio normalised to MP3 before transcription.
+ */
+export type FfmpegTaskKind = 'export' | 'prepare' | 'convert'
+
+/**
+ * How far one ffmpeg task has got. Its own channel, NOT the engine's output stream: every
+ * tick would otherwise become a log row and undo the panel work of FP-3.
+ */
+export interface FfmpegProgress {
+  kind: FfmpegTaskKind
+  /**
+   * Whole percent, or null when the input's duration is unknown and only elapsed time can
+   * honestly be shown. Never reaches 100 while the task is running.
+   */
+  pct: number | null
+  /** Milliseconds since the task started, so a page can show a clock without owning one. */
+  elapsedMs: number
+  /**
+   * The task has ended, however it ended — stop showing it. `pct` is meaningless here.
+   * Present because `convert` runs inside a job the renderer never awaits, so nothing else
+   * would tell its page that the conversion is over.
+   */
+  done?: boolean
+}
+
+/**
  * Why a run ended, when something other than the engine decided it.
  *
  * A boolean would not do. A killed process and a crashed one both exit non-zero, so the

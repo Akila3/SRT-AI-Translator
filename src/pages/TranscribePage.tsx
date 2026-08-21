@@ -6,10 +6,12 @@ import {
   Label,
   FilePicker,
   Button,
+  Elapsed,
   ProgressBar,
   LogPanel,
   RetryNotice,
-  Select
+  Select,
+  Working
 } from '../components/ui'
 import { THINKING_LEVELS } from '../data/freeTier'
 import { retryIsCurrent } from '../lib/logView'
@@ -28,12 +30,43 @@ export default function TranscribePage(): React.JSX.Element {
   const [outputFile, setOutputFile] = useState('')
   const [description, setDescription] = useState('')
   const [startError, setStartError] = useState('')
+  /** When this run started, for the clock shown while the engine is preparing in silence. */
+  const [runStartedAt, setRunStartedAt] = useState(0)
+  /**
+   * The audio conversion the app runs before the engine, when the file is one the engine
+   * cannot read. Null when there is none — which is the common case, since MP3 and WAV are
+   * passed straight through and video is the engine's own job.
+   *
+   * `startedAt` is derived from the report's own elapsed time rather than from when the first
+   * report arrived: ffmpeg needs a moment to open a large file, and a clock that started late
+   * would quietly under-report every conversion.
+   */
+  const [convert, setConvert] = useState<{ pct: number | null; startedAt: number } | null>(null)
 
   useEffect(() => {
     if (mediaFile && !outputFile) {
       setOutputFile(mediaFile.replace(/\.[^.]+$/, '') + '.srt')
     }
   }, [mediaFile, outputFile])
+
+  useEffect(
+    () =>
+      window.api.onFfmpegProgress((p) => {
+        // Only this page's own preparation. An export started on the Translate page can be
+        // running at the same time, under a different lock, and is none of this page's business.
+        if (p.kind !== 'convert') return
+        setConvert((cur) =>
+          // `done` is the only thing that ends this box: the conversion happens inside a job
+          // the renderer never awaits, so there is no promise here to hang the ending on.
+          p.done
+            ? null
+            : // The clock is anchored once, on the first report. Recomputing it every tick
+              // would restart the timer that draws it and make the seconds stutter.
+              { pct: p.pct, startedAt: cur?.startedAt ?? Date.now() - p.elapsedMs }
+        )
+      }),
+    []
+  )
 
   if (!settings) return <div className="p-6 text-sm text-gray-500 dark:text-gray-400">Loading…</div>
 
@@ -79,6 +112,8 @@ export default function TranscribePage(): React.JSX.Element {
       description: description || undefined,
       ffmpegPath: settings.ffmpegPath || undefined
     }
+    setRunStartedAt(Date.now())
+    setConvert(null)
     await start(() => window.api.startTranscribe(args))
   }
 
@@ -211,7 +246,28 @@ export default function TranscribePage(): React.JSX.Element {
 
         {(isRunning || state.status === 'done' || state.status === 'error' || state.status === 'stopped') && (
           <div className="mt-4 space-y-3">
-            <ProgressBar pct={state.progress} />
+            {/*
+              Transcription is the worst case for silence and the reason this bar can now be
+              indeterminate. The engine extracts the audio, downmixes it and compresses it
+              before it says anything at all, and its own ffmpeg calls capture their output
+              instead of streaming it — so there is no percentage to be had from them at any
+              price short of forking the engine. The clock is what can honestly be shown.
+            */}
+            <ProgressBar pct={state.progress} indeterminate={isRunning && state.progress === 0} />
+            {convert && (
+              <Working
+                label="Converting the audio to MP3, which is the format the engine reads"
+                pct={convert.pct}
+                since={convert.startedAt}
+              />
+            )}
+            {isRunning && !convert && state.progress === 0 && (
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Working for <Elapsed since={runStartedAt} /> — the engine extracts and compresses
+                the audio before it reports anything, which on a large video takes several
+                minutes.
+              </p>
+            )}
             {isRunning && retryIsCurrent(state.retry, state.currentLine) && state.retry && (
               <RetryNotice retry={state.retry} />
             )}

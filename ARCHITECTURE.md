@@ -71,6 +71,7 @@ flowchart TD
     I --> TM
     G -->|stdout/stderr lines| PB --> I
     I -->|"translate:output / translate:done"| R
+    I -->|"ffmpeg:progress"| R
     G -->|writes| Tmp
     R -->|"Save..."| I -->|copyFile| Tmp
 ```
@@ -132,7 +133,8 @@ keeps a bad network from quietly resetting someone's model.
    Any track can also be extracted to a file of the user's choosing, including an image-based (PGS)
    one, which is exported as `.sup` because it is a bitmap and cannot be translated at all. The two
    acts are separate controls: the radio chooses what to *translate*, the button on each row saves
-   that track out.
+   that track out. Both run under one lock and report a live percentage — on a 50 GB container either
+   can run for minutes, and the page refuses to start a second ffmpeg while one is working.
 3. `translate:start` runs the pre-spawn model guard, merges log flags from settings, and calls
    `startTranslate`.
 4. `startTranslate` normalises the input encoding, builds the argv, and spawns `gst`.
@@ -164,6 +166,28 @@ disk stays byte-identical to what the engine wrote.
 Note that step 3 can fail **synchronously** — a busy job slot, a refused non-UTF-8 `.ass`, a spawn
 that throws — so anything the completion callback closes over must already be initialised when
 `startTranslate` is called.
+
+### Saying that long work is progressing
+
+Several things here legitimately take minutes, and an app that says nothing for minutes is
+indistinguishable from one that has hung. The design turns on a single question — **can this wait be
+measured?**
+
+- **The app's own ffmpeg calls can.** Track extraction and audio conversion run with
+  `-progress pipe:1`, and one `ffprobe` for the duration turns the reported position into a
+  percentage. `electron/shared/ffmpegProgress.ts` owns the parsing, and it is pure so that a *wrong*
+  number — the real failure mode of a progress bar — is catchable by a test.
+- **The engine's internal ffmpeg cannot.** It captures its output and returns it on exit, so its
+  extraction and MP3 steps have no progress to recover without forking a pinned dependency. Those
+  get an indeterminate bar and an **elapsed clock**, which is the one thing always honestly
+  knowable. Nothing invents a percentage: an unknown duration produces `null` and the UI says so.
+- **Progress travels on its own channel, `ffmpeg:progress`, never on `translate:output`.** The
+  renderer treats every line of that stream as an engine log row, so a tick twice a second would
+  become a log row twice a second. The payload carries a `kind` (`export`, `prepare`, `convert`) and
+  each page ignores the kinds it did not start — a transcription's conversion and a track export run
+  under different locks and can genuinely overlap.
+- **The spawn itself gets a line.** A frozen build unpacks before it runs any of our code, measured
+  at ~9 seconds cold, so `Starting engine…` is emitted the moment the process is created.
 
 ### Transcribe job
 
@@ -212,6 +236,7 @@ through the preload bridge and typed in `electron/preload/index.d.ts`.
 | `stop` | `translate:stop` | Windows uses `taskkill /f /t` |
 | `isRunning` | `translate:isRunning` | exposed but unused by the renderer |
 | `onOutput` / `onDone` | `translate:output` / `translate:done` | shared by translate **and** transcribe |
+| `onFfmpegProgress` | `ffmpeg:progress` | deliberately **not** the output stream — see "Saying that long work is progressing" |
 
 ## What ripples when you change it
 
@@ -243,6 +268,8 @@ Notable helpers, and the promise each makes:
 | `ensureEngineReadableAudio()` | Same contract for audio: returns the untouched path, or a temp MP3. |
 | `generationParamArgs()` | Emits temperature/top-p/top-k only when the custom-parameters toggle is on **and the model still honours them**, and never emits a zero — the engine's truthiness check would drop it silently, so the UI would be claiming to send something it did not. |
 | `envWithFfmpeg()` | **Appends** the bundled bin directory to PATH, never prepends. See hazard 2. |
+| `readProgressChunk()` / `percentOf()` (`electron/shared/ffmpegProgress.ts`) | Report what ffmpeg said, or nothing. `out_time_ms` is never read — it has carried *microseconds* for years, a bug preserved for compatibility. `N/A` is not zero. The percentage is capped at 99 while the process is alive, because a bar that reads 100% and keeps working is the same complaint in a different costume. |
+| `probeDuration()` (`electron/main/ffmpeg.ts`) | The one `ffprobe` that turns a position into a percentage. It runs *before* the work it measures, so it takes the caller's `AbortSignal` and forwards it: without that, Stop cannot end a job until an unbounded read on an unreachable path finishes by itself. A file that will not state its duration costs a percentage, never an error. |
 | `companionName()` / `extractedTrackName()` (`src/lib/outputName.ts`) | The single definition of what a written file is called: `<source stem>_<suffix><ext>`. A saved translation is named from its source and the target language; an extracted track is named from **its own** language, never the target — which is the same name for a track that happens to match, and a correct one for every other track. An untagged track falls back to its index, and only tracks alike in language *and* type need one, since the extension already separates `.srt` from `.sup`. |
 
 ### Three contracts that cross the process boundary

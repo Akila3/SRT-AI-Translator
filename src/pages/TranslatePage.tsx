@@ -7,10 +7,12 @@ import {
   Select,
   FilePicker,
   Button,
+  Elapsed,
   ProgressBar,
   LogPanel,
   RetryNotice,
-  StatusCard
+  StatusCard,
+  Working
 } from '../components/ui'
 import { SubTrackPanel } from '../components/SubTrackPanel'
 import { TmdbSearch } from '../components/TmdbSearch'
@@ -26,6 +28,19 @@ const SUBTITLE_FILTERS = [{ name: 'Subtitles', extensions: ['srt', 'ass'] }]
 const AUDIO_FILTERS = [
   { name: 'Audio/Video', extensions: ['mp3', 'aac', 'wav', 'm4a', 'flac', 'mp4', 'mkv'] }
 ]
+
+/**
+ * One piece of ffmpeg work this page is waiting on.
+ *
+ * `export` is a track written to a file the user chose; `prepare` is the silent extraction
+ * that turns a chosen track into translation input. `pct` is null until the first report,
+ * and stays null for a container that will not say how long it is.
+ */
+interface FfmpegTask {
+  kind: 'export' | 'prepare'
+  pct: number | null
+  startedAt: number
+}
 
 export default function TranslatePage(): React.JSX.Element {
   const settings = useStore((s) => s.settings)
@@ -54,15 +69,43 @@ export default function TranslatePage(): React.JSX.Element {
   const [startError, setStartError] = useState('')
   const [showLog, setShowLog] = useState(false)
   /**
-   * Whether an extraction started from the track panel is still running.
+   * The ffmpeg work this page is waiting on, or null when there is none.
    *
    * It is held here rather than in the panel because the panel is keyed by `videoFile` and so
    * does not survive a video change — while the ffmpeg process it started does, and nothing in
    * the main process serialises `video:extractTrack`. Kept in the child, the lock was released
    * by the remount and a second extraction could start beside the first (validator finding
    * FP5-01). The panel takes and releases it; the promise that releases it outlives the panel.
+   *
+   * It is now a task rather than a boolean because the same lock answers a second question —
+   * how far along that work is. The two belong together: exactly one ffmpeg task runs from
+   * this page at a time, so "is one running" and "which one, and how far" are one state.
    */
-  const [extracting, setExtracting] = useState(false)
+  const [ffmpeg, setFfmpeg] = useState<FfmpegTask | null>(null)
+  /** When the current run started, for the clock shown while nothing measurable has happened. */
+  const [runStartedAt, setRunStartedAt] = useState(0)
+  /** When the track scan started, for the same reason: a 50 GB container takes a while. */
+  const [probeStartedAt, setProbeStartedAt] = useState(0)
+
+  /**
+   * Follow the ffmpeg progress channel for as long as this page exists.
+   *
+   * A report for a kind this page is not waiting on is ignored rather than shown: a
+   * transcription's audio conversion runs on the other page under the job lock, and can
+   * genuinely overlap a track export started here.
+   */
+  useEffect(
+    () =>
+      window.api.onFfmpegProgress((p) => {
+        setFfmpeg((cur) => {
+          // `done` is deliberately not acted on: the awaits below own the end of these two
+          // tasks, and clearing here as well would race a task that starts immediately after.
+          if (!cur || cur.kind !== p.kind || p.done) return cur
+          return { ...cur, pct: p.pct }
+        })
+      }),
+    []
+  )
 
   // Seed the language pickers from saved defaults once. We intentionally don't
   // re-run on every settings change: the page stays mounted across tabs, and
@@ -81,6 +124,7 @@ export default function TranslatePage(): React.JSX.Element {
     if (!p) return
     setVideoFile(p)
     setProbing(true)
+    setProbeStartedAt(Date.now())
     setTracks([])
     setSelectedTrack(null)
     try {
@@ -108,6 +152,20 @@ export default function TranslatePage(): React.JSX.Element {
     setSelectedTrack(null)
   }
 
+  /**
+   * Take or release the lock on the track panel's behalf.
+   *
+   * The release only clears an export, never whatever else might hold the lock. The two
+   * tasks cannot overlap today — each refuses to start while the other holds it — but a lock
+   * that any caller can clear is one edit away from being no lock at all.
+   */
+  function setExportBusy(running: boolean): void {
+    setFfmpeg((cur) => {
+      if (running) return { kind: 'export', pct: null, startedAt: Date.now() }
+      return cur?.kind === 'export' ? null : cur
+    })
+  }
+
   if (!settings) return <div className="p-6 text-sm text-gray-500 dark:text-gray-400">Loading…</div>
 
   const isRunning = state.status === 'running'
@@ -123,6 +181,13 @@ export default function TranslatePage(): React.JSX.Element {
    */
   function whyCannotStart(): string {
     if (!tgtLang) return 'Choose a target language first.'
+    // One ffmpeg call at a time from this page. Two at once on a large container is exactly
+    // the machine-load complaint REP-11 arrived with, and the second would appear to hang.
+    if (ffmpeg) {
+      return ffmpeg.kind === 'export'
+        ? 'A track is still being extracted — wait for it to finish.'
+        : 'Already preparing the selected track.'
+    }
     if (srtFile) return ''
     if (!videoFile) {
       return 'Provide a subtitle file (.srt or .ass), or a video with a selectable text track.'
@@ -164,9 +229,25 @@ export default function TranslatePage(): React.JSX.Element {
     const chosenSource = srtFile || videoFile
 
     let inputFile = srtFile
-    // If translating from a video's embedded track, extract it silently first.
+    // If translating from a video's embedded track, extract it first. This used to be silent
+    // — the button still read "Start Translation" while ffmpeg walked a 50 GB container for
+    // minutes (REP-11). The task state below is what puts a bar and a clock on screen, and
+    // what stops a second ffmpeg call being started on top of this one.
     if (!inputFile && videoFile && selectedTrack !== null) {
-      const res = await window.api.extractToTemp({ filePath: videoFile, subtitleIndex: selectedTrack })
+      setFfmpeg({ kind: 'prepare', pct: null, startedAt: Date.now() })
+      let res: { ok: boolean; path?: string }
+      try {
+        res = await window.api.extractToTemp({ filePath: videoFile, subtitleIndex: selectedTrack })
+      } catch (e) {
+        // A rejected invoke used to leave the press with no visible effect at all — the same
+        // shape of dead end REP-10 records, arrived at from the other direction.
+        setStartError(`Could not extract the selected subtitle track: ${String(e)}`)
+        return
+      } finally {
+        // In a finally because a failure must not leave the page permanently unable to start
+        // anything: this lock is what every other action on the page checks.
+        setFfmpeg(null)
+      }
       if (!res.ok || !res.path) {
         setStartError('Could not extract the selected subtitle track. Is FFmpeg installed?')
         return
@@ -207,6 +288,7 @@ export default function TranslatePage(): React.JSX.Element {
       thoughtsLog: cfg.thoughtsLog
     }
     setRunSource(chosenSource)
+    setRunStartedAt(Date.now())
     await start(() => window.api.startTranslate(args))
   }
 
@@ -267,7 +349,15 @@ export default function TranslatePage(): React.JSX.Element {
               onPick={pickVideo}
               onClear={clearVideo}
             />
-            {probing && <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">Scanning subtitle tracks…</p>}
+            {/*
+              The clock is the point. ffprobe on a 50 GB file over a network share can take
+              a while, and a static line gives no way to tell "working" from "wedged".
+            */}
+            {probing && (
+              <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">
+                Scanning subtitle tracks… <Elapsed since={probeStartedAt} />
+              </p>
+            )}
             <div className="mt-2">
               {/*
                 REP-9: the key is what clears the panel's extraction result when a different
@@ -283,8 +373,9 @@ export default function TranslatePage(): React.JSX.Element {
                 targetLang={tgtLang}
                 selectedIndex={selectedTrack}
                 onSelect={setSelectedTrack}
-                busy={extracting}
-                onBusy={setExtracting}
+                busy={ffmpeg !== null}
+                busyPct={ffmpeg?.kind === 'export' ? ffmpeg.pct : null}
+                onBusy={setExportBusy}
               />
             </div>
           </div>
@@ -339,13 +430,17 @@ export default function TranslatePage(): React.JSX.Element {
         <div className="flex items-center gap-2">
           {!isRunning ? (
             /*
-              Disabled only while a job is running — and even that is belt-and-braces, since
-              this branch is not rendered then. Everything else that would prevent a run is
-              now reported by `handleStart` in words rather than by a button that does
-              nothing. See `whyCannotStart`.
+              Disabled only while a job is running or its track is being extracted — and the
+              first of those is belt-and-braces, since this branch is not rendered then.
+              Everything else that would prevent a run is now reported by `handleStart` in
+              words rather than by a button that does nothing. See `whyCannotStart`.
+
+              The label changes during preparation because the reported complaint was
+              precisely that it did not: a button still offering to start something is the
+              strongest possible claim that nothing has started.
             */
-            <Button onClick={handleStart} disabled={isRunning}>
-              Start Translation
+            <Button onClick={handleStart} disabled={isRunning || ffmpeg !== null}>
+              {ffmpeg?.kind === 'prepare' ? 'Extracting track…' : 'Start Translation'}
             </Button>
           ) : (
             <Button variant="danger" onClick={stop}>
@@ -365,9 +460,32 @@ export default function TranslatePage(): React.JSX.Element {
           {!tgtLang && <span className="text-xs text-gray-400 dark:text-gray-500">Choose a target language to begin.</span>}
         </div>
 
+        {ffmpeg?.kind === 'prepare' && (
+          <div className="mt-4">
+            <Working
+              label="Extracting the selected subtitle track"
+              pct={ffmpeg.pct}
+              since={ffmpeg.startedAt}
+              note="FFmpeg reads the whole container to find the track, so this takes as long as the film is big. The translation starts on its own when it finishes."
+            />
+          </div>
+        )}
+
         {(isRunning || state.status === 'done' || state.status === 'error' || state.status === 'stopped') && (
           <div className="mt-4 space-y-3">
-            <ProgressBar pct={state.progress} />
+            {/*
+              Nothing measurable has happened yet, so the bar says "alive" instead of "0%".
+              The engine's own preparation — extracting the audio for gender context, sizing
+              the first batch — reports nothing at all while it runs, and a 0% bar under a
+              window that has been open for two minutes reads as a hang.
+            */}
+            <ProgressBar pct={state.progress} indeterminate={isRunning && state.progress === 0} />
+            {isRunning && state.progress === 0 && (
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                Working for <Elapsed since={runStartedAt} /> — the engine reports no progress
+                while it prepares, which on a large file takes a few minutes.
+              </p>
+            )}
 
             {isRunning && retryIsCurrent(state.retry, state.currentLine) && state.retry && (
               <RetryNotice retry={state.retry} />

@@ -16,16 +16,26 @@ type ExtractResult = { ok: true; path: string } | { ok: false; error: string }
 function ExtractButton({
   track,
   extracting,
+  pct,
   blocked,
   onExtract
 }: {
   track: SubtitleTrack
   extracting: boolean
+  /** How far this row's extraction has got, or null before the first report / unknown length. */
+  pct: number | null
   blocked: boolean
   onExtract: () => void
 }): React.JSX.Element {
   if (extracting) {
-    return <span className="whitespace-nowrap text-xs text-gray-500 dark:text-gray-400">Extracting…</span>
+    // A percentage where there was previously only a word. ffmpeg walks the whole container
+    // to find one track's packets, so on a large film "Extracting…" alone sat there long
+    // enough to be read as a hang (REP-11).
+    return (
+      <span className="whitespace-nowrap text-xs text-gray-500 dark:text-gray-400">
+        Extracting…{pct !== null && ` ${pct}%`}
+      </span>
+    )
   }
   return (
     <button
@@ -107,6 +117,7 @@ export function SubTrackPanel({
   selectedIndex,
   onSelect,
   busy,
+  busyPct,
   onBusy
 }: {
   videoFile: string
@@ -116,6 +127,12 @@ export function SubTrackPanel({
   onSelect: (index: number) => void
   /** An extraction is running somewhere — possibly one this panel did not start. */
   busy: boolean
+  /**
+   * How far that extraction has got, when it is an export and it has reported anything.
+   * Owned by the parent for the same reason `busy` is: the progress channel is subscribed to
+   * once, at a level that survives this panel being replaced mid-extraction.
+   */
+  busyPct: number | null
   onBusy: (running: boolean) => void
 }): React.JSX.Element | null {
   // Which of THIS panel's rows is working, as opposed to whether anything is: the lock is the
@@ -178,6 +195,7 @@ export function SubTrackPanel({
     <ExtractButton
       track={track}
       extracting={busyIndex === track.index}
+      pct={busyIndex === track.index ? busyPct : null}
       blocked={busy}
       onExtract={() => void doExtract(track)}
     />

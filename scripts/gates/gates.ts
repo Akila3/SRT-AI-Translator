@@ -42,6 +42,12 @@ import {
 } from '../../electron/main/ipc'
 import { scanTranslatedOutput } from '../../electron/shared/outputSanity'
 import {
+  durationFromProbe,
+  parseTimestamp,
+  percentOf,
+  readProgressChunk
+} from '../../electron/shared/ffmpegProgress'
+import {
   buildTranscribeArgs,
   buildTranslateArgs,
   ensureUtf8Subtitle,
@@ -1390,6 +1396,85 @@ section('G6 — an extracted track is named after itself, not after the target (
   eq('G6 the save path builds the same shape', companionName('C:\\Subs\\Pachinko.S01E01.eng.srt', 'he', '.srt'), 'Pachinko.S01E01.eng_he.srt')
   eq('G6 an ASS job keeps its format', companionName('/x/Show.ass', 'he', '.ass'), 'Show_he.ass')
   eq('G6 and a run with no source path still proposes something', companionName('', 'he', '.srt'), 'subtitle_he.srt')
+}
+
+section('G7 — ffmpeg progress is read, never invented (REP-11)')
+{
+  // The format is ffmpeg's `-progress` output: blocks of key=value ending in progress=continue,
+  // or progress=end on the last one. A read has to survive several blocks arriving in one chunk,
+  // because the process writes faster than the main process reads.
+  const block = (t: string, state = 'continue'): string =>
+    `frame=120\nfps=25\nbitrate=N/A\ntotal_size=4096\nout_time_us=${Math.round(
+      parseFloat(t) * 1_000_000
+    )}\nout_time_ms=${Math.round(parseFloat(t) * 1_000_000)}\nspeed=12x\nprogress=${state}\n`
+
+  eq('G7 a single block reports its position', readProgressChunk(block('12.5')).outTimeSec, 12.5)
+  eq('G7 and is not finished', readProgressChunk(block('12.5')).ended, false)
+  // The LAST block in a chunk is the current one; the earlier ones are already stale.
+  eq(
+    'G7 several blocks at once report the newest',
+    readProgressChunk(block('10') + block('20') + block('30')).outTimeSec,
+    30
+  )
+  eq('G7 progress=end is recognised', readProgressChunk(block('60', 'end')).ended, true)
+  eq('G7 a chunk with no timestamp reports none', readProgressChunk('frame=1\nfps=0\n').outTimeSec, null)
+  eq('G7 an empty chunk is harmless', readProgressChunk('').outTimeSec, null)
+
+  // out_time is the unambiguous spelling and wins when both are present. out_time_ms is
+  // deliberately never read: it has carried MICROseconds for years, a bug kept for
+  // compatibility, so trusting it would report a 90-minute film as finishing in 5 seconds.
+  eq(
+    'G7 the timestamp spelling is preferred',
+    readProgressChunk('out_time_us=1000000\nout_time=00:01:00.000000\nprogress=continue').outTimeSec,
+    60
+  )
+  eq(
+    'G7 the millisecond spelling is ignored',
+    readProgressChunk('out_time_ms=90000000\nprogress=continue').outTimeSec,
+    null
+  )
+
+  // A pipe read can end anywhere, including mid-number. `execFfmpeg` carries the remainder
+  // to the next chunk for exactly this reason: half of `out_time_us=10000000` parses as a
+  // valid 1 second, which is not a missing report but a wrong one — and wrong in the only
+  // direction a progress bar must never move. The reader below sees whole lines only.
+  const twoBlocks = block('10') + block('30')
+  const cut = twoBlocks.lastIndexOf('out_time_us=') + 16 // four digits into the second value
+  eq(
+    'G7 a chunk cut mid-number would report a time that never happened',
+    readProgressChunk(twoBlocks.slice(0, cut)).outTimeSec,
+    0.003
+  )
+  eq(
+    'G7 …so trimming to the last line break reports the previous position instead',
+    readProgressChunk(twoBlocks.slice(0, twoBlocks.lastIndexOf('\n', cut) + 1)).outTimeSec,
+    10
+  )
+
+  eq('G7 timestamps carry hours', parseTimestamp('01:02:03.500000'), 3723.5)
+  eq('G7 and fractions', parseTimestamp('00:00:00.250000'), 0.25)
+  // N/A appears before ffmpeg has decoded anything. Reading it as zero would show a 0% bar
+  // for a file that has not started, which is the very state this feature exists to disprove.
+  eq('G7 N/A is not a time', parseTimestamp('N/A'), null)
+  eq('G7 nor is nothing', parseTimestamp(''), null)
+  eq('G7 nor is a bare number', parseTimestamp('12'), null)
+
+  // Duration comes from ffprobe and is allowed to be missing: streams and some remuxes
+  // genuinely will not say. That costs a percentage, never an error.
+  eq('G7 a duration is read', durationFromProbe('5405.280000\n'), 5405.28)
+  eq('G7 an unknown duration is null', durationFromProbe('N/A\n'), null)
+  eq('G7 as is an empty answer', durationFromProbe(''), null)
+  eq('G7 and a zero one', durationFromProbe('0.000000'), null)
+
+  eq('G7 the percentage is whole', percentOf(2702.64, 5405.28), 50)
+  eq('G7 it starts at zero', percentOf(0, 5405.28), 0)
+  // Capped below 100 while the process is alive: ffmpeg routinely reports a position at or
+  // past the nominal duration near the end, and a bar reading 100% for another minute is
+  // exactly the "it is stuck" complaint in a different costume.
+  eq('G7 it never reaches 100 while running', percentOf(5405.28, 5405.28), 99)
+  eq('G7 nor beyond it', percentOf(9999, 5405.28), 99)
+  eq('G7 no duration means no percentage', percentOf(120, null), null)
+  eq('G7 a nonsense duration means the same', percentOf(120, 0), null)
 }
 
 // ── result ─────────────────────────────────────────────────────────────────────
