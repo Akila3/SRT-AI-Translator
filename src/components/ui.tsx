@@ -394,7 +394,7 @@ export function LogPanel({ lines }: { lines: string[] }): React.JSX.Element {
         <div className="text-gray-500">Waiting to start…</div>
       ) : (
         lines.map((l, i) => (
-          <div key={i} className="whitespace-pre-wrap">
+          <div key={i} className="log-row whitespace-pre-wrap">
             {l}
           </div>
         ))

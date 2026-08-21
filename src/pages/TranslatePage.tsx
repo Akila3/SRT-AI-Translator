@@ -39,6 +39,15 @@ export default function TranslatePage(): React.JSX.Element {
   const [description, setDescription] = useState('')
   const [tmdbResetKey, setTmdbResetKey] = useState(0)
   const [savedPath, setSavedPath] = useState('')
+  /**
+   * What the user chose to translate, frozen when the run started.
+   *
+   * The pickers stay live after a run finishes — Save and the file inputs are on screen together —
+   * so reading them at save time would let a token report name a file that was never translated.
+   * That is worse than the dead temp path REP-1 set out to fix: a stale path is obviously stale,
+   * while a confident wrong one is not.
+   */
+  const [runSource, setRunSource] = useState('')
   const [startError, setStartError] = useState('')
   const [showLog, setShowLog] = useState(false)
 
@@ -98,6 +107,10 @@ export default function TranslatePage(): React.JSX.Element {
     const cfg = settings
     if (!cfg) return
 
+    // Read before the first await, not after: extracting a track from a large video runs for
+    // minutes, and nothing stops the user editing the pickers while it does.
+    const chosenSource = srtFile || videoFile
+
     let inputFile = srtFile
     // If translating from a video's embedded track, extract it silently first.
     if (!inputFile && videoFile && selectedTrack !== null) {
@@ -139,12 +152,15 @@ export default function TranslatePage(): React.JSX.Element {
       progressLog: cfg.progressLog,
       thoughtsLog: cfg.thoughtsLog
     }
+    setRunSource(chosenSource)
     await start(() => window.api.startTranslate(args))
   }
 
   async function handleSave(): Promise<void> {
     if (!state.outputPath) return
-    const base = (srtFile || videoFile || 'subtitle').replace(/\.[^.]+$/, '')
+    // Same snapshot, same reason: the proposed filename must describe the run being saved, not
+    // whatever happens to be in the pickers now.
+    const base = (runSource || 'subtitle').replace(/\.[^.]+$/, '')
     // Keep the format the engine actually produced. It writes according to the output
     // path's extension, so proposing ".srt" for an ASS job would mislabel the file.
     const ext = /\.ass$/i.test(state.outputPath) ? '.ass' : '.srt'
@@ -153,7 +169,12 @@ export default function TranslatePage(): React.JSX.Element {
       srcPath: state.outputPath,
       defaultName: name,
       defaultDir: settings?.outputFolder || undefined,
-      logPaths: state.logPaths.length ? state.logPaths : undefined
+      logPaths: state.logPaths.length ? state.logPaths : undefined,
+      // What the user picked for THIS run, not what the engine was handed and not whatever the
+      // pickers hold now: for a video the engine received an extracted temp track, and for a
+      // re-encoded subtitle a temp `.utf8.srt`. Neither exists by the time they open the token
+      // report sitting next to the file they saved.
+      inputPath: runSource || undefined
     })
     if (saved) setSavedPath(saved)
   }
@@ -295,6 +316,24 @@ export default function TranslatePage(): React.JSX.Element {
 
             {state.status === 'done' && (
               <p className="text-sm font-medium text-green-700 dark:text-green-400">✅ Translation complete.</p>
+            )}
+
+            {/*
+              REP-16. The engine validates a batch by counting items, not by reading them, so a run
+              that filled 136 cues with two characters still reported success. This says so before
+              the user picks a destination — it never blocks the save, and the file is untouched.
+            */}
+            {state.status === 'done' && state.warnings.length > 0 && (
+              <div className="rounded-md border border-amber-400 bg-amber-50 px-3.5 py-3 dark:border-amber-700/60 dark:bg-amber-900/25">
+                <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
+                  ⚠ Part of this translation does not look right.
+                </p>
+                {state.warnings.map((w, i) => (
+                  <p key={i} className="mt-1 text-sm text-amber-800 dark:text-amber-300">
+                    {w}
+                  </p>
+                ))}
+              </div>
             )}
             {state.status === 'error' && (
               <p className="text-sm font-medium text-red-600 dark:text-red-400">

@@ -175,6 +175,12 @@ export interface ProcDone {
   code: number | null
   outputPath: string
   logPaths?: string[]
+  /**
+   * Advisory messages about the output the engine just wrote — see `outputSanity.ts`. Optional, and
+   * everything that ignores it keeps working: the renderer shows these beside Save so the user reads
+   * them *before* choosing where to put the file. Nothing here ever blocks a save or alters a file.
+   */
+  warnings?: string[]
 }
 
 export interface TmdbResult {

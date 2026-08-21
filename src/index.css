@@ -50,3 +50,19 @@ input[type='number'].no-spin::-webkit-inner-spin-button {
   -webkit-appearance: none;
   margin: 0;
 }
+
+/*
+ * Log rows: skip layout and paint for lines scrolled out of view.
+ *
+ * The panel is about ten lines tall but can hold thousands, and every arriving line
+ * re-renders it and then reads scrollHeight to auto-scroll, which forces a full layout.
+ * content-visibility lets the browser skip that work for off-screen rows, so the cost
+ * tracks what is visible rather than what is retained. Rows wrap to variable heights, so
+ * index-based windowing would need measurement; this needs none, and scroll-back through
+ * the whole log keeps working. contain-intrinsic-size remembers each row's last measured
+ * height, which keeps the scrollbar from jumping as rows are skipped.
+ */
+.log-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 16px;
+}

@@ -60,8 +60,14 @@ const api = {
   openFile: (filters?: Electron.FileFilter[]): Promise<string> =>
     ipcRenderer.invoke('dialog:openFile', { filters }),
   openFolder: (): Promise<string> => ipcRenderer.invoke('dialog:openFolder'),
-  saveFile: (args: { srcPath?: string; defaultName: string; defaultDir?: string; logPaths?: string[] }): Promise<string> =>
-    ipcRenderer.invoke('dialog:saveFile', args),
+  saveFile: (args: {
+    srcPath?: string
+    defaultName: string
+    defaultDir?: string
+    logPaths?: string[]
+    /** The file the user chose to translate, so the token report can name it instead of a temp path. */
+    inputPath?: string
+  }): Promise<string> => ipcRenderer.invoke('dialog:saveFile', args),
 
   // shell
   showItemInFolder: (p: string): Promise<void> => ipcRenderer.invoke('shell:showItem', p),

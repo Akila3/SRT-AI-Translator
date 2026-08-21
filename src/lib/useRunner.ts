@@ -20,8 +20,21 @@ export interface RunnerState {
   statusText: string
   outputPath: string
   logPaths: string[]
+  /** Advisory notes about the finished file, shown beside Save. Never blocks anything. */
+  warnings: string[]
   exitCode: number | null
 }
+
+/**
+ * Upper bound on retained log lines.
+ *
+ * Appending copies the whole array, and every retained line is also a live DOM node, so both
+ * costs grow with the run. A pathological run is not theoretical: an invalid key puts the
+ * engine in a retry loop that emits ~25 lines a second with no ceiling. Well above any real
+ * run — the largest observed was ~1,100 lines — so ordinary jobs keep their full log and only
+ * runaway ones are trimmed, oldest first, since it is the tail that carries the failure.
+ */
+const LOG_CAP = 5000
 
 const INITIAL: RunnerState = {
   status: 'idle',
@@ -34,6 +47,7 @@ const INITIAL: RunnerState = {
   statusText: '',
   outputPath: '',
   logPaths: [],
+  warnings: [],
   exitCode: null
 }
 
@@ -55,6 +69,72 @@ function deriveStatus(s: string): string | null {
   return null
 }
 
+/**
+ * Fold one engine line into the run state.
+ *
+ * Extracted so a batch of lines can be applied in one state update: the parsing is
+ * per-line and order-dependent, but committing per line is what costs a render each.
+ */
+function applyLine(s: RunnerState, clean: string): RunnerState {
+  let { progress, tokenStats, tokens, currentLine, totalLines, statusText } = s
+
+  // Total line count — announced once at the start.
+  const totalDecl = clean.match(/translation of (\d+) lines/i)
+  if (totalDecl) totalLines = parseInt(totalDecl[1], 10)
+
+  // Progress "(cur/total)" — usually inside the spinner line.
+  const frac = clean.match(/(\d+)\s*\/\s*(\d+)/)
+  if (frac && /translat|batch|processing|%/i.test(clean)) {
+    const cur = parseInt(frac[1], 10)
+    const tot = parseInt(frac[2], 10)
+    if (tot > 0) {
+      currentLine = cur
+      totalLines = tot
+      progress = Math.min(100, Math.round((cur / tot) * 100))
+    }
+  }
+
+  const pct = clean.match(/(\d{1,3})\s?%/)
+  if (pct) progress = Math.min(100, parseInt(pct[1], 10))
+
+  // Token breakdown line.
+  const tk = clean.match(
+    /Prompt Tokens:\s*(\d+)\s*\|\s*Thoughts Tokens:\s*(\d+)\s*\|\s*Output Tokens:\s*(\d+)\s*\|\s*Total Tokens:\s*(\d+)/i
+  )
+  if (tk) {
+    tokens = {
+      prompt: parseInt(tk[1], 10),
+      thoughts: parseInt(tk[2], 10),
+      output: parseInt(tk[3], 10),
+      total: parseInt(tk[4], 10)
+    }
+    tokenStats = clean
+  }
+
+  const st = deriveStatus(clean)
+  if (st) statusText = st
+
+  // Keep a clean log for error inspection: drop spinner/progress noise,
+  // token lines (surfaced separately), and consecutive duplicates.
+  let log = s.log
+  const skip = isSpinnerLine(clean) || tk !== null
+  if (!skip && clean !== s.log[s.log.length - 1]) {
+    log = s.log.length >= LOG_CAP ? [...s.log.slice(s.log.length - LOG_CAP + 1), clean] : [...s.log, clean]
+  }
+
+  return { ...s, log, progress, tokenStats, tokens, currentLine, totalLines, statusText }
+}
+
+/**
+ * How long arriving lines are gathered before one state update is committed.
+ *
+ * Each commit re-renders the whole log panel, so the cost is per COMMIT, not per line;
+ * without this, a line rate sets the render rate. Short enough to be imperceptible — a
+ * lone line, such as each of the engine's extraction steps, still lands within a frame or
+ * two — and long enough that a sustained ~25 line/s retry storm cannot drive rendering.
+ */
+const FLUSH_MS = 100
+
 export function useRunner(): {
   state: RunnerState
   start: (launch: () => Promise<string>) => Promise<void>
@@ -63,12 +143,20 @@ export function useRunner(): {
 } {
   const [state, setState] = useState<RunnerState>(INITIAL)
   const cleanup = useRef<Array<() => void>>([])
+  const pending = useRef<string[]>([])
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const flushPending = useRef<(() => void) | null>(null)
 
   useEffect(() => {
     return () => cleanup.current.forEach((fn) => fn())
   }, [])
 
   const reset = useCallback(() => {
+    pending.current = []
+    if (timer.current !== null) {
+      clearTimeout(timer.current)
+      timer.current = null
+    }
     setState(INITIAL)
   }, [])
 
@@ -77,63 +165,31 @@ export function useRunner(): {
     cleanup.current = []
     setState({ ...INITIAL, status: 'running' })
 
+    const flush = (): void => {
+      if (timer.current !== null) {
+        clearTimeout(timer.current)
+        timer.current = null
+      }
+      if (pending.current.length === 0) return
+      const batch = pending.current
+      pending.current = []
+      setState((s) => batch.reduce(applyLine, s))
+    }
+    flushPending.current = flush
+
     const offOut = window.api.onOutput(({ line }) => {
       if (!line) return
       const clean = line.replace(ANSI, '').trim()
       if (!clean) return
 
-      setState((s) => {
-        let { progress, tokenStats, tokens, currentLine, totalLines, statusText } = s
-
-        // Total line count — announced once at the start.
-        const totalDecl = clean.match(/translation of (\d+) lines/i)
-        if (totalDecl) totalLines = parseInt(totalDecl[1], 10)
-
-        // Progress "(cur/total)" — usually inside the spinner line.
-        const frac = clean.match(/(\d+)\s*\/\s*(\d+)/)
-        if (frac && /translat|batch|processing|%/i.test(clean)) {
-          const cur = parseInt(frac[1], 10)
-          const tot = parseInt(frac[2], 10)
-          if (tot > 0) {
-            currentLine = cur
-            totalLines = tot
-            progress = Math.min(100, Math.round((cur / tot) * 100))
-          }
-        }
-
-        const pct = clean.match(/(\d{1,3})\s?%/)
-        if (pct) progress = Math.min(100, parseInt(pct[1], 10))
-
-        // Token breakdown line.
-        const tk = clean.match(
-          /Prompt Tokens:\s*(\d+)\s*\|\s*Thoughts Tokens:\s*(\d+)\s*\|\s*Output Tokens:\s*(\d+)\s*\|\s*Total Tokens:\s*(\d+)/i
-        )
-        if (tk) {
-          tokens = {
-            prompt: parseInt(tk[1], 10),
-            thoughts: parseInt(tk[2], 10),
-            output: parseInt(tk[3], 10),
-            total: parseInt(tk[4], 10)
-          }
-          tokenStats = clean
-        }
-
-        const st = deriveStatus(clean)
-        if (st) statusText = st
-
-        // Keep a clean log for error inspection: drop spinner/progress noise,
-        // token lines (surfaced separately), and consecutive duplicates.
-        let log = s.log
-        const skip = isSpinnerLine(clean) || tk !== null
-        if (!skip && clean !== s.log[s.log.length - 1]) {
-          log = [...s.log, clean]
-        }
-
-        return { ...s, log, progress, tokenStats, tokens, currentLine, totalLines, statusText }
-      })
+      pending.current.push(clean)
+      if (timer.current === null) timer.current = setTimeout(flush, FLUSH_MS)
     })
 
-    const offDone = window.api.onDone(({ code, outputPath, logPaths }) => {
+    const offDone = window.api.onDone(({ code, outputPath, logPaths, warnings }) => {
+      // The last lines of a run are usually the interesting ones, so they must be committed
+      // before the terminal state rather than left to a timer that unmounting could cancel.
+      flush()
       setState((s) => ({
         ...s,
         status: code === 0 ? 'done' : 'error',
@@ -141,11 +197,21 @@ export function useRunner(): {
         statusText: code === 0 ? 'Completed' : 'Failed',
         outputPath,
         logPaths: logPaths ?? [],
+        warnings: warnings ?? [],
         exitCode: code
       }))
     })
 
-    cleanup.current = [offOut, offDone]
+    cleanup.current = [
+      offOut,
+      offDone,
+      () => {
+        if (timer.current !== null) clearTimeout(timer.current)
+        timer.current = null
+        pending.current = []
+        flushPending.current = null
+      }
+    ]
 
     try {
       await launch()
@@ -156,6 +222,7 @@ export function useRunner(): {
 
   const stop = useCallback(async () => {
     await window.api.stop()
+    flushPending.current?.()
     setState((s) => ({ ...s, status: s.status === 'running' ? 'error' : s.status }))
   }, [])
 

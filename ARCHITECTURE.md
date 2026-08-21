@@ -133,9 +133,19 @@ keeps a bad network from quietly resetting someone's model.
    `startTranslate`.
 4. `startTranslate` normalises the input encoding, builds the argv, and spawns `gst`.
 5. Output is line-buffered and pushed to the renderer as it arrives; on close a single
-   `translate:done` carries the exit code, the output path and any log sidecars.
+   `translate:done` carries the exit code, the output path, any log sidecars, and any sanity
+   warnings about the finished file.
 6. `useRunner` parses the stream for progress and token counts; the page then copies the temp output
    and its sidecars to the user's chosen path, named from the extension the engine actually produced.
+
+On a successful run the main process reads the finished subtitle back and compares it against its
+source (`electron/shared/outputSanity.ts`). The engine validates a batch by *counting* items rather
+than reading them, so a model that returns filler for part of a batch still reports success — a
+measured run emitted a two-character string for 136 consecutive cues and was written out as
+complete. Three relative signals must agree in pairs before anything is said: a run of identical
+translations, a collapse in length relative to the run's own median, and disagreement in line
+structure. The result is **advisory only**. Nothing is repaired, no save is blocked, and the file on
+disk stays byte-identical to what the engine wrote.
 
 Note that step 3 can fail **synchronously** — a busy job slot, a refused non-UTF-8 `.ass`, a spawn
 that throws — so anything the completion callback closes over must already be initialised when
@@ -240,7 +250,7 @@ Import graph, main process — no cycles:
 
 ```
 index.ts     -> ipc.ts, pythonBridge
-ipc.ts       -> store, ffmpeg, tmdb, modelsList, pythonBridge, shared/types
+ipc.ts       -> store, ffmpeg, tmdb, modelsList, pythonBridge, shared/{types,outputSanity}
 modelsList   -> pythonBridge, ffmpeg, store, shared/types
 pythonBridge -> ffmpeg, store, shared/{languages,types,keyOrder,modelCaps}
 store.ts     -> shared/types, migrations

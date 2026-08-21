@@ -929,21 +929,21 @@ This setting has NO effect on a normal run — it applies only when a translatio
         desc="Save a per-run token usage JSON file"
         checked={settings.writeTokenReport}
         onChange={(v) => set('writeTokenReport', v)}
-        tip="Write a JSON file next to each output recording detailed token usage for that run. Useful for auditing costs across many files. Off by default."
+        tip="Write a JSON file recording detailed token usage for that run. It is placed next to your subtitle when you save it, not while the run is going, and it names the files you chose. Useful for auditing costs across many files. Off by default."
       />
       <ToggleRow
         label="Progress Log"
         desc="Write detailed progress logging"
         checked={settings.progressLog}
         onChange={(v) => set('progressLog', v)}
-        tip="Enable verbose progress logging from the translator. Helpful for debugging stalled translations. Off by default."
+        tip="Enable verbose progress logging from the translator. The file is placed next to your subtitle when you save it, not while the run is going. Helpful for debugging stalled translations. Off by default."
       />
       <ToggleRow
         label="Thoughts Log"
         desc="Log the model's internal reasoning (large files)"
         checked={settings.thoughtsLog}
         onChange={(v) => set('thoughtsLog', v)}
-        tip="Log the model's internal 'thinking' output. Warning: this can create very large log files. Only enable when diagnosing translation quality issues. Off by default."
+        tip="Log the model's internal 'thinking' output, placed next to your subtitle when you save it. Some models do little or no thinking at lower levels, so this file can come back empty — that is the model's behaviour, not a fault. Warning: it can also create very large log files. Only enable when diagnosing translation quality issues. Off by default."
       />
     </div>
   )

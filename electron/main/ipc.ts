@@ -23,6 +23,7 @@ import {
   keySlotsFor
 } from './pythonBridge'
 import { activeKeySlots } from '../shared/keyOrder'
+import { scanTranslatedOutput } from '../shared/outputSanity'
 import type {
   TranslateArgs,
   TranscribeArgs,
@@ -39,6 +40,53 @@ export function setMainWindow(w: BrowserWindow): void {
 
 function send(channel: string, payload: unknown): void {
   win?.webContents.send(channel, payload)
+}
+
+/**
+ * Read a finished subtitle and compare it against its source (REP-16).
+ *
+ * Guarded to the point of paranoia on purpose: this runs on the path that delivers the terminal
+ * event, so anything it threw would strand a finished job with no `done` at all — a worse failure
+ * than the corruption it looks for. A missing, empty, unreadable or unparseable file simply
+ * produces no warnings. It is the only *read* this path performs, and the files were written
+ * moments earlier, so they are small and warm.
+ */
+export function scanOutputFiles(sourcePath: string, outputPath: string): string[] {
+  try {
+    if (!sourcePath || !outputPath) return []
+    if (!fs.existsSync(sourcePath) || !fs.existsSync(outputPath)) return []
+    if (!fs.statSync(sourcePath).isFile() || !fs.statSync(outputPath).isFile()) return []
+    const source = fs.readFileSync(sourcePath, 'utf-8')
+    const output = fs.readFileSync(outputPath, 'utf-8')
+    return scanTranslatedOutput(source, output).map((w) => w.message)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Point a token report at the files the user can actually see (REP-1).
+ *
+ * The engine records the paths it was handed, which are ours: a temp `.srt` for the output and,
+ * when the input needed re-encoding, a temp `.utf8.srt` for the input. Both are gone by the time
+ * the user opens the report sitting next to their saved subtitle.
+ *
+ * Pure, and total. A report we cannot parse is returned untouched, which reproduces exactly what
+ * the old copy did — the file is the engine's evidence, and mangling it would be worse than leaving
+ * a stale path in it. `inputPath` is optional for the same reason: when the caller does not know
+ * the user's source, the original value stays rather than being replaced by a guess.
+ */
+export function retargetTokenReport(json: string, inputPath: string, outputPath: string): string {
+  try {
+    const report = JSON.parse(json) as Record<string, unknown>
+    if (report === null || typeof report !== 'object' || Array.isArray(report)) return json
+    if (outputPath) report.output_file = outputPath
+    if (inputPath) report.input_file = inputPath
+    // Two-space indent matches what the engine writes, so a user diffing the two sees only paths.
+    return JSON.stringify(report, null, 2)
+  } catch {
+    return json
+  }
 }
 
 export interface SingleKeyRefreshScope {
@@ -327,7 +375,14 @@ export function registerIpc(): void {
     'dialog:saveFile',
     async (
       _e,
-      args: { srcPath?: string; defaultName: string; defaultDir?: string; logPaths?: string[] }
+      args: {
+        srcPath?: string
+        defaultName: string
+        defaultDir?: string
+        logPaths?: string[]
+        /** The file the user chose to translate, so the token report can name it (REP-1). */
+        inputPath?: string
+      }
     ) => {
       if (!win) return ''
       const defaultPath = args.defaultDir
@@ -356,8 +411,17 @@ export function registerIpc(): void {
         for (const logPath of args.logPaths) {
           if (fs.existsSync(logPath)) {
             const suffix = KNOWN_SUFFIXES.find((s) => logPath.endsWith(s)) ?? path.extname(logPath)
+            const dest = `${destBase}${suffix}`
             try {
-              fs.copyFileSync(logPath, `${destBase}${suffix}`)
+              // The token report records the temp paths the engine was handed, so the user opens a
+              // file next to their subtitle and reads two paths that no longer exist (REP-1). Only
+              // this one sidecar is rewritten; everything else is still copied byte for byte.
+              if (suffix === '.tokens.json') {
+                const report = fs.readFileSync(logPath, 'utf-8')
+                fs.writeFileSync(dest, retargetTokenReport(report, args.inputPath ?? '', res.filePath))
+              } else {
+                fs.copyFileSync(logPath, dest)
+              }
             } catch {
               // Non-fatal: log file copy failure should not block the SRT save.
             }
@@ -479,7 +543,15 @@ export function registerIpc(): void {
     let logPaths: string[] = []
     const started = startTranslate(fullArgs, {
       onOutput: (stream, line) => send('translate:output', { stream, line }),
-      onDone: (code, op) => send('translate:done', { code, outputPath: op, logPaths })
+      onDone: (code, op) =>
+        send('translate:done', {
+          code,
+          outputPath: op,
+          logPaths,
+          // Only a run the engine called successful is worth scanning. A failed run has no complete
+          // output to judge, and warning about a file the user was already told about would be noise.
+          warnings: code === 0 ? scanOutputFiles(fullArgs.inputFile, op) : []
+        })
     })
     logPaths = started.logPaths
     return started.outputPath

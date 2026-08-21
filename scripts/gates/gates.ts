@@ -34,7 +34,13 @@ import {
   resolveDefaultModel,
   summarizeRefresh
 } from '../../electron/main/modelsList'
-import { applyModelSelectionRules, singleKeyRefreshScope } from '../../electron/main/ipc'
+import {
+  applyModelSelectionRules,
+  retargetTokenReport,
+  scanOutputFiles,
+  singleKeyRefreshScope
+} from '../../electron/main/ipc'
+import { scanTranslatedOutput } from '../../electron/shared/outputSanity'
 import {
   buildTranscribeArgs,
   buildTranslateArgs,
@@ -741,6 +747,205 @@ section('G2 — subtitle normalisation (ASS/SRT encoding)')
   const utf16 = write('utf16.srt', Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('1\n', 'utf16le')]))
   const r5 = ensureUtf8Subtitle(utf16)
   check('UTF-16 input is decoded rather than passed through', r5.ok && r5.path !== utf16)
+}
+
+// ── G3: output sanity (REP-16) and the token report (REP-1) ────────────────────
+
+section('G3 — output sanity: two signals must agree before anything is said')
+{
+  const srt = (cues: string[]): string =>
+    cues
+      .map((text, i) => {
+        const s = i * 2
+        const stamp = (sec: number): string =>
+          `00:${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')},000`
+        return `${i + 1}\n${stamp(s)} --> ${stamp(s + 1)}\n${text}\n`
+      })
+      .join('\n')
+
+  // Deterministic, so a fixture cannot drift between runs and quietly stop testing what it tested.
+  const rand = (seed: number) => () => {
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+
+  /** A plausible clean pair: varied lengths, occasional two-line cues, a ~0.9x expansion factor. */
+  function cleanPair(count: number): { source: string[]; output: string[] } {
+    const next = rand(20260821)
+    const source: string[] = []
+    const output: string[] = []
+    for (let i = 0; i < count; i++) {
+      const words = 3 + Math.floor(next() * 9)
+      const twoLine = next() < 0.3
+      const src = Array.from({ length: words }, (_, w) => `word${(i + w) % 97}`).join(' ')
+      const out = Array.from({ length: words }, (_, w) => `tr${(i + w) % 89}`).join(' ')
+      source.push(twoLine ? src.replace(' ', '\n') : src)
+      output.push(twoLine ? out.replace(' ', '\n') : out)
+    }
+    return { source, output }
+  }
+
+  // ---- the measured fault, reproduced at the indices it was measured at ----
+  const FILLER = 'ב-'
+  const bad = cleanPair(736)
+  const corrupted = [...bad.output]
+  for (let i = 463; i < 599; i++) corrupted[i] = FILLER // cues 464..599, 136 of them
+  const warnings = scanTranslatedOutput(srt(bad.source), srt(corrupted))
+
+  check('G3 the filler run produces exactly one warning', warnings.length === 1, `got ${warnings.length}`)
+  if (warnings.length === 1) {
+    const w = warnings[0]
+    check(`G3 the range starts at or before the first bad cue`, w.from <= 464, `from ${w.from}`)
+    eq('G3 the range ends at the last bad cue', w.to, 599)
+    check('G3 all three signals fired', w.signals.length === 3, w.signals.join('+'))
+    check('G3 the message says the file was not altered', /exactly\s+as the engine wrote it/i.test(w.message))
+  }
+  eq('G3 the same file without the filler is silent', scanTranslatedOutput(srt(bad.source), srt(bad.output)).length, 0)
+
+  // ---- each signal alone must NOT warn: this is what makes "two of three" real ----
+  const only = (source: string[], output: string[]): number =>
+    scanTranslatedOutput(srt(source), srt(output)).length
+
+  // S1 alone: every translation identical, but the right length and the right shape.
+  const s1Source = Array.from({ length: 200 }, (_, i) => `source line number ${i} here`)
+  const s1Output = Array.from({ length: 200 }, () => 'identical translation text!')
+  eq('G3 S1 alone (repeated text, normal length) says nothing', only(s1Source, s1Output), 0)
+
+  // S2 alone: everything far too short, but all distinct and all one line like their sources.
+  const s2Source = Array.from({ length: 200 }, (_, i) => `a reasonably long source sentence ${i}`)
+  const s2Output = Array.from({ length: 200 }, (_, i) => `x${i}`)
+  eq('G3 S2 alone (length collapse) says nothing', only(s2Source, s2Output), 0)
+
+  // S3 alone: right length, all distinct, but every cue re-wrapped onto two lines.
+  const s3Source = Array.from({ length: 200 }, (_, i) => `single line source sentence ${i}`)
+  const s3Output = Array.from({ length: 200 }, (_, i) => `two line\ntranslation ${i} here`)
+  eq('G3 S3 alone (re-wrapping) says nothing', only(s3Source, s3Output), 0)
+
+  // ---- each PAIR must warn: if a signal were dead code, two of these would go quiet ----
+  // Each corrupts a stretch rather than the whole file, which is both the measured fault shape and
+  // what leaves S2 a clean baseline to judge against.
+  const damage = (clean: string[], bad: (i: number) => string): string[] =>
+    clean.map((text, i) => (i >= 60 && i < 160 ? bad(i) : text))
+
+  const s1s2Source = Array.from({ length: 200 }, (_, i) => `a reasonably long source sentence ${i}`)
+  const s1s2Clean = Array.from({ length: 200 }, (_, i) => `a plausible translated sentence ${i}`)
+  check('G3 S1+S2 warns (repeated AND collapsed)', only(s1s2Source, damage(s1s2Clean, () => FILLER)) > 0)
+
+  const s1s3Source = Array.from({ length: 200 }, (_, i) => `single line source sentence ${i}`)
+  const s1s3Clean = Array.from({ length: 200 }, (_, i) => `single line translated text ${i}`)
+  check(
+    'G3 S1+S3 warns (repeated AND re-shaped)',
+    only(s1s3Source, damage(s1s3Clean, () => 'identical two\nline translation!!')) > 0
+  )
+
+  const s2s3Source = Array.from({ length: 200 }, (_, i) => `a two line\nsource sentence ${i}`)
+  const s2s3Clean = Array.from({ length: 200 }, (_, i) => `a two line\ntranslated text ${i}`)
+  check('G3 S2+S3 warns (collapsed AND re-shaped)', only(s2s3Source, damage(s2s3Clean, (i) => `y${i}`)) > 0)
+
+  // The hole the pair fixtures exposed: a file that is MOSTLY filler must still be caught, even
+  // though the corrupt cues then dominate the length distribution.
+  const mostly = Array.from({ length: 200 }, (_, i) => (i < 40 ? `a plausible translation ${i}` : FILLER))
+  check('G3 a file that is mostly filler is still caught', only(s1s2Source, mostly) > 0)
+
+  // ---- the false positives that would teach a user to ignore the warning ----
+  const sound = Array.from({ length: 200 }, () => '♪')
+  eq('G3 a file of repeated sound cues is not corruption', only(sound, sound.map(() => '♪')), 0)
+
+  const repeatedSource = Array.from({ length: 200 }, (_, i) => (i % 2 === 0 ? 'Yes.' : `line ${i}`))
+  const repeatedOutput = Array.from({ length: 200 }, (_, i) => (i % 2 === 0 ? 'כן.' : `שורה ${i}`))
+  eq('G3 a legitimately repeated short phrase is not corruption', only(repeatedSource, repeatedOutput), 0)
+
+  const untranslated = Array.from({ length: 200 }, (_, i) => `${i + 1}.`)
+  eq('G3 cues left untranslated on purpose are excluded, not flagged', only(untranslated, untranslated), 0)
+
+  // ---- the floor, and the guards ----
+  const tinySource = Array.from({ length: 25 }, (_, i) => `a reasonably long source sentence ${i}`)
+  eq(
+    'G3 a file under the 30-cue floor is never judged',
+    only(tinySource, tinySource.map(() => FILLER)),
+    0
+  )
+  eq('G3 empty input produces nothing rather than throwing', scanTranslatedOutput('', '').length, 0)
+  eq('G3 unparseable input produces nothing', scanTranslatedOutput('not a subtitle', '{}').length, 0)
+  eq(
+    'G3 an output missing half its cues is skipped, not guessed at',
+    scanTranslatedOutput(srt(bad.source), srt(bad.output.slice(0, 100))).length,
+    0
+  )
+
+  // ---- ASS, because the app translates it too ----
+  const ass = (cues: string[]): string =>
+    '[Script Info]\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n' +
+    cues
+      .map((t) => `Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,${t.replace(/\n/g, '\\N')}`)
+      .join('\n')
+  const assPair = cleanPair(200)
+  eq('G3 a clean ASS pair is silent', scanTranslatedOutput(ass(assPair.source), ass(assPair.output)).length, 0)
+  const assBad = [...assPair.output]
+  for (let i = 60; i < 160; i++) assBad[i] = FILLER
+  check('G3 the same fault is caught in ASS', scanTranslatedOutput(ass(assPair.source), ass(assBad)).length === 1)
+}
+
+section('G3b — the token report names the user\u2019s files (REP-1)')
+{
+  const engineReport = JSON.stringify(
+    {
+      timestamp: '2026-08-19T21:42:36.023737',
+      mode: 'translate',
+      model: 'gemini-3.5-flash-lite',
+      output_file: 'C:\\temp\\1787164913314.srt',
+      duration_seconds: 40.54,
+      tokens: { prompt: 10926, thoughts: 0, output: 16413, total: 27339 },
+      input_file: 'C:\\temp\\1787164913314.utf8.srt',
+      target_language: 'Hebrew'
+    },
+    null,
+    2
+  )
+
+  const rewritten = retargetTokenReport(engineReport, 'D:\\Movies\\Show.eng.srt', 'D:\\Movies\\Show_he.srt')
+  const parsed = JSON.parse(rewritten) as Record<string, unknown>
+  eq('G3b the output path is the file the user saved', parsed.output_file, 'D:\\Movies\\Show_he.srt')
+  eq('G3b the input path is the file the user chose', parsed.input_file, 'D:\\Movies\\Show.eng.srt')
+  eq('G3b the token counts are untouched', parsed.tokens, {
+    prompt: 10926,
+    thoughts: 0,
+    output: 16413,
+    total: 27339
+  })
+  eq('G3b every other field survives', parsed.target_language, 'Hebrew')
+  eq('G3b no temp path is left anywhere in the file', /1787164913314/.test(rewritten), false)
+
+  const noInput = JSON.parse(retargetTokenReport(engineReport, '', 'D:\\out.srt')) as Record<string, unknown>
+  eq(
+    'G3b an unknown source leaves the original value rather than guessing',
+    noInput.input_file,
+    'C:\\temp\\1787164913314.utf8.srt'
+  )
+
+  eq('G3b an unparseable report is returned untouched', retargetTokenReport('{oops', 'a', 'b'), '{oops')
+  eq('G3b a JSON array is not treated as a report', retargetTokenReport('[1,2]', 'a', 'b'), '[1,2]')
+}
+
+section('G3c — the scan can never strand a finished job')
+{
+  // This runs on the path that delivers the terminal event, so every one of these must return an
+  // empty list rather than throw. A run that ends with no `done` event is worse than any warning.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'srt-gate-scan-'))
+  const missing = path.join(dir, 'nope.srt')
+  const empty = path.join(dir, 'empty.srt')
+  const junk = path.join(dir, 'junk.srt')
+  fs.writeFileSync(empty, '')
+  fs.writeFileSync(junk, 'this is not a subtitle at all')
+
+  eq('G3c no paths at all', scanOutputFiles('', ''), [])
+  eq('G3c a missing source', scanOutputFiles(missing, junk), [])
+  eq('G3c a missing output', scanOutputFiles(junk, missing), [])
+  eq('G3c an empty output', scanOutputFiles(junk, empty), [])
+  eq('G3c an unparseable pair', scanOutputFiles(junk, junk), [])
+  eq('G3c a directory where a file was expected', scanOutputFiles(dir, junk), [])
 }
 
 // ── result ─────────────────────────────────────────────────────────────────────
