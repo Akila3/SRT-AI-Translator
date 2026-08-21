@@ -238,6 +238,23 @@ export interface RefreshResult {
 }
 
 /**
+ * How long one key's fetch may run before it is abandoned.
+ *
+ * Sized from measurement rather than taste: the frozen binary needs about six seconds just to
+ * unpack itself and import the engine — that is a `gst.exe --help` round trip, before a single
+ * byte reaches the network — and a first run on a cold disk behind an antivirus scanner is slower
+ * still. Sixty seconds leaves roughly fifty for the ListModels call, which normally answers in
+ * under three.
+ *
+ * The honest worst case: `refreshAllKeys` awaits each key in turn, so this budget multiplies by
+ * the number of configured keys — three keys, three minutes. That requires every key to hang,
+ * which is the failure this phase exists to prevent; the timeout is the backstop for the *next*
+ * unanswerable prompt, not the expected path. It is deliberately generous, because a premature
+ * timeout would report a working key as unreachable, which is worse than waiting.
+ */
+const FETCH_TIMEOUT_MS = 60_000
+
+/**
  * Ask one API key what models it can see.
  *
  * Returns raw ids rather than a curated list on purpose: availability decisions
@@ -251,12 +268,13 @@ export async function refreshModels(apiKey: string): Promise<RefreshResult> {
   }
 
   const bin = resolveGstBin()
-  const { out } = await new Promise<{ out: string; code: number | null }>((resolve) => {
+  // The exit code is deliberately not collected. This fetch decides on the ids it can parse,
+  // because the engine's upgrade handler can exit 0 having done no work at all — a code check
+  // here would read that as a successful fetch of zero models.
+  const { out, timedOut } = await new Promise<{ out: string; timedOut: boolean }>((resolve) => {
     let stdout = ''
     let proc
     try {
-      // 3.6.2 added --skip-upgrade, which replaces the old workaround of writing 'n\n'
-      // to stdin to answer the blocking "upgrade? (y/n)" prompt.
       proc = spawn(bin, ['list-models', '-k', apiKey, '--skip-upgrade'], {
         env: envWithFfmpeg(getSettings().ffmpegPath, {
           PYTHONUTF8: '1',
@@ -265,13 +283,51 @@ export async function refreshModels(apiKey: string): Promise<RefreshResult> {
         })
       })
     } catch {
-      resolve({ out: '', code: -1 })
+      resolve({ out: '', timedOut: false })
       return
     }
-    proc.stdout.on('data', (d) => (stdout += d.toString()))
-    proc.stderr.on('data', (d) => (stdout += d.toString()))
-    proc.on('error', () => resolve({ out: stdout, code: -1 }))
-    proc.on('close', (code) => resolve({ out: stdout, code }))
+    const child = proc
+
+    // `--skip-upgrade` is registered on all four subcommands but only *assigned* for translate and
+    // transcribe, so `list-models` runs the upgrade check regardless and asks "upgrade? (y/n)"
+    // through a blocking read whenever PyPI is ahead of the pinned version — which it is, as of
+    // 3.7.1. Answer it. When no prompt comes, which is the normal case, these bytes are simply
+    // never read. The error handler is not optional: writing to a child that has already exited
+    // emits on the stream, and an unhandled 'error' there would take down the process.
+    child.stdin.on('error', () => {})
+    try {
+      child.stdin.write('n\n')
+      child.stdin.end()
+    } catch {
+      // The answer could not be delivered; the timeout below is what keeps this bounded.
+    }
+
+    const timer = setTimeout(() => {
+      try {
+        // Kill the tree rather than the bootloader alone, for the same reason `stopCurrent()` does.
+        if (process.platform === 'win32' && child.pid) {
+          spawn('taskkill', ['/pid', String(child.pid), '/f', '/t'])
+        } else {
+          child.kill('SIGTERM')
+        }
+      } catch {
+        // A fetch that cannot be killed must still not hang the UI, so resolve either way.
+      }
+      resolve({ out: stdout, timedOut: true })
+    }, FETCH_TIMEOUT_MS)
+
+    child.stdout.on('data', (d) => (stdout += d.toString()))
+    child.stderr.on('data', (d) => (stdout += d.toString()))
+    // Clearing the timer is not tidiness: a surviving timer would later fire `taskkill` at a pid
+    // the OS may have recycled onto an unrelated process.
+    child.on('error', () => {
+      clearTimeout(timer)
+      resolve({ out: stdout, timedOut: false })
+    })
+    child.on('close', () => {
+      clearTimeout(timer)
+      resolve({ out: stdout, timedOut: false })
+    })
   })
 
   const ids = new Set<string>()
@@ -297,8 +353,18 @@ export async function refreshModels(apiKey: string): Promise<RefreshResult> {
     console.log(`[models] ignored ${aliasesSeen} "-latest" alias id(s) returned by the API`)
   }
 
+  // A fetch that ran long but still produced ids is a success — the ids are the evidence, and
+  // abandoning them because the process was slow to exit would discard a correct answer.
   if (ids.size === 0) {
-    return { ids: [], keyValid: false, error: friendlyError(out) }
+    return {
+      ids: [],
+      keyValid: false,
+      error: timedOut
+        ? `The model fetch gave up after ${Math.round(FETCH_TIMEOUT_MS / 1000)} seconds. ` +
+          'The engine may be waiting for input it will never receive, or the network may be unreachable. ' +
+          'This does not mean the key is invalid.'
+        : friendlyError(out)
+    }
   }
 
   return { ids: Array.from(ids), keyValid: true, error: '' }

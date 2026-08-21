@@ -148,12 +148,41 @@ function appEnv(): NodeJS.ProcessEnv {
   })
 }
 
-function run(args: string[], env?: NodeJS.ProcessEnv): Promise<RunResult> {
+/**
+ * @param answerUpgradePrompt Answer the engine's "upgrade? (y/n)" question and close stdin.
+ *
+ * Opt-in, and only `list-models` may opt in. `cmd_list_models` never honours `--skip-upgrade`, so
+ * the engine asks whenever PyPI is ahead of the pin — that unanswered question is what made L1 hang
+ * for the full timeout — while `cmd_translate` and `cmd_transcribe` do honour the flag and are never
+ * asked. Every other probe must keep the stdin **production** gives the engine: `pythonBridge.run()`
+ * writes nothing and leaves the pipe open. That is not a detail. The engine falls back to an
+ * interactive stdin read when `--resume`/`--no-resume` is missing (see `pythonBridge.ts` and gate
+ * C22b), so a translate probe running on a closed stdin would turn that hang into a tidy EOF error
+ * and hide the very regression C22b exists to catch.
+ */
+function run(
+  args: string[],
+  env?: NodeJS.ProcessEnv,
+  { answerUpgradePrompt = false }: { answerUpgradePrompt?: boolean } = {}
+): Promise<RunResult> {
   return new Promise((resolve) => {
     const child = spawn(GST, args, { windowsHide: true, env: env ?? appEnv() })
     let stdout = ''
     let stderr = ''
     let timedOut = false
+
+    if (answerUpgradePrompt) {
+      // Exactly what `refreshModels()` does, including the error handler — writing to a child that
+      // has already exited emits on the stream, and an unhandled 'error' there ends the process.
+      child.stdin.on('error', () => {})
+      try {
+        child.stdin.write('n\n')
+        child.stdin.end()
+      } catch {
+        // The timeout below still bounds the run.
+      }
+    }
+
     const timer = setTimeout(() => {
       timedOut = true
       child.kill()
@@ -488,7 +517,9 @@ async function main(): Promise<void> {
 
   // ── B1 / C19 — the frozen binary reaches Google and the model list is honest ──
   section('L1 — list-models against a real key (B1, C19)')
-  const list = await run(['list-models', '-k', secret, '--skip-upgrade'])
+  const list = await run(['list-models', '-k', secret, '--skip-upgrade'], undefined, {
+    answerUpgradePrompt: true
+  })
   const listOut = mask(list.stdout + list.stderr)
   const ids = Array.from(listOut.matchAll(/\b(gemini-[a-z0-9.\-]+)/gi)).map((m) => m[1])
   const unique = Array.from(new Set(ids))
@@ -634,7 +665,9 @@ async function main(): Promise<void> {
   section('L5 — ffmpeg unreachable (C23)')
   const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'srt-nopath-'))
   const strippedEnv = { ...process.env, PATH: emptyDir, Path: emptyDir }
-  const noFfmpeg = await run(['list-models', '-k', secret, '--skip-upgrade'], strippedEnv)
+  const noFfmpeg = await run(['list-models', '-k', secret, '--skip-upgrade'], strippedEnv, {
+    answerUpgradePrompt: true
+  })
   check(
     'the engine still completes an operation that does not need ffmpeg',
     noFfmpeg.code === 0,
