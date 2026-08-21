@@ -25,6 +25,7 @@ import {
   type KeyPreflight
 } from './pythonBridge'
 import { activeKeySlots } from '../shared/keyOrder'
+import { CONSOLE_LOG_SUFFIX } from '../shared/consoleLog'
 import { scanTranslatedOutput } from '../shared/outputSanity'
 import type {
   TranslateArgs,
@@ -91,6 +92,32 @@ export function retargetTokenReport(json: string, inputPath: string, outputPath:
   } catch {
     return json
   }
+}
+
+/**
+ * Every compound suffix a run can leave beside its subtitle.
+ *
+ * Compound, and matched as a whole, because `path.extname()` sees only the last dot: it turns
+ * `.tokens.json` into `.json` and reduces all three `.log` sidecars to the same `.log`, so the
+ * last one copied would silently overwrite the others. The list is therefore exhaustive by
+ * obligation — anything that starts writing a new sidecar has to appear here in the same change.
+ */
+const KNOWN_SIDECAR_SUFFIXES = ['.tokens.json', '.progress.log', '.thoughts.log', CONSOLE_LOG_SUFFIX]
+
+/**
+ * Where a sidecar lands when its subtitle is saved to `savedPath`.
+ *
+ * Split out of the save handler so it can be proven rather than argued about: the property that
+ * matters is that the whole set maps to distinct names, and that is a statement about this
+ * function, not about a dialog.
+ *
+ * An unrecognised path keeps `path.extname()`'s answer, which is what the handler has always
+ * done. That is a deliberately imperfect fallback — it exists so an unforeseen sidecar is still
+ * delivered rather than dropped — and it is exactly why the list above must stay complete.
+ */
+export function sidecarDestination(logPath: string, savedPath: string): string {
+  const suffix = KNOWN_SIDECAR_SUFFIXES.find((s) => logPath.endsWith(s)) ?? path.extname(logPath)
+  return `${savedPath.replace(/\.[^.]+$/, '')}${suffix}`
 }
 
 export interface SingleKeyRefreshScope {
@@ -458,24 +485,18 @@ export function registerIpc(): void {
       if (args.srcPath && fs.existsSync(args.srcPath)) {
         fs.copyFileSync(args.srcPath, res.filePath)
       }
-      // Copy any log/report files (token report, progress, thoughts) next to the saved SRT.
-      // Each temp log path shares the same base as the temp SRT; we re-derive the dest
-      // path using the same extension so they land alongside the user-chosen file.
+      // Copy any log/report files (token report, progress, thoughts, console) next to the saved
+      // SRT. Each temp log path shares the same base as the temp SRT; the destination is
+      // re-derived from the same compound suffix so they land alongside the user-chosen file.
       if (args.logPaths?.length) {
-        const destBase = res.filePath.replace(/\.[^.]+$/, '')
-        // Preserve the full compound suffix (e.g. ".tokens.json", ".progress.log")
-        // rather than just path.extname() — otherwise ".tokens.json" would become
-        // ".json" and ".progress.log"/".thoughts.log" would collide on ".log".
-        const KNOWN_SUFFIXES = ['.tokens.json', '.progress.log', '.thoughts.log']
         for (const logPath of args.logPaths) {
           if (fs.existsSync(logPath)) {
-            const suffix = KNOWN_SUFFIXES.find((s) => logPath.endsWith(s)) ?? path.extname(logPath)
-            const dest = `${destBase}${suffix}`
+            const dest = sidecarDestination(logPath, res.filePath)
             try {
               // The token report records the temp paths the engine was handed, so the user opens a
               // file next to their subtitle and reads two paths that no longer exist (REP-1). Only
               // this one sidecar is rewritten; everything else is still copied byte for byte.
-              if (suffix === '.tokens.json') {
+              if (dest.endsWith('.tokens.json')) {
                 const report = fs.readFileSync(logPath, 'utf-8')
                 fs.writeFileSync(dest, retargetTokenReport(report, args.inputPath ?? '', res.filePath))
               } else {
@@ -640,11 +661,15 @@ export function registerIpc(): void {
     let logPaths: string[] = []
     const started = startTranslate(fullArgs, {
       onOutput: (stream, line) => send('translate:output', { stream, line }),
-      onDone: (code, op, reason) =>
+      onDone: (code, op, reason, ownLogs) =>
         send('translate:done', {
           code,
           outputPath: op,
-          logPaths,
+          // Two sources, because the two are known at different times and by different things:
+          // the engine's sidecars are named up front from the arguments it was given, while the
+          // console log is reported by the bridge when the run ends, which is the only moment
+          // anyone knows whether it exists.
+          logPaths: [...logPaths, ...(ownLogs ?? [])],
           reason,
           // Only a run the engine called successful is worth scanning. A failed run has no complete
           // output to judge, and warning about a file the user was already told about would be noise.
@@ -692,7 +717,11 @@ export function registerIpc(): void {
       args,
       {
         onOutput: (stream, line) => send('translate:output', { stream, line }),
-        onDone: (code, outputPath, reason) => send('translate:done', { code, outputPath, reason }),
+        // Transcription has no Save step — the output path was chosen before the run — so its
+        // console log is already sitting beside that output and never travels through
+        // `dialog:saveFile`. It is reported here purely so the panel can point at it.
+        onDone: (code, outputPath, reason, logPaths) =>
+          send('translate:done', { code, outputPath, reason, logPaths }),
         // The payload is built by the bridge, which is the only thing that knows whether the
         // conversion is still running; this just forwards it.
         onProgress: (p) => send('ffmpeg:progress', p)

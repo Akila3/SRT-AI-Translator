@@ -113,16 +113,30 @@ function loadKey(): string {
     )
     process.exit(1)
   }
-  const line = fs
+  const lines = fs
     .readFileSync(KEY_FILE, 'utf8')
     .split(/\r?\n/)
     .map((l) => l.trim())
-    .find((l) => l && !l.startsWith('#'))
-  if (!line) {
+    .filter((l) => l && !l.startsWith('#'))
+  if (lines.length === 0) {
     console.error(`\n${KEY_FILE} contains no key line.\n`)
     process.exit(1)
   }
-  return line
+  // A file a human maintains gets labels — this one holds a free key and a paid one, written
+  // as "Free: …" and "Paid: …". Taking the line whole sent the label to Google as part of the
+  // credential and the run died at L1 on "API key not valid", which is an expensive-looking way
+  // to report a parsing problem, and one that reads as a revoked key rather than a bad parse.
+  //
+  // Three attempts, narrowing: a Google-shaped token anywhere in the line; failing that, the
+  // line with a short leading label stripped; failing that, the line verbatim, which is what
+  // every previous run relied on. Nothing here prints the file.
+  for (const line of lines) {
+    const shaped = /AIza[A-Za-z0-9_-]{20,}/.exec(line)?.[0]
+    if (shaped) return shaped
+  }
+  const first = lines[0]
+  const unlabelled = /^[A-Za-z][A-Za-z ]{0,20}[:=]\s*(\S+)/.exec(first)?.[1]
+  return unlabelled ?? first
 }
 
 interface RunResult {
@@ -505,7 +519,13 @@ async function main(): Promise<void> {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'srt-verify-'))
   console.log(`Engine:    ${GST}`)
   console.log(`Workspace: ${work}`)
-  console.log('Key:       loaded (never printed)')
+  // Length and shape only — never the key. Enough to tell a parsing failure apart from a
+  // revoked credential without anyone having to open the file, which is the confusion that cost
+  // this phase two live runs.
+  console.log(
+    `Key:       loaded, never printed (${secret.length} chars, ` +
+      `${/^AIza[A-Za-z0-9_-]{20,}$/.test(secret) ? 'AIza-shaped' : 'not AIza-shaped'})`
+  )
   console.log(
     `ffmpeg:    ${FFMPEG_PATH ?? 'bundled/default (set SRT_VERIFY_FFMPEG_PATH to verify an override)'}`
   )

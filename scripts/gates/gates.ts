@@ -42,8 +42,17 @@ import {
   keySnapshotChanged,
   retargetTokenReport,
   scanOutputFiles,
+  sidecarDestination,
   singleKeyRefreshScope
 } from '../../electron/main/ipc'
+import {
+  CONSOLE_LOG_SUFFIX,
+  CONSOLE_LOG_TRUNCATION_MARK,
+  DEFAULT_CONSOLE_LOG_LIMITS,
+  consoleLogPathFor,
+  createConsoleLog,
+  findConsoleLog
+} from '../../electron/shared/consoleLog'
 import { scanTranslatedOutput } from '../../electron/shared/outputSanity'
 import {
   durationFromProbe,
@@ -1865,6 +1874,170 @@ section('G8e — a result may not be applied to keys it was not learned from (FP
   // what a check learns, is not persisted by it, and is not ranked on.
   check('G8e an empty configuration compares equal to itself', !keySnapshotChanged([], []))
   check('G8e and a whitespace difference is a real difference', keySnapshotChanged([' k'], ['k']))
+}
+
+section('G9a — the console log keeps both ends of a run it has to cut (REP-1/REP-3)')
+{
+  // Tiny limits so the cut is reached in a few lines. The policy is a function of the limits,
+  // not of the defaults, which is the whole reason they are a parameter.
+  const chunks: string[] = []
+  const log = createConsoleLog((c) => chunks.push(c), { headBytes: 40, tailBytes: 40 })
+  for (let i = 1; i <= 60; i++) log.write(`line ${i}`)
+  log.close()
+  const file = chunks.join('')
+
+  // The head streams as it happens, so it is on disk even if nothing ever closes the file.
+  check('G9a the run starts at the start', file.startsWith('line 1\nline 2\n'))
+  check('G9a the cut is announced', file.includes(CONSOLE_LOG_TRUNCATION_MARK))
+  // The point of the whole exercise: a run long enough to be cut is a run that went wrong, and
+  // what went wrong is at the end.
+  check('G9a the ending survives the cut', file.trimEnd().endsWith('line 60'))
+  check('G9a and the middle is honestly reported missing', /\d+ line\(s\) from the middle/.test(file))
+  // A ceiling that can be exceeded by ten thousand lines is not a ceiling. Head + tail + one
+  // marker is the entire budget, whatever the run does.
+  check(
+    'G9a the file cannot grow with the run',
+    file.length < 400,
+    `${file.length} bytes for 60 lines`
+  )
+  // Nothing is invented and nothing is reordered — this file is the console, verbatim.
+  check('G9a no line is rewritten', file.includes('line 1\n') && file.includes('line 60\n'))
+  check('G9a and none is duplicated across the cut', file.split('line 60\n').length === 2)
+
+  // A run that never reaches the ceiling gets no marker and no ceremony.
+  const small: string[] = []
+  const quiet = createConsoleLog((c) => small.push(c), { headBytes: 4096, tailBytes: 4096 })
+  quiet.write('only line')
+  quiet.close()
+  check('G9a a short run is written whole', small.join('') === 'only line\n')
+
+  // `close()` runs from `finish()`, which several racing paths can reach for the same job.
+  const twice: string[] = []
+  const closed = createConsoleLog((c) => twice.push(c), { headBytes: 8, tailBytes: 64 })
+  closed.write('aaaaaaaaaaaaaaaa')
+  closed.write('bbbb')
+  closed.close()
+  const after = twice.join('')
+  closed.close()
+  closed.write('cccc')
+  check('G9a closing twice is closing once', twice.join('') === after)
+  check('G9a and a line after the end is refused', !twice.join('').includes('cccc'))
+}
+
+section('G9d — one line cannot step over the ceiling the other lines respect')
+{
+  // The hole this closes: both the head and the tail decide whether to take a line BEFORE seeing
+  // how big it is, so a single line arriving with budget left was written whole at any size —
+  // and `run()` turns an entire newline-free chunk into exactly one line.
+  const flood: string[] = []
+  const log = createConsoleLog((c) => flood.push(c), { headBytes: 200, tailBytes: 200, lineBytes: 64 })
+  log.write('a'.repeat(100_000))
+  log.close()
+  const file = flood.join('')
+
+  check('G9d the long line is cut, not written', file.length < 300, `${file.length} bytes`)
+  check('G9d it is cut to its own budget', file.split('\n')[0].startsWith('a'.repeat(64)))
+  check('G9d not one byte further', !file.includes('a'.repeat(65)))
+  check('G9d and the cut is admitted, with its size', /\[log truncated\] 99936 more character\(s\)/.test(file))
+
+  // The ceiling is only a ceiling if it holds for a run made ENTIRELY of such lines.
+  const many: string[] = []
+  const flooded = createConsoleLog((c) => many.push(c), { headBytes: 200, tailBytes: 200, lineBytes: 64 })
+  for (let i = 0; i < 500; i++) flooded.write('b'.repeat(50_000))
+  flooded.close()
+  check(
+    'G9d five hundred of them still fit under it',
+    many.join('').length < 1200,
+    `${many.join('').length} bytes for 500 x 50 KB`
+  )
+
+  // Cutting at an arbitrary byte would put half a character — a replacement character — into a
+  // file whose whole value is being a faithful record. 'é' is two bytes, so a 9-byte budget has
+  // to stop at four of them and refuse the fifth rather than emit its first byte alone.
+  const utf8: string[] = []
+  const chars = createConsoleLog((c) => utf8.push(c), { headBytes: 4096, tailBytes: 4096, lineBytes: 9 })
+  chars.write('é'.repeat(20))
+  chars.close()
+  const cut = utf8.join('').split(' [log truncated]')[0]
+  check('G9d a multi-byte character is never split', !cut.includes('\uFFFD'), JSON.stringify(cut))
+  check('G9d the cut lands on a character boundary', cut === 'é'.repeat(4), JSON.stringify(cut))
+
+  // Surrogate pairs are the same hazard one level up: two code units, four bytes, and slicing
+  // the string rather than the bytes would leave a lone surrogate behind.
+  const astral: string[] = []
+  const emoji = createConsoleLog((c) => astral.push(c), { headBytes: 4096, tailBytes: 4096, lineBytes: 10 })
+  emoji.write('😀'.repeat(20))
+  emoji.close()
+  const emojiCut = astral.join('').split(' [log truncated]')[0]
+  check('G9d a surrogate pair survives the cut whole', emojiCut === '😀'.repeat(2), JSON.stringify(emojiCut))
+
+  // And the lines that actually occur are still the bytes the engine sent, unexamined.
+  const plain: string[] = []
+  const ordinary = createConsoleLog((c) => plain.push(c))
+  ordinary.write('Translating batch 3 of 40…')
+  ordinary.close()
+  check('G9d an ordinary line is untouched', plain.join('') === 'Translating batch 3 of 40…\n')
+
+  // A default-limits log has a stated ceiling; it is worth one assertion that it is a real number
+  // and that the per-line limit is the small one of the three.
+  check(
+    'G9d the per-line budget is the smallest of them',
+    DEFAULT_CONSOLE_LOG_LIMITS.lineBytes < DEFAULT_CONSOLE_LOG_LIMITS.tailBytes &&
+      DEFAULT_CONSOLE_LOG_LIMITS.tailBytes < DEFAULT_CONSOLE_LOG_LIMITS.headBytes
+  )
+}
+
+section('G9b — no sidecar overwrites another, and the console log is one of them')
+{
+  const saved = String.raw`C:\Users\me\Movies\Pachinko.he.srt`
+  const temp = String.raw`C:\Temp\srt-out-123`
+  const sidecars = [
+    `${temp}.tokens.json`,
+    `${temp}.progress.log`,
+    `${temp}.thoughts.log`,
+    `${temp}${CONSOLE_LOG_SUFFIX}`
+  ]
+  const dests = sidecars.map((p) => sidecarDestination(p, saved))
+
+  check('G9b every sidecar lands on its own name', new Set(dests).size === dests.length, dests.join(' '))
+  check('G9b none of them lands on the subtitle', !dests.includes(saved))
+  // The specific bug this phase was warned about: `path.extname()` sees only the last dot, so a
+  // `.console.log` missing from the list becomes `.log` — a name the other two logs are one
+  // small mistake away from as well.
+  check(
+    'G9b the console log keeps its compound suffix',
+    dests[3] === String.raw`C:\Users\me\Movies\Pachinko.he.console.log`,
+    dests[3]
+  )
+  check('G9b and the token report keeps both of its dots', dests[0].endsWith('.tokens.json'))
+  // Every sidecar takes the name the user chose, not the temp name the engine was given.
+  check('G9b all of them take the saved name', dests.every((d) => d.startsWith(String.raw`C:\Users\me\Movies\Pachinko.he.`)))
+
+  // POSIX separators, since the same code runs on both.
+  check(
+    'G9b and it works with forward slashes',
+    sidecarDestination('/tmp/out-9.console.log', '/home/me/ep1.he.srt') === '/home/me/ep1.he.console.log'
+  )
+}
+
+section('G9c — a run\u2019s console is named after its output, and found again by name')
+{
+  check('G9c beside the output, sharing its name', consoleLogPathFor('/out/ep1.srt') === '/out/ep1.console.log')
+  check('G9c an .ass output is no different', consoleLogPathFor('/out/ep1.ass') === '/out/ep1.console.log')
+  check('G9c an extensionless output still gets one', consoleLogPathFor('/out/ep1') === '/out/ep1.console.log')
+  // Windows paths have dots in directory names far more often than anyone expects.
+  check(
+    'G9c a dotted directory is not mistaken for an extension',
+    consoleLogPathFor(String.raw`C:\My.Films\ep1.srt`) === String.raw`C:\My.Films\ep1.console.log`
+  )
+
+  // The panel picks it out of a list whose other members depend on settings, so position is
+  // not something it may rely on.
+  check('G9c found among the engine\u2019s own reports', findConsoleLog(['/a/x.progress.log', '/a/x.console.log']) === '/a/x.console.log')
+  check('G9c found when it is the only one', findConsoleLog(['/a/x.console.log']) === '/a/x.console.log')
+  check('G9c and absent means absent', findConsoleLog(['/a/x.progress.log', '/a/x.tokens.json']) === '')
+  check('G9c an empty list is not an error', findConsoleLog([]) === '')
+  check('G9c nor is no list at all', findConsoleLog(undefined) === '')
 }
 
 // ── result ─────────────────────────────────────────────────────────────────────

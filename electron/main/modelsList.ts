@@ -359,9 +359,14 @@ export async function refreshModels(apiKey: string, signal?: AbortSignal): Promi
     /** Kill the tree rather than the bootloader alone, for the reason `killJob()` documents. */
     const kill = (): void => {
       try {
-        if (process.platform === 'win32' && child.pid) {
-          spawn('taskkill', ['/pid', String(child.pid), '/f', '/t'])
-        } else {
+      if (process.platform === 'win32' && child.pid) {
+        // The same listener this file already attaches to stdin above, and for the same reason:
+        // an unhandled 'error' on a child nobody kept is an uncaught exception, and a `taskkill`
+        // that cannot start would end the application over a model fetch. Nothing else about this
+        // child is worth keeping — unlike a translation, this promise resolves on its own timer
+        // whether the kill worked or not, so there is no slot to protect here (FP8-R02).
+        spawn('taskkill', ['/pid', String(child.pid), '/f', '/t']).on('error', () => {})
+      } else {
           child.kill('SIGTERM')
         }
       } catch {

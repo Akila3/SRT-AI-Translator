@@ -7,6 +7,7 @@ import { convertAudioToMp3, envWithFfmpeg } from './ffmpeg'
 import { getSettings } from './store'
 import { orderKeySlots, type KeySlot } from '../shared/keyOrder'
 import { maskCommandLine } from '../shared/maskedCommand'
+import { createConsoleLog, consoleLogPathFor } from '../shared/consoleLog'
 import { createStallWatch } from '../shared/stallBudget'
 import { effectiveThinkingLevel, modelCapabilities } from '../shared/modelCaps'
 import {
@@ -45,9 +46,69 @@ interface Job {
   endReason: TerminalReason | null
   /** Temp files this job created and owns. Deleted when it ends, whatever the outcome. */
   scratch: string[]
+  /**
+   * This run's console, on disk. Deliberately NOT in `scratch`: scratch is deleted when the job
+   * ends and the entire purpose of this file is to outlive the run. Null if it could not be
+   * opened, which is never allowed to stop the run.
+   */
+  console: JobConsoleLog | null
   finished: boolean
   handlers: SpawnHandlers
   outputPath: string
+}
+
+interface JobConsoleLog {
+  path: string
+  write(line: string): void
+  close(): void
+}
+
+/**
+ * Bind the capped writer to a real file beside the job's output.
+ *
+ * Written synchronously, one line at a time. An async stream would be cheaper per line and
+ * would also mean the last thing a run said is sitting in a buffer at the moment the run ends —
+ * which is the moment a crash, a Stop or a `taskkill` on a frozen engine is most likely to
+ * arrive. The volume is bounded by the ceiling, so the cost of being sure is small.
+ */
+function openJobConsoleLog(outputPath: string): JobConsoleLog | null {
+  if (!outputPath) return null
+  const logPath = consoleLogPathFor(outputPath)
+  let fd: number
+  try {
+    fd = fs.openSync(logPath, 'w')
+  } catch {
+    // A log we cannot write is not a reason to refuse a translation.
+    return null
+  }
+  let broken = false
+  const log = createConsoleLog((chunk) => {
+    if (broken) return
+    try {
+      fs.writeSync(fd, chunk)
+    } catch {
+      // A full disk or a revoked handle: stop trying rather than throw once per line into a
+      // path that is only observing.
+      broken = true
+    }
+  })
+  let closed = false
+  return {
+    path: logPath,
+    write: (line) => {
+      if (!closed) log.write(line)
+    },
+    close: () => {
+      if (closed) return
+      closed = true
+      log.close()
+      try {
+        fs.closeSync(fd)
+      } catch {
+        /* best effort: the descriptor is going away with the job either way */
+      }
+    }
+  }
 }
 
 let job: Job | null = null
@@ -55,13 +116,27 @@ let job: Job | null = null
 /** Reserve the single job slot, or return null if one is already held. */
 function beginJob(handlers: SpawnHandlers, outputPath: string): Job | null {
   if (job) return null
+  const consoleLog = openJobConsoleLog(outputPath)
   job = {
     proc: null,
     prep: null,
     endReason: null,
     scratch: [],
+    console: consoleLog,
     finished: false,
-    handlers,
+    // Teed here rather than at each call site so the file gets what the panel gets, from every
+    // path that reports anything: the masked command line, the preparation notices, the
+    // engine's own two streams, the stall budget's verdict. A site that forgot to tee would be
+    // a line the user can see but cannot send.
+    handlers: consoleLog
+      ? {
+          ...handlers,
+          onOutput: (stream, line) => {
+            consoleLog.write(line)
+            handlers.onOutput(stream, line)
+          }
+        }
+      : handlers,
     outputPath
   }
   return job
@@ -84,7 +159,21 @@ function finish(j: Job, code: number | null): void {
     }
   }
   j.scratch = []
-  j.handlers.onDone(code, j.outputPath, j.endReason ?? undefined)
+  // How the run ended is the one fact the console never carries: the panel shows it as a
+  // status, and a status is chrome a file does not have. Written here rather than through
+  // `onOutput` so it does not become a second, redundant row on screen.
+  j.console?.write(
+    `[run ended: exit code ${code ?? 'none'}${j.endReason ? `, ended by the app: ${j.endReason}` : ''}]`
+  )
+  // Closed BEFORE the terminal event, so whatever the renderer does next — offer a Save that
+  // copies this file, or open its folder — is looking at a complete one.
+  j.console?.close()
+  j.handlers.onDone(
+    code,
+    j.outputPath,
+    j.endReason ?? undefined,
+    j.console ? [j.console.path] : undefined
+  )
 }
 
 /** Refuse a start request without leaving the caller's page spinning forever. */
@@ -114,14 +203,115 @@ function killJob(j: Job): void {
   }
   try {
     if (process.platform === 'win32' && proc.pid) {
-      spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t'])
+      treeKill(j, proc.pid)
     } else {
       proc.kill('SIGTERM')
     }
   } catch {
-    // The kill itself failed, so no `close` is coming to release the slot.
-    finish(j, -1)
+    // This used to end the job outright, reasoning that a failed kill means no `close` is
+    // coming. True, and the wrong conclusion: if the kill failed the engine is still RUNNING,
+    // and releasing the slot then is not a recovery, it is a second engine.
+    //
+    // Note how little this branch actually catches: `spawn()` reports almost every real failure
+    // asynchronously, so this is the rare synchronous-argument case and NOT where a blocked or
+    // missing `taskkill` arrives. That is `treeKill()`'s business.
+    failedTermination(j, 'the termination could not be attempted')
   }
+}
+
+/**
+ * Kill the engine's whole process tree on Windows — and find out whether that worked.
+ *
+ * The child used to be spawned and dropped on the floor, which is wrong twice over. A `taskkill`
+ * that cannot START reports it through an **`error` event**, and an `error` on a child with no
+ * listener is an uncaught exception: it does not merely go unnoticed, it takes the Electron main
+ * process down. A `taskkill` that runs and **fails** — "Access is denied" is the ordinary case —
+ * reports it by exiting non-zero, which nothing was reading. Both left the engine alive with the
+ * UI stuck on Stopping… forever, because the only event that ends this run is a `close` from a
+ * process that was never killed.
+ *
+ * Only failure is acted on. A successful tree kill exits 0 and the engine's own `close` ends the
+ * run, which is the single path every other ending already goes through.
+ */
+function treeKill(j: Job, pid: number): void {
+  const killer = spawn('taskkill', ['/pid', String(pid), '/f', '/t'])
+  // `taskkill` says why in one line, and that line is the difference between "run it as
+  // administrator" and "the anti-virus is holding it". Bounded: this is a diagnostic, not a feed.
+  let why = ''
+  killer.stderr?.on('data', (d: Buffer) => {
+    if (why.length < 400) why += String(d)
+  })
+  killer.on('error', (e) => failedTermination(j, `taskkill could not run: ${e.message}`))
+  killer.on('close', (code) => {
+    if (code === 0) return
+    // Both lines, joined: `taskkill` names the process on the first and gives the REASON on the
+    // second, and the reason is the half the user can act on.
+    const said = why
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .join(' ')
+    failedTermination(j, `taskkill exited ${code}${said ? ` — ${said}` : ''}`)
+  })
+}
+
+/**
+ * A termination attempt failed. End the job only if the engine turns out to be gone anyway.
+ *
+ * The `finished` guard matters more than it looks: these handlers fire asynchronously, so this
+ * one can arrive after the engine's own `close` has already ended the run — and by then the slot
+ * may belong to a DIFFERENT job, whose panel would receive a stop failure that has nothing to do
+ * with it. Reporting is left to `engineOutlivedItsKill()` for the same reason in miniature: a Stop
+ * pressed just as the engine exits on its own makes `taskkill` report "process not found", and
+ * announcing a failed termination for a process that is already gone is a false alarm.
+ */
+function failedTermination(j: Job, detail: string): void {
+  if (j.finished) return
+  if (engineOutlivedItsKill(j, detail)) return
+  finish(j, -1)
+}
+
+/**
+ * Is that process still out there?
+ *
+ * Signal 0 runs the existence and permission checks without delivering anything, which is the only
+ * way to tell apart the two things a failed termination can mean. EPERM counts as ALIVE: a process
+ * we are not allowed to signal is the worst version of this, not an absent one.
+ */
+function childIsAlive(pid: number | undefined): boolean {
+  if (pid === undefined) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * A termination attempt failed — did the engine survive it?
+ *
+ * If it did, the job must NOT end. This is the harder half of the invariant to see: an ending
+ * releases the single slot, so declaring a run over while its engine is alive lets a SECOND engine
+ * start against the same API, and the survivor keeps pushing lines through the shared output
+ * channel into the new run's panel. A slot held by a process that genuinely still exists is
+ * accurate; a slot released for one that does is a lie the rest of the app then acts on.
+ *
+ * So the run stays open and waits for the `close` that arrives whenever the engine does exit. If
+ * it never exits, that is said plainly rather than hidden behind a spinner — and pressing Stop
+ * again re-enters `killJob()`, so the sentence is advice the user can act on twice.
+ */
+function engineOutlivedItsKill(j: Job, detail = ''): boolean {
+  const pid = j.proc?.pid
+  if (!childIsAlive(pid)) return false
+  j.handlers.onOutput(
+    'stderr',
+    `${j.endReason ? 'The engine did not stop' : 'The engine is still running'} (pid ${pid})` +
+      `${detail ? ` — ${detail}` : ''}. ` +
+      'This run stays open until it exits, because starting another one now would put two engines ' +
+      'on the same API key. Press Stop again to retry, or end that process yourself.'
+  )
+  return true
 }
 
 /** Resolve the bundled `gst` executable, or fall back to PATH in dev. */
@@ -367,7 +557,20 @@ export interface KeyPreflight {
 
 export interface SpawnHandlers {
   onOutput: (stream: 'stdout' | 'stderr', line: string) => void
-  onDone: (code: number | null, outputPath: string, reason?: TerminalReason) => void
+  /**
+   * `logPaths` names the sidecars THIS FILE owns — today, the console log — and is optional for
+   * the same reason `onProgress` is: it is additional information, not a new meaning for the
+   * existing arguments, so every caller that declares fewer parameters stays valid. It is the
+   * bridge that reports it because the bridge is the only thing that knows whether the file was
+   * opened at all; a caller deriving the name for itself would happily name a previous run's
+   * log after a start that was refused.
+   */
+  onDone: (
+    code: number | null,
+    outputPath: string,
+    reason?: TerminalReason,
+    logPaths?: string[]
+  ) => void
   /**
    * How far the job's ffmpeg preparation has got. Optional: it is a second channel, not a
    * second meaning for the first, so every existing caller — including the verification
@@ -644,12 +847,35 @@ function run(j: Job, args: string[]): void {
       observe(l)
     }
   })
-  proc.on('error', (err) => {
-    handlers.onOutput('stderr', `Process error: ${err.message}`)
-  })
-  proc.on('close', (code) => {
+  /** Whatever the two streams were still holding when the run ended, in order. */
+  const flush = (): void => {
     if (stdoutBuf) handlers.onOutput('stdout', stdoutBuf)
     if (stderrBuf) handlers.onOutput('stderr', stderrBuf)
+    stdoutBuf = ''
+    stderrBuf = ''
+  }
+  proc.on('error', (err) => {
+    handlers.onOutput('stderr', `Process error: ${err.message}`)
+    // This used to report and stop there, on the assumption that `close` would follow and end
+    // the job. Node does not promise that — "the exit event may or may not fire after an error"
+    // — and one of the documented causes is a kill that FAILED, where the child is still alive
+    // and no close is coming by definition. `killJob()` cannot cover it either: it catches a
+    // synchronous throw, and `proc.kill()` reports EPERM through this event instead.
+    //
+    // The cost of getting it wrong is the whole application: the job slot stays held, so every
+    // later run of either kind is refused for the life of the process, with no terminal event to
+    // release the page that asked. Ending here is safe in the ordinary case too, because
+    // `finish()` is idempotent and the close that usually does follow finds the job already done.
+    //
+    // But NOT unconditionally, because the failed-kill case is exactly the one where the child is
+    // still alive: ending then would release the slot to a second engine while the first is still
+    // running and still writing into the shared output channel. The child is asked directly.
+    if (engineOutlivedItsKill(j)) return
+    flush()
+    finish(j, -1)
+  })
+  proc.on('close', (code) => {
+    flush()
     finish(j, code)
   })
 }
@@ -672,6 +898,11 @@ export function startTranslate(a: TranslateArgs, handlers: SpawnHandlers): Start
     refuseStart(handlers, outputPath)
     return { outputPath, logPaths: [] }
   }
+  // Everything from here on speaks through the JOB's handlers, which tee into its console log.
+  // Rebinding the parameter rather than changing each call site is deliberate: the alternative
+  // relies on every future message remembering to use `j.handlers`, and a message that forgets
+  // is a line the user can read on screen and cannot send to anyone.
+  handlers = j.handlers
 
   const norm = ensureUtf8Subtitle(a.inputFile)
   if (!norm.ok) {
@@ -721,6 +952,10 @@ export async function startTranscribe(
     refuseStart(handlers, a.outputFile)
     return a.outputFile
   }
+  // As in `startTranslate`, and for the same reason. This path has more to say before the engine
+  // exists than any other — the key preflight and the audio conversion both report here — so it
+  // is the one that would lose the most.
+  handlers = j.handlers
 
   // REP-2's cheaper half. Translation gets this free — the engine's own `ListModels` call
   // rejects a bad key and exits 1 — while transcription hands the same credential straight to

@@ -16,6 +16,7 @@
     "build:python": "python scripts/build_python.py",
     "check:bin": "node scripts/check-bin.mjs",
     "verify:live": "node scripts/verify/run.mjs",
+    "verify:consolelog": "node scripts/verify/run-consolelog.mjs",
     "build:win": "node scripts/check-bin.mjs --target=win32 && electron-vite build && electron-builder --win",
     "build:dir": "npm run check:bin && electron-vite build && electron-builder --dir"
   },

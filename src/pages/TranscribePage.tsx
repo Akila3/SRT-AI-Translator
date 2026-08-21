@@ -16,6 +16,7 @@ import {
 import { THINKING_LEVELS } from '../data/freeTier'
 import { retryIsCurrent } from '../lib/logView'
 import { useRunner } from '../lib/useRunner'
+import { findConsoleLog } from '../../electron/shared/consoleLog'
 import { modelCapabilities } from '../../electron/shared/modelCaps'
 import type { TranscribeArgs } from '../../electron/shared/types'
 
@@ -72,6 +73,11 @@ export default function TranscribePage(): React.JSX.Element {
 
   const caps = modelCapabilities(settings.model)
   const isRunning = state.status === 'running'
+  /**
+   * Where this run's console was written. Unlike Translate's, this path is already the final
+   * one — there is no temp original and no copy — so it is used exactly as it arrives.
+   */
+  const consoleLog = findConsoleLog(state.logPaths)
 
   // A Select whose value is absent from its options renders BLANK, which reads as "no
   // model selected" even though one is stored. Settings keeps the id visible in that case;
@@ -272,6 +278,23 @@ export default function TranscribePage(): React.JSX.Element {
               <RetryNotice retry={state.retry} />
             )}
             <LogPanel rows={state.log} />
+            {/*
+              Offered on every ending, not just the good one. Transcription writes this file
+              beside an output path the user chose before the run, so unlike Translate there is
+              no Save step to attach it to — and the ending that most needs a complete log is the
+              one that failed, where there is no output to save at all (REP-1, REP-3).
+            */}
+            {!isRunning && consoleLog && (
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                The complete console for this run → {consoleLog}{' '}
+                <button
+                  onClick={() => window.api.showItemInFolder(consoleLog)}
+                  className="text-brand hover:underline"
+                >
+                  Show it
+                </button>
+              </p>
+            )}
             {state.status === 'done' && (
               <p className="text-sm font-medium text-green-700 dark:text-green-400">✅ Transcription saved → {state.outputPath}</p>
             )}

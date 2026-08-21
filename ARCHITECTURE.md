@@ -163,6 +163,20 @@ head plus a rolling tail, marking how many lines the middle lost. Folding only e
 is still on screen elsewhere. It also follows the newest line only while the view is already at the
 bottom, so scrolling up during a run holds position.
 
+Because the panel is capped and folded, it is the wrong thing to export — an export of it would be
+missing the middle of the run with its repetition already flattened away. So every run also writes a
+`.console.log` beside its output as it happens, containing what the run actually said: the command
+line, the app's own notices and both engine streams, uncapped and unfolded. It is opened when the job
+takes its slot and closed on every ending, including a Stop, so a run that failed still has a
+complete record. Its own ceiling keeps both ends — a streamed head and a retained tail either side of
+a marker naming the missing lines — because a run long enough to be truncated is one that went wrong,
+and what went wrong is at the end. A single line is bounded too, and separately: the engine's output
+is split on newlines, so a chunk containing none of them arrives as one line, and a limit that only
+counted lines would not have held. The cut lands on a character boundary rather than an arbitrary
+byte. A translation's copy travels with the subtitle when you save it; a transcription's is already
+beside the output it wrote, and a run that never reached a save — because it failed or was stopped —
+names the original where it lies, since that is the run whose log is worth reading.
+
 On a successful run the main process reads the finished subtitle back and compares it against its
 source (`electron/shared/outputSanity.ts`). The engine validates a batch by *counting* items rather
 than reading them, so a model that returns filler for part of a batch still reports success — a
@@ -266,10 +280,26 @@ Rules to preserve when touching `pythonBridge.ts`:
   ahead of the spawn is caught, and leans towards *continuing*: the injected key preflight treats
   its own failure as "not checked", because a fault in a check must not be able to make
   transcription impossible.
-- A refused start emits a terminal event, never a bare stderr line.
+- A refused start emits a terminal event, never a bare stderr line. So does a child-process
+  `error`, because Node does not promise an `exit` after one — **unless the child is still alive**.
+  A failed termination is the one case where both answers are wrong by default: leaving the run
+  open holds the slot forever, and closing it hands the slot to a second engine while the first is
+  still running against the same key and still writing to the shared output channel. So the child
+  is asked directly (signal `0`, which checks for existence without delivering anything, and where
+  EPERM counts as alive). A process that is gone ends the run; one that is still there keeps it,
+  and says so, because a held slot is then simply the truth. `finish()` is idempotent, so the
+  errors that *do* get a later close cost nothing.
+- **The tree kill is watched, not fired and forgotten.** On Windows the engine is stopped through
+  `taskkill`, and that command can fail in two ways which arrive nowhere near the call: it can fail
+  to start, reported through an asynchronous `error` event that is an uncaught exception — and so
+  the end of the whole application — if nobody is listening, or it can run and refuse ("Access is
+  denied"), reported only by a non-zero exit code. Both are treated as a failed termination, which
+  quotes the command's own explanation back and then asks whether the engine survived. A successful
+  kill is left alone: the engine's own `close` ends the run, as it does for every other ending.
 - Scratch is the converted **audio** only. The normalised subtitle must not be added to it: the
   engine names its progress and thoughts logs from that path, and the page copies those sidecars
-  after the job ends.
+  after the job ends. The console log is not scratch either, for the opposite reason — the whole
+  point of that file is that it outlives the run.
 
 ## IPC surface
 
@@ -282,7 +312,7 @@ through the preload bridge and typed in `electron/preload/index.d.ts`.
 | `getCachedModels` | `models:getCached` | re-curates, preserving stored provenance |
 | `refreshModels` | `models:refresh` | exposed but unused by the renderer |
 | `checkApiKeys` | `models:checkKeys` | the path Settings actually uses |
-| `openFile` / `openFolder` / `saveFile` | `dialog:*` | `saveFile` also copies log sidecars |
+| `openFile` / `openFolder` / `saveFile` | `dialog:*` | `saveFile` also copies log sidecars, matching each by its **full compound suffix** — `path.extname()` sees only the last dot, which would flatten `.progress.log`, `.thoughts.log` and `.console.log` onto one name |
 | `showItemInFolder` / `openExternal` | `shell:*` | |
 | `probeTracks` / `extractTrack` / `extractToTemp` | `video:*` | ffprobe / ffmpeg |
 | `tmdbSearch` / `tmdbCast` | `tmdb:*` | |

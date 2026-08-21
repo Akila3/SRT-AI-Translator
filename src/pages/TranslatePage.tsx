@@ -17,6 +17,7 @@ import {
 import { SubTrackPanel } from '../components/SubTrackPanel'
 import { TmdbSearch } from '../components/TmdbSearch'
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from '../data/languages'
+import { consoleLogPathFor, findConsoleLog } from '../../electron/shared/consoleLog'
 import { retryIsCurrent } from '../lib/logView'
 import { companionName } from '../lib/outputName'
 import { useRunner } from '../lib/useRunner'
@@ -86,6 +87,28 @@ export default function TranslatePage(): React.JSX.Element {
   const [runStartedAt, setRunStartedAt] = useState(0)
   /** When the track scan started, for the same reason: a 50 GB container takes a while. */
   const [probeStartedAt, setProbeStartedAt] = useState(0)
+
+  /**
+   * The console log's name once it has a home, or '' while the run has none.
+   *
+   * Derived from the SAVED path rather than read out of `logPaths`, because the path in there is
+   * the temp original: `dialog:saveFile` copies every sidecar onto the destination the user
+   * picked. `logPaths` is still what decides whether to mention it at all — no entry means the
+   * file was never opened, and naming one that does not exist is worse than saying nothing.
+   */
+  const consoleLogName =
+    savedPath && findConsoleLog(state.logPaths)
+      ? (consoleLogPathFor(savedPath).split(/[\\/]/).pop() ?? '')
+      : ''
+
+  /**
+   * Where the console log is RIGHT NOW, for a run with no saved subtitle to sit beside.
+   *
+   * `logPaths` is only ever populated by the terminal event, so a non-empty value here already
+   * means the run has ended — there is no separate status to check. It empties on `reset()`,
+   * which is correct: New starts a run that has no log yet.
+   */
+  const consoleLogPath = findConsoleLog(state.logPaths)
 
   /**
    * Follow the ffmpeg progress channel for as long as this page exists.
@@ -565,10 +588,45 @@ export default function TranslatePage(): React.JSX.Element {
             )}
 
             {savedPath && (
-              <p className="text-sm text-gray-700 dark:text-gray-300">
-                Saved → {savedPath}{' '}
-                <button onClick={() => window.api.showItemInFolder(savedPath)} className="text-brand hover:underline">
-                  Open folder
+              <>
+                <p className="text-sm text-gray-700 dark:text-gray-300">
+                  Saved → {savedPath}{' '}
+                  <button onClick={() => window.api.showItemInFolder(savedPath)} className="text-brand hover:underline">
+                    Open folder
+                  </button>
+                </p>
+                {/*
+                  Said once, after the save, because that is the moment the file exists where the
+                  user can reach it: until then it is in temp, waiting for a destination. The
+                  panel above is capped and collapses repeats — this file is neither, which is
+                  the whole reason it was asked for (REP-1, REP-3).
+                */}
+                {consoleLogName && (
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    The complete console for this run was saved beside it, as {consoleLogName} —
+                    uncapped and uncollapsed, unlike the panel above.
+                  </p>
+                )}
+              </>
+            )}
+
+            {/*
+              The run that did NOT reach a Save.
+
+              Routing this page's console through `dialog:saveFile` is right for a successful run
+              and wrong for every other one: a stopped or failed translation has no subtitle to
+              save, so gating the log on `savedPath` withheld it from precisely the runs it exists
+              for. The file is already written — `finish()` reports it on every ending — so this
+              points at the original in temp rather than at a copy that will never be made.
+            */}
+            {!savedPath && consoleLogPath && (
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                The complete console for this run → {consoleLogPath}{' '}
+                <button
+                  onClick={() => window.api.showItemInFolder(consoleLogPath)}
+                  className="text-brand hover:underline"
+                >
+                  Show it
                 </button>
               </p>
             )}
