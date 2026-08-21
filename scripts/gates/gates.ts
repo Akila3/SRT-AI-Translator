@@ -66,7 +66,12 @@ import {
   type LogGap,
   type LogRow
 } from '../../src/lib/logView'
-import { effectiveThinkingLevel, modelCapabilities } from '../../electron/shared/modelCaps'
+import {
+  effectiveThinkingLevel,
+  modelCapabilities,
+  samplingDefaults
+} from '../../electron/shared/modelCaps'
+import { valueOnBlur, valueWhileTyping, type NumberFieldRules } from '../../src/lib/numberField'
 import type { ModelInfo, SlotFetchResult, TranslateArgs } from '../../electron/shared/types'
 
 // ── harness ────────────────────────────────────────────────────────────────────
@@ -676,6 +681,66 @@ function flagValue(args: string[], flag: string): string | null {
 }
 
 {
+  // G5a (REP-6): a model that has deprecated these must never receive them, however the
+  // toggle is set. This is the branch that stops a stored configuration from failing every
+  // run the day Google ships a model that returns 400 instead of ignoring them.
+  const wanted = { customGenerationParams: true, temperature: 0.7, topP: 0.8, topK: 40 }
+  const sampled = (a: string[]): string[] =>
+    ['--temperature', '--top-p', '--top-k'].filter((f) => a.includes(f))
+
+  eq(
+    'G5a a model at the boundary gets none of the three',
+    sampled(buildTranslateArgs(baseArgs({ ...wanted, model: 'gemini-3.6-flash' }), 'C:/o.srt')),
+    []
+  )
+  eq(
+    'G5a Flash-Lite at 3.5 is named in the deprecation and gets none',
+    sampled(buildTranslateArgs(baseArgs({ ...wanted, model: 'gemini-3.5-flash-lite' }), 'C:/o.srt')),
+    []
+  )
+  eq(
+    'G5a plain Flash at 3.5 is not, and still gets all three',
+    sampled(buildTranslateArgs(baseArgs({ ...wanted, model: 'gemini-3.5-flash' }), 'C:/o.srt')),
+    ['--temperature', '--top-p', '--top-k']
+  )
+  // The reachable trigger: a profile stored by an older build still names 3.5 Pro, and the
+  // toggle is on. Being at 3.5 and not Lite is NOT the same as being exempt.
+  eq(
+    'G5a 3.5 Pro gets none of them either',
+    sampled(buildTranslateArgs(baseArgs({ ...wanted, model: 'gemini-3.5-pro' }), 'C:/o.srt')),
+    []
+  )
+  eq(
+    'G5a a model we have never heard of is treated as a future one',
+    sampled(buildTranslateArgs(baseArgs({ ...wanted, model: 'gemini-flash-latest' }), 'C:/o.srt')),
+    []
+  )
+  // The same rule, on the other command. generationParamArgs feeds both, and a fix that
+  // covered only translation would leave transcription sending the flags that fail.
+  const txDeprecated = buildTranscribeArgs(
+    {
+      mediaFile: 'C:/a.mp4',
+      outputFile: 'C:/a.srt',
+      targetLang: '',
+      model: 'gemini-3.7-flash',
+      apiKeys: ['KEY-A'],
+      thinkingLevel: 'low',
+      thinkingBudget: 512,
+      customGenerationParams: true,
+      temperature: 0.5,
+      topP: 0.9,
+      topK: 40
+    },
+    'C:/a.srt'
+  )
+  eq('G5a transcribe withholds them for the same models', sampled(txDeprecated), [])
+  check(
+    'G5a withholding sampling flags leaves the rest of argv intact',
+    txDeprecated.includes('--thinking-level') && flagValue(txDeprecated, '-m') === 'gemini-3.7-flash'
+  )
+}
+
+{
   // C22 / C22b: resume flags.
   const atDefault = buildTranslateArgs(baseArgs({ resumeContextSize: 50 }), 'C:/out.srt')
   check('C22 flag omitted at the engine default', !atDefault.includes('--resume-context-size'))
@@ -1175,6 +1240,105 @@ section('G4d — only a user Stop reads as Stopped (MAN-1)')
     status: 'error',
     statusText: 'Failed'
   })
+}
+
+// ── G5: sampling parameters and the fields that hold them (REP-4/5/6) ──────────
+
+section('G5b — where Google’s sampling deprecation begins')
+{
+  const accepts = (id: string): boolean => modelCapabilities(id).acceptsSamplingParams
+
+  // Everything before the boundary is unaffected and must keep working exactly as it did.
+  eq('G5b 2.0', accepts('gemini-2.0-flash'), true)
+  eq('G5b 2.5', accepts('gemini-2.5-flash'), true)
+  eq('G5b 2.5 Pro', accepts('gemini-2.5-pro'), true)
+  eq('G5b 3.1 Flash-Lite', accepts('gemini-3.1-flash-lite'), true)
+  eq('G5b 3.1 Pro', accepts('gemini-3.1-pro'), true)
+
+  // The boundary runs THROUGH 3.5, which is why this cannot be a major-version test.
+  eq('G5b 3.5 Flash is not named', accepts('gemini-3.5-flash'), true)
+  eq('G5b 3.5 Flash with the API prefix is the same model', accepts('models/gemini-3.5-flash'), true)
+  eq('G5b 3.5 Flash-Lite is named', accepts('gemini-3.5-flash-lite'), false)
+  eq('G5b 3.6 Flash is named', accepts('gemini-3.6-flash'), false)
+  eq('G5b 3.7 Flash came after it', accepts('gemini-3.7-flash'), false)
+
+  // At the boundary the exemption is an allowlist, not "anything that is not Lite". Google
+  // names Flash-Lite and omits Flash; it says nothing at all about any other 3.5 model, and
+  // silence is not permission. 3.5 Pro is reachable today — it is in SUSPICIOUS_MODEL_IDS, so
+  // a stored profile can still hold it, and M1 only flags such an id rather than replacing it.
+  eq('G5b 3.5 Pro is not exempt just because it is not Lite', accepts('gemini-3.5-pro'), false)
+  eq('G5b nor is a 3.5 family we have never seen', accepts('gemini-3.5-ultra'), false)
+  eq('G5b nor a new variant of the exempt model', accepts('gemini-3.5-flash-preview-11-2026'), false)
+
+  // Versions are compared as numbers. As text, "3.10" sorts beside "3.1" and a future model
+  // would silently be handed parameters that fail the request.
+  eq('G5b a future 3.10', accepts('gemini-3.10-flash'), false)
+  eq('G5b a future 4.x', accepts('gemini-4.0-flash'), false)
+
+  // Unknown means future, and future means rejected. Guessing this way round costs a control
+  // that does nothing; guessing the other way costs every run.
+  eq('G5b an alias that follows the model line forwards', accepts('gemini-flash-latest'), false)
+  eq('G5b an unversioned id', accepts('gemini-exp-1206'), false)
+  eq('G5b something that is not Gemini at all', accepts('gpt-4o'), false)
+  eq('G5b nothing selected', accepts(''), false)
+
+  // Adding this capability must not have disturbed the ones already there.
+  eq('G5b thinking is unchanged for 2.5', modelCapabilities('gemini-2.5-pro').thinking, 'budget')
+  eq('G5b thinking is unchanged for 3.x', modelCapabilities('gemini-3.6-flash').thinking, 'level')
+  eq('G5b transcription is unchanged', modelCapabilities('gemini-3.6-flash').supportsTranscription, true)
+
+  eq('G5b 3.x defaults', samplingDefaults('gemini-3.1-flash-lite'), { temperature: 1.0, topP: 0.95 })
+  eq('G5b 2.x defaults', samplingDefaults('gemini-2.5-flash'), { temperature: 0.3, topP: 0.8 })
+  eq('G5b a dated 2.5 preview is not a 3.x model', samplingDefaults('gemini-2.5-flash-preview-03-25'), {
+    temperature: 0.3,
+    topP: 0.8
+  })
+}
+
+section('G5c — a number field can be typed into (REP-4)')
+{
+  const temp: NumberFieldRules = { min: 0.05, max: 2, step: 0.05 }
+  const topK: NumberFieldRules = { min: 1, max: 100, allowEmpty: true }
+  const budget: NumberFieldRules = { min: 128, max: 32768 }
+
+  /** Every intermediate the browser reports while a string is typed left to right. */
+  const typing = (text: string, rules: NumberFieldRules): (number | null)[] =>
+    text.split('').map((_, i) => valueWhileTyping(text.slice(0, i + 1), rules))
+
+  // The reported defect, as a sequence. `0` and `0.` are below the minimum and commit
+  // nothing — correcting them is what ate the caret — while `0.8` is a real value on the way
+  // to `0.85` and is committed as it passes, so nothing is lost if the field never blurs.
+  eq('G5c typing 0.85 into a 0.05-minimum field', typing('0.85', temp), [null, null, 0.8, 0.85])
+  eq('G5c typing 512 into a 128-minimum field', typing('512', budget), [null, null, 512])
+  eq('G5c an in-range prefix commits as it goes', typing('40', topK), [4, 40])
+
+  // A number input reports '' for a half-typed value it cannot parse — `0.` being the one
+  // that matters. It must be held, never turned into a value.
+  eq('G5c the unparseable intermediate commits nothing', valueWhileTyping('', temp), null)
+  eq('G5c and neither does a bare minus', valueWhileTyping('-', temp), null)
+  eq('G5c out of range is held, not clamped', valueWhileTyping('9', temp), null)
+  eq('G5c above the maximum is held too', valueWhileTyping('150', topK), null)
+
+  // Correction happens once, on the way out.
+  eq('G5c blur clamps to the maximum', valueOnBlur('9', temp, 1), 2)
+  eq('G5c blur clamps to the minimum', valueOnBlur('0.01', temp, 1), 0.05)
+  eq('G5c blur keeps a good value', valueOnBlur('0.85', temp, 1), 0.85)
+  eq('G5c blur rounds a decimal field to two places', valueOnBlur('0.8549', temp, 1), 0.85)
+  eq('G5c blur rounds an integer field rather than truncating', valueOnBlur('2.6', topK, 1), 3)
+
+  // Clearing a field: allowed for Top-K, and otherwise a no-op rather than a silent edit.
+  // The old field wrote `min` here, so clearing Thinking Budget on 2.5 Pro to retype it and
+  // then clicking away changed the setting to 128 without anyone choosing that.
+  eq('G5c an empty optional field means no value', valueOnBlur('', topK, 40), null)
+  eq('G5c an empty required field keeps what it had', valueOnBlur('', budget, 512), 512)
+  eq('G5c text that is not a number keeps what it had', valueOnBlur('abc', temp, 0.7), 0.7)
+  eq('G5c whitespace is not a value', valueOnBlur('   ', budget, 512), 512)
+
+  // Regression: the three fields that always worked must keep working, including the
+  // integer ones that have no step at all.
+  eq('G5c batch size still commits while typing', typing('100', { min: 1, max: 1000 }), [1, 10, 100])
+  eq('G5c resume context accepts zero', valueWhileTyping('0', { min: 0, max: 1000 }), 0)
+  eq('G5c and blur leaves it alone', valueOnBlur('0', { min: 0, max: 1000 }, 50), 0)
 }
 
 // ── result ─────────────────────────────────────────────────────────────────────

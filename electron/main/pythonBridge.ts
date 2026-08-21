@@ -259,14 +259,35 @@ function thinkingArgs(level: string, budget: number, model: string): string[] {
  * The zero trap: `cli.py` tests these with plain truthiness (lines 153-158), so a literal
  * 0 is silently dropped. The UI clamps above zero; this skips-and-logs as a second line
  * of defence rather than letting a user believe a 0 was applied.
+ *
+ * The model check is NOT a duplicate of the disabled fields in Settings, and must stay even
+ * though the UI already prevents the combination. Settings can only reason about the model
+ * selected right now; a saved configuration outlives the model it was made with, and the
+ * model list is fetched live, so a stored `customGenerationParams: true` will eventually
+ * meet a model that rejects these outright. This is the last point before the process is
+ * spawned, and it is the one that has to hold.
+ *
+ * Withholding the flags genuinely removes the fields from the API request rather than
+ * merely leaving them to the engine's defaults — the engine's are `None` and the Google SDK
+ * omits `None`, which is confirmed in captured traffic (REP-6: a payload whose
+ * `generationConfig` contains temperature and topP but no topK, because no --top-k was
+ * passed).
  */
 function generationParamArgs(a: {
+  model: string
   customGenerationParams: boolean
   temperature: number
   topP: number
   topK: number | null
 }): string[] {
   if (!a.customGenerationParams) return []
+  if (!modelCapabilities(a.model).acceptsSamplingParams) {
+    console.warn(
+      `[gst] withholding --temperature/--top-p/--top-k: ${a.model} ignores them today and ` +
+        'newer models reject the request outright'
+    )
+    return []
+  }
   const args: string[] = []
   const push = (flag: string, value: number): void => {
     if (!value) {

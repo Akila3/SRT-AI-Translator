@@ -221,7 +221,7 @@ Consult this before editing shared code.
 | `src/components/ui.tsx` | 18 primitives used by every page. |
 | `src/lib/useRunner.ts` | Owns **all** stdout parsing. If engine output changes, both pages regress together. |
 | `electron/shared/languages.ts` | 80-entry table driving UI labels, the engine's language argument, and subtitle-track matching. |
-| `electron/shared/modelCaps.ts` | The only place deciding thinking mode, budget range and transcription support. Three consumers; a wrong rule here makes the UI offer something the engine silently overrides. |
+| `electron/shared/modelCaps.ts` | The only place deciding thinking mode, budget range, transcription support and whether the model still honours temperature/top-p/top-k. Four consumers; a wrong rule here makes the UI offer something the engine silently overrides — or, for the sampling rule, something a future model rejects outright. Google deprecated those three parameters from Gemini 3.6 Flash and 3.5 Flash-Lite onwards, and says future releases return HTTP 400 for them, so the rule is a **version comparison** rather than a list of ids: the model list is fetched live, and an id we do not recognise is by definition a later release. Unknown therefore resolves to "does not accept", which costs a control that does nothing instead of costing every run. |
 | `electron/shared/keyOrder.ts` | The single ranking source for the spawn path, the Primary/Fallback/Reserve badges and the tier display. If the UI ever ranks separately, its labels can disagree with what a run actually does. |
 | `electron/main/migrations.ts` | Owns every write to a legacy profile. Pure and Electron-free so fixtures can run it directly. |
 
@@ -237,7 +237,7 @@ Notable helpers, and the promise each makes:
 | `forgetSlotEvidence()` / `reindexEvidenceAfterRemoval()` | Model availability is recorded by key **slot index**, so editing a key repoints its evidence and removing one renumbers the rest. An entry that loses all evidence degrades to unverified — never removed, because lost evidence is not proof of absence. |
 | `ensureUtf8Subtitle()` | Encoding guard. **Never mutates the original**, preserves the extension, and refuses a non-UTF-8 `.ass` rather than transcoding from a guessed code page. |
 | `ensureEngineReadableAudio()` | Same contract for audio: returns the untouched path, or a temp MP3. |
-| `generationParamArgs()` | Emits temperature/top-p/top-k only when the custom-parameters toggle is on, and never emits a zero — the engine's truthiness check would drop it silently, so the UI would be claiming to send something it did not. |
+| `generationParamArgs()` | Emits temperature/top-p/top-k only when the custom-parameters toggle is on **and the model still honours them**, and never emits a zero — the engine's truthiness check would drop it silently, so the UI would be claiming to send something it did not. |
 | `envWithFfmpeg()` | **Appends** the bundled bin directory to PATH, never prepends. See hazard 2. |
 
 ### Three contracts that cross the process boundary

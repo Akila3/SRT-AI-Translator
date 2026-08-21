@@ -22,7 +22,11 @@ import {
   type KeyRole,
   type KeySlot
 } from '../../electron/shared/keyOrder'
-import { effectiveThinkingLevel, modelCapabilities } from '../../electron/shared/modelCaps'
+import {
+  effectiveThinkingLevel,
+  modelCapabilities,
+  samplingDefaults
+} from '../../electron/shared/modelCaps'
 import {
   DEFAULT_RESUME_CONTEXT_SIZE,
   type AppSettings,
@@ -554,13 +558,26 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
     models.unshift({ value: settings.model, label: `${settings.model} (not in fetched list)` })
   }
 
+  const defaults = samplingDefaults(settings.model)
+  // Two independent reasons the fields can be inert, and they are not interchangeable: the
+  // toggle is the user's choice, while the capability is Google's. The second one wins, and
+  // says so in words — a greyed-out field with no explanation reads as a fault.
+  const samplingLive = settings.customGenerationParams && caps.acceptsSamplingParams
+
   function handleModel(v: string): void {
     set('model', v)
-    // Sampling defaults differ by generation. Only meaningful while custom parameters are
-    // on; still applied so switching the toggle on later shows sensible values.
-    const gen3 = /(^|-)3(\.|-)/.test(v)
-    set('temperature', gen3 ? 1.0 : 0.3)
-    set('topP', gen3 ? 0.95 : 0.8)
+    // Sampling defaults differ by generation, and are refreshed ONLY while the toggle is
+    // off. With it off nothing is sent, so these numbers are a preview and keeping them
+    // current for the selected generation is what the original code was for. With it on
+    // they are the user's own choice and go to the API verbatim, and overwriting them was
+    // the whole of REP-5: a value typed deliberately vanished on the next model change.
+    // Top-K was never reset, so leaving all three alone makes them consistent rather than
+    // introducing a rule. "Reset to defaults" below is what keeps the old behaviour
+    // available on purpose.
+    if (settings.customGenerationParams) return
+    const d = samplingDefaults(v)
+    set('temperature', d.temperature)
+    set('topP', d.topP)
   }
 
   return (
@@ -706,13 +723,29 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
             tip={
               'OFF (default, recommended): temperature, top-p and top-k are not sent at all, so each model uses the values Google tuned for it. This is what you want unless you have a specific reason.\n\n' +
               'ON: the three values below are sent with every request. They apply to ALL models, including ones released after these defaults were chosen — a value that suits one generation can degrade another.\n\n' +
+              'Not every model accepts them. Google deprecated all three from Gemini 3.6 Flash and Gemini 3.5 Flash-Lite onwards, and newer models reject a request that carries them, so for those models they are never sent and the fields are greyed out no matter how this is set.\n\n' +
               'Note: a value of exactly 0 cannot be sent (the engine treats it as "not set"), which is why the minimums below are above zero.'
             }
           />
-          <div className={settings.customGenerationParams ? '' : 'pointer-events-none opacity-50'}>
+          {/*
+            Only while the toggle is ON. With it off the fields are greyed because the user
+            has not asked for them, which needs no explanation — and since the app defaults to
+            the newest flash-lite, which IS a deprecated model, an unconditional warning would
+            sit permanently on a default installation about a feature nobody switched on.
+          */}
+          {settings.customGenerationParams && !caps.acceptsSamplingParams && (
+            <p className="text-xs text-amber-600 dark:text-amber-400">
+              This model does not use these settings. Google deprecated temperature, top-p and
+              top-k for Gemini 3.6 Flash, Gemini 3.5 Flash-Lite and every model released since
+              — they are ignored today and newer models reject a request that includes them, so
+              the app does not send them for this model. Steer it with the Description field
+              instead.
+            </p>
+          )}
+          <div className={samplingLive ? '' : 'pointer-events-none opacity-50'}>
             <div className="space-y-5">
               <div>
-                <Label tip="Controls randomness (creativity). Lower = more literal. Higher = more natural-sounding. Range: 0.05 – 2.0. Typical: 1.0 for Gemini 3.x, 0.3 for 2.x. Lower it if translations feel too creative; raise it if too robotic. Exactly 0 cannot be sent — the engine would ignore it and silently use the model default.">
+                <Label tip="Controls randomness (creativity). Lower = more literal. Higher = more natural-sounding. Range: 0.05 – 2.0. Lower it if translations feel too creative; raise it if too robotic. Exactly 0 cannot be sent — the engine would ignore it and silently use the model default.">
                   Temperature
                 </Label>
                 <NumberInput
@@ -720,13 +753,13 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
                   min={0.05}
                   max={2}
                   step={0.05}
-                  disabled={!settings.customGenerationParams}
-                  onChange={(v) => set('temperature', v ?? 1)}
+                  disabled={!samplingLive}
+                  onChange={(v) => set('temperature', v ?? defaults.temperature)}
                   className="w-28"
                 />
               </div>
               <div>
-                <Label tip="Nucleus sampling — limits token candidates to the top P% by probability. Range: 0.05 – 1.0. Typical: 0.95 for Gemini 3.x, 0.80 for 2.x. Works with Temperature. Exactly 0 cannot be sent — the engine would ignore it and silently use the model default.">
+                <Label tip="Nucleus sampling — limits token candidates to the top P% by probability. Range: 0.05 – 1.0. Works with Temperature. Exactly 0 cannot be sent — the engine would ignore it and silently use the model default.">
                   Top-P
                 </Label>
                 <NumberInput
@@ -734,8 +767,8 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
                   min={0.05}
                   max={1}
                   step={0.05}
-                  disabled={!settings.customGenerationParams}
-                  onChange={(v) => set('topP', v ?? 0.95)}
+                  disabled={!samplingLive}
+                  onChange={(v) => set('topP', v ?? defaults.topP)}
                   className="w-28"
                 />
               </div>
@@ -748,11 +781,37 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
                   min={1}
                   max={100}
                   allowEmpty
-                  disabled={!settings.customGenerationParams}
+                  disabled={!samplingLive}
                   onChange={(v) => set('topK', v)}
                   placeholder="— model default —"
                   className="w-40"
                 />
+              </div>
+              {/*
+                What the model change used to do by force. Temperature and Top-P are no longer
+                overwritten while the toggle is on, so this is how the per-generation values
+                stay reachable — deliberately, and without discarding anything.
+              */}
+              <div>
+                <Button
+                  variant="secondary"
+                  disabled={!samplingLive}
+                  onClick={() => {
+                    set('temperature', defaults.temperature)
+                    set('topP', defaults.topP)
+                  }}
+                >
+                  Reset to this model’s defaults ({defaults.temperature} / {defaults.topP})
+                </Button>
+                {/* Only once the user has taken control — advice, not an obstacle. */}
+                {samplingLive && caps.thinking === 'level' && (
+                  <p className="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
+                    Gemini 3.x models are tuned to run at their own defaults, which are these
+                    numbers — so overriding them mostly restates what the model would do anyway.
+                    Lowering the temperature on a 3.x model is known to degrade output and can
+                    make it loop.
+                  </p>
+                )}
               </div>
             </div>
           </div>

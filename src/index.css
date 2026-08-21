@@ -44,13 +44,6 @@ html.dark .thin-scroll::-webkit-scrollbar-thumb {
   background: transparent;
 }
 
-/* Remove number input spinners where we clamp manually */
-input[type='number'].no-spin::-webkit-outer-spin-button,
-input[type='number'].no-spin::-webkit-inner-spin-button {
-  -webkit-appearance: none;
-  margin: 0;
-}
-
 /*
  * Log rows: skip layout and paint for lines scrolled out of view.
  *

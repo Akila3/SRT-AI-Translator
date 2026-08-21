@@ -1,5 +1,6 @@
 import React, { useState, useRef } from 'react'
 import type { LogRow, RetryState } from '../lib/logView'
+import { valueOnBlur, valueWhileTyping } from '../lib/numberField'
 
 // ─── Tooltip ("?") ───────────────────────────────────────────────────────────
 export function Tooltip({ tip }: { tip: string }): React.JSX.Element {
@@ -80,7 +81,25 @@ export function TextInput({
   )
 }
 
-// Number input with min/max clamping on change
+/**
+ * A number field that can be typed into as well as nudged.
+ *
+ * It used to clamp on every keystroke, which made `0.85` unreachable in a field whose
+ * minimum is `0.05` — the leading `0` was rewritten under the caret (REP-4). The rules for
+ * what a keystroke commits live in `numberField.ts`; what is left here is the part that
+ * needs a DOM.
+ *
+ * **The draft is what makes it work, and it has to be rendered verbatim — including empty.**
+ * A `type="number"` input reports an empty string for any half-typed value it cannot parse,
+ * `0.` being the one that matters. Holding that empty string in state and rendering it is
+ * what stops React writing the old value back over the text: the input's own `value` is
+ * already `''` in that state, so the two agree and React leaves the DOM alone, and the `.`
+ * the user just typed stays on screen. Rendering the last good value instead — the obvious
+ * thing — deletes the character as it is typed, which is the original bug wearing a hat.
+ *
+ * Because nothing is corrected mid-word any more, the native spinners are safe to show
+ * again; they were hidden only to keep the per-keystroke clamp from fighting them.
+ */
 export function NumberInput({
   value,
   onChange,
@@ -102,27 +121,39 @@ export function NumberInput({
   placeholder?: string
   className?: string
 }): React.JSX.Element {
+  // The text as typed, while the field has focus. Null means "show the committed value".
+  const [draft, setDraft] = useState<string | null>(null)
+  const rules = { min, max, step, allowEmpty }
+
+  const commit = (el: HTMLInputElement): void => {
+    setDraft(null)
+    // `badInput` is the difference between an empty box and an unfinished one: both read as
+    // '' here, but only the first means the user cleared it.
+    if (el.validity?.badInput) return
+    const settled = valueOnBlur(el.value, rules, value)
+    if (settled !== value) onChange(settled)
+  }
+
   return (
     <TextInput
       type="number"
-      className={`no-spin ${className}`}
+      className={className}
       min={min}
       max={max}
       step={step}
       disabled={disabled}
       placeholder={placeholder}
-      value={value === null ? '' : value}
+      value={draft ?? (value === null ? '' : String(value))}
       onChange={(e) => {
-        const raw = e.target.value
-        if (raw === '') {
-          onChange(allowEmpty ? null : min)
-          return
-        }
-        let n = step && step < 1 ? parseFloat(raw) : parseInt(raw, 10)
-        if (Number.isNaN(n)) n = min
-        n = Math.min(max, Math.max(min, n))
-        if (step && step < 1) n = Math.round(n * 100) / 100
-        onChange(n)
+        setDraft(e.target.value)
+        const typed = valueWhileTyping(e.target.value, rules)
+        if (typed !== null) onChange(typed)
+      }}
+      onBlur={(e) => commit(e.currentTarget)}
+      onKeyDown={(e) => {
+        // Enter settles the field without waiting for focus to move, so a value typed and
+        // confirmed with the keyboard is corrected at the same moment as a clicked-away one.
+        if (e.key === 'Enter') commit(e.currentTarget)
       }}
     />
   )
