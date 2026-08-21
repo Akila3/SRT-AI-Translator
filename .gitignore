@@ -20,3 +20,9 @@ Source Codes/
 .DS_Store
 .vite/
 build/python/
+# Probe scratch: generated media fixtures and, after a re-freeze, a copy of the previous
+# engine binary. Large, regenerable, and never part of a build. Covered by a pattern rather
+# than by name because each probe makes its own, and they are normally deleted on success —
+# so the one that survives is the one whose probe crashed, which is exactly when nobody is
+# thinking about .gitignore.
+.tmp-*/

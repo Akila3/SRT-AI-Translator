@@ -15,9 +15,12 @@ Set up the venv with:
     py -3.14 -m venv .venv-build
     .venv-build\\Scripts\\python.exe -m pip install -r scripts/build-python-requirements.lock
 """
+import hashlib
+import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +29,23 @@ WORK = ROOT / "build" / "python"
 ENTRY = ROOT / "scripts" / "gst_entry.py"
 VENV = ROOT / ".venv-build"
 LOCK = ROOT / "scripts" / "build-python-requirements.lock"
+
+# Records what produced the binary now sitting in resources/bin.
+#
+# The executable is git-ignored, so nothing a packaging run can see changes when its inputs
+# do: check-bin.mjs would pass on a stale binary and ship a release without the change.
+# Every input that can alter the frozen artifact is fingerprinted, not just the entry shim —
+# the pinned engine version and the PyInstaller collection recipe both live in THIS file, and
+# the exact dependency set lives in the lock, so a pin bump with an untouched shim would
+# otherwise look identical to a current build. Kept in the git-ignored work directory rather
+# than beside the binary, because the extraResources filter is `gst*` and anything matching it
+# is packaged into the app.
+STAMP = WORK / "gst.buildstamp.json"
+BUILD_INPUTS = {
+    "scripts/gst_entry.py": ENTRY,
+    "scripts/build_python.py": Path(__file__).resolve(),
+    "scripts/build-python-requirements.lock": LOCK,
+}
 
 # The engine release this build is pinned to. Bump this and the lock file together.
 REQUIRED_GST_VERSION = "3.7.0"
@@ -97,6 +117,33 @@ def ensure_installed() -> None:
     print(f"Engine: gemini-srt-translator {version} ({sys.executable})")
 
 
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def write_stamp(produced: Path) -> None:
+    """Record what this build was made from, for check-bin.mjs to verify before packaging."""
+    STAMP.parent.mkdir(parents=True, exist_ok=True)
+    STAMP.write_text(
+        json.dumps(
+            {
+                "binary": produced.name,
+                "binarySha256": sha256(produced),
+                "inputs": {name: sha256(path) for name, path in BUILD_INPUTS.items()},
+                "engineVersion": REQUIRED_GST_VERSION,
+                "builtAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"Build stamp: {STAMP}")
+
+
 def main() -> None:
     reexec_in_build_venv()
     ensure_installed()
@@ -132,6 +179,7 @@ def main() -> None:
 
     produced = OUT_DIR / ("gst.exe" if os.name == "nt" else "gst")
     if produced.exists():
+        write_stamp(produced)
         print(f"\nBuilt: {produced}")
     else:
         sys.exit("Build finished but executable not found.")
