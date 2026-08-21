@@ -9,11 +9,13 @@ import {
   Button,
   ProgressBar,
   LogPanel,
+  RetryNotice,
   StatusCard
 } from '../components/ui'
 import { SubTrackPanel } from '../components/SubTrackPanel'
 import { TmdbSearch } from '../components/TmdbSearch'
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from '../data/languages'
+import { retryIsCurrent } from '../lib/logView'
 import { useRunner } from '../lib/useRunner'
 import type { SubtitleTrack, TranslateArgs } from '../../electron/shared/types'
 
@@ -295,12 +297,16 @@ export default function TranslatePage(): React.JSX.Element {
           {!tgtLang && <span className="text-xs text-gray-400 dark:text-gray-500">Choose a target language to begin.</span>}
         </div>
 
-        {(isRunning || state.status === 'done' || state.status === 'error') && (
+        {(isRunning || state.status === 'done' || state.status === 'error' || state.status === 'stopped') && (
           <div className="mt-4 space-y-3">
             <ProgressBar pct={state.progress} />
 
-            {state.status === 'error' ? (
-              <LogPanel lines={state.log} />
+            {isRunning && retryIsCurrent(state.retry, state.currentLine) && state.retry && (
+              <RetryNotice retry={state.retry} />
+            )}
+
+            {state.status === 'error' || state.status === 'stopped' ? (
+              <LogPanel rows={state.log} />
             ) : (
               <StatusCard
                 running={isRunning}
@@ -340,9 +346,23 @@ export default function TranslatePage(): React.JSX.Element {
                 Process ended with an error (exit code {state.exitCode}). Check the log above.
               </p>
             )}
+            {/*
+              A run the user ended is not a failure, and saying so in red told them the app had
+              broken when it had done exactly what they asked.
+            */}
+            {state.status === 'stopped' && (
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                  Stopped. Nothing was saved.
+                </p>
+                <Button variant="ghost" onClick={reset}>
+                  New
+                </Button>
+              </div>
+            )}
 
             {/* Raw log is hidden by default on success; power users can expand it. */}
-            {state.status !== 'error' && state.log.length > 0 && (
+            {state.status !== 'error' && state.status !== 'stopped' && state.log.length > 0 && (
               <div>
                 <button
                   onClick={() => setShowLog((v) => !v)}
@@ -352,7 +372,7 @@ export default function TranslatePage(): React.JSX.Element {
                 </button>
                 {showLog && (
                   <div className="mt-2">
-                    <LogPanel lines={state.log} />
+                    <LogPanel rows={state.log} />
                   </div>
                 )}
               </div>

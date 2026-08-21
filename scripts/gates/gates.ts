@@ -55,6 +55,17 @@ import {
   reindexEvidenceAfterRemoval
 } from '../../electron/shared/keyOrder'
 import { RATE_LIMITS_URL, lookupFreeTier, paidQuotaTooltip } from '../../src/data/freeTier'
+import {
+  HEAD_LINES,
+  TAIL_LINES,
+  appendLogLine,
+  readRetryState,
+  retryIsCurrent,
+  terminalState,
+  type LogBlock,
+  type LogGap,
+  type LogRow
+} from '../../src/lib/logView'
 import { effectiveThinkingLevel, modelCapabilities } from '../../electron/shared/modelCaps'
 import type { ModelInfo, SlotFetchResult, TranslateArgs } from '../../electron/shared/types'
 
@@ -83,6 +94,13 @@ function eq<T>(name: string, actual: T, expected: T): void {
   const a = JSON.stringify(actual)
   const e = JSON.stringify(expected)
   check(name, a === e, a === e ? undefined : `expected ${e}\n        actual   ${a}`)
+}
+
+/** Replay a run's output through the panel's collapser, one line at a time as it arrives. */
+function feedLog(lines: string[]): LogRow[] {
+  let rows: LogRow[] = []
+  for (const l of lines) rows = appendLogLine(rows, l)
+  return rows
 }
 
 // ── fixtures ───────────────────────────────────────────────────────────────────
@@ -946,6 +964,217 @@ section('G3c — the scan can never strand a finished job')
   eq('G3c an empty output', scanOutputFiles(junk, empty), [])
   eq('G3c an unparseable pair', scanOutputFiles(junk, junk), [])
   eq('G3c a directory where a file was expected', scanOutputFiles(dir, junk), [])
+}
+
+// ── G4: the run panel (REP-2/3/12, MAN-1/6/8) ──────────────────────────────────
+
+section('G4 — collapsing a repeated block, and never hiding a line')
+{
+  /** What the panel actually shows, top to bottom. */
+  const shown = (rows: LogRow[]): string[] => {
+    const out: string[] = []
+    for (const r of rows) {
+      if (r.kind === 'block') out.push(...r.lines)
+      else out.push(`<${r.hiddenLines} hidden>`)
+    }
+    return out
+  }
+  /**
+   * The invariant the whole feature stands on: collapsing may only ever remove text that is
+   * still on screen somewhere. An error folded away into a counter is worse than repetition.
+   */
+  const nothingHidden = (name: string, stream: string[], rows: LogRow[]): void => {
+    const visible = new Set(shown(rows))
+    const missing = [...new Set(stream)].filter((l) => !visible.has(l))
+    check(
+      `G4 ${name} — every distinct line still visible`,
+      missing.length === 0,
+      `missing: ${missing.slice(0, 3).join(' | ')}`
+    )
+  }
+
+  // 1. the two cases the plan's first revision got wrong
+  {
+    const abab = ['A', 'B', 'A', 'B']
+    const rows = feedLog(abab)
+    eq('G4 A B A B collapses to one two-line block', shown(rows), ['A', 'B'])
+    eq('G4 A B A B counts two', rows.length === 1 && rows[0].kind === 'block' ? rows[0].count : -1, 2)
+    nothingHidden('A B A B', abab, rows)
+
+    const abac = ['A', 'B', 'A', 'C']
+    const rowsC = feedLog(abac)
+    eq('G4 A B A C stays four rows', shown(rowsC), abac)
+    nothingHidden('A B A C', abac, rowsC)
+  }
+
+  // 2. a progress line whose number moves must never collapse: if it does, progress is hidden
+  {
+    const stream = Array.from({ length: 40 }, (_, i) => `Translating batch 1: ${i + 1}/300 lines`)
+    const rows = feedLog(stream)
+    eq('G4 a changing progress line never collapses', shown(rows), stream)
+    check(
+      'G4 no counter appears on distinct lines',
+      rows.every((r) => r.kind === 'block' && r.count === 1)
+    )
+  }
+
+  // 3. the measured flood: an 11-line frame redrawn 900 times (REP-12)
+  {
+    const frame = Array.from({ length: 11 }, (_, i) => `engine message ${i + 1}`)
+    const stream: string[] = []
+    for (let i = 0; i < 900; i++) stream.push(...frame)
+    const rows = feedLog(stream)
+    eq('G4 9,900 lines collapse to one block', rows.length, 1)
+    eq('G4 the block is the 11 real messages', shown(rows), frame)
+    eq('G4 the counter is exact', rows[0].kind === 'block' ? rows[0].count : -1, 900)
+    nothingHidden('the 9,900-line flood', stream, rows)
+
+    // and the proof that a one-line check could not have done this
+    let naive = 0
+    let previous = ''
+    for (const l of stream) {
+      if (l !== previous) naive++
+      previous = l
+    }
+    eq('G4 a consecutive-duplicate check would have kept every line', naive, stream.length)
+  }
+
+  // 4. the shape the engine actually produces: a message history that GROWS and is redrawn
+  {
+    const msgs = Array.from({ length: 12 }, (_, i) => `history line ${i + 1}`)
+    const draws = [2, 2, 2, 2, 3, 2, 2, 2, 2, 2, 2, 3]
+    const stream: string[] = []
+    draws.forEach((d, i) => {
+      for (let k = 0; k < d; k++) stream.push(...msgs.slice(0, i + 1))
+    })
+    eq('G4 the growing-history fixture is 173 lines', stream.length, 173)
+    const rows = feedLog(stream)
+    eq('G4 173 lines render as the 12 distinct messages', shown(rows), msgs)
+    check(
+      'G4 the block carries a climbing counter',
+      rows.length === 1 && rows[0].kind === 'block' && rows[0].count > 1
+    )
+    nothingHidden('the growing history', stream, rows)
+
+    // A redraw that is still arriving shows as ordinary lines until it completes — deliberately,
+    // because the alternative is holding lines back on the chance that they will repeat.
+    const partial = feedLog([...stream, msgs[0], msgs[1]])
+    eq('G4 an in-flight redraw is visible, not withheld', shown(partial).slice(-2), [msgs[0], msgs[1]])
+  }
+
+  // 5. a repeated message that recurs with different text between occurrences
+  {
+    const stream = ['X', 'X', 'X', 'Y', 'X', 'X', 'X']
+    const rows = feedLog(stream)
+    eq('G4 an interrupted repeat keeps both texts, in order', shown(rows), ['X', 'Y', 'X'])
+    nothingHidden('X Y X', stream, rows)
+  }
+
+  // 6. REP-7 was declined: the AFC notice must survive
+  {
+    const afc = 'Direct use of automatic function calling (AFC) is not recommended'
+    const frame = ['Validating token size...', 'Token size validated. Translating...']
+    const stream = [afc]
+    for (let i = 0; i < 50; i++) stream.push(...frame)
+    const rows = feedLog(stream)
+    check('G4 the AFC notice is still visible after a flood', shown(rows).includes(afc))
+    eq('G4 the flood around it still collapses', shown(rows), [afc, ...frame])
+  }
+}
+
+section('G4b — the cap keeps the start-up block and says what it hid')
+{
+  const stream = Array.from({ length: 3000 }, (_, i) => `distinct line ${i}`)
+  const rows = feedLog(stream)
+  const blocks = rows.filter((r) => r.kind === 'block') as LogBlock[]
+  const gaps = rows.filter((r) => r.kind === 'gap') as LogGap[]
+
+  eq('G4b exactly one gap marker', gaps.length, 1)
+  eq('G4b the head is kept, oldest first', blocks[0].lines[0], 'distinct line 0')
+  eq('G4b the newest line survives', blocks[blocks.length - 1].lines[0], 'distinct line 2999')
+  eq('G4b retained lines are head + tail', blocks.length, HEAD_LINES + TAIL_LINES)
+  eq('G4b the marker counts what went', gaps[0].hiddenLines, 3000 - HEAD_LINES - TAIL_LINES)
+
+  // The gap keeps its identity as more is hidden, so the row under the cursor does not jump.
+  let more = rows
+  for (let i = 3000; i < 3010; i++) more = appendLogLine(more, `distinct line ${i}`)
+  const gap2 = more.find((r) => r.kind === 'gap') as LogGap
+  eq('G4b the gap keeps its React key', gap2.seq, gaps[0].seq)
+  eq('G4b and grows', gap2.hiddenLines, 3010 - HEAD_LINES - TAIL_LINES)
+  eq('G4b the head is still the head', (more[0] as LogBlock).lines[0], 'distinct line 0')
+
+  // Row identity must be unique, or React reuses the wrong DOM node.
+  eq('G4b every row has a distinct key', new Set(more.map((r) => r.seq)).size, more.length)
+}
+
+section('G4c — a retry is named, never counted from redrawn lines (MAN-8)')
+{
+  // Five real retries of one batch, each adding three messages to a history that is redrawn
+  // twenty times per cycle — the measured shape, where two retries arrived as 1,521 lines.
+  const history: string[] = ['Validating token size...', 'Token size validated. Translating...']
+  const stream: string[] = []
+  for (let retry = 1; retry <= 5; retry++) {
+    history.push(
+      'Consecutive error count: 1/3',
+      'Expected 100 lines, got 50.',
+      'Retrying batch for lines 301-400...'
+    )
+    for (let draw = 0; draw < 20; draw++) stream.push(...history)
+  }
+  const raw = stream.filter((l) => l.startsWith('Retrying batch')).length
+  check('G4c the raw stream really is inflated', raw > 200, `raw retry lines: ${raw}`)
+
+  const rows = feedLog(stream)
+  eq('G4c the batch is named', readRetryState(rows), { from: 301, to: 400 })
+
+  // No count is claimed, on purpose: the display cannot tell "the history accumulated five
+  // retries" from "one history was redrawn five times", and inventing a number here is how a
+  // recovered run gets reported as a catastrophe.
+  eq('G4c nothing to say before a retry', retryIsCurrent(null, 0), false)
+  eq('G4c speaks while the batch is unfinished', retryIsCurrent({ from: 301, to: 400 }, 300), true)
+  eq('G4c goes quiet once the run reaches the end of that batch', retryIsCurrent({ from: 301, to: 400 }, 400), false)
+  eq('G4c and stays quiet after it', retryIsCurrent({ from: 301, to: 400 }, 460), false)
+
+  // The panel must not turn a five-retry history into sixty adjacent identical blocks.
+  check('G4c the redrawn storm stays readable', rows.length <= 8, `rows: ${rows.length}`)
+  eq('G4c row keys stay unique', new Set(rows.map((r) => r.seq)).size, rows.length)
+  check(
+    'G4c row keys stay in order',
+    rows.every((r, i) => i === 0 || r.seq > rows[i - 1].seq)
+  )
+}
+
+section('G4d — only a user Stop reads as Stopped (MAN-1)')
+{
+  eq('G4d a clean run', terminalState(0), { status: 'done', statusText: 'Completed' })
+  eq('G4d an engine failure', terminalState(1), { status: 'error', statusText: 'Failed' })
+  eq('G4d a killed run the user asked for', terminalState(1, 'user'), {
+    status: 'stopped',
+    statusText: 'Stopped'
+  })
+  eq('G4d a Stop that happened to exit 0', terminalState(0, 'user'), {
+    status: 'stopped',
+    statusText: 'Stopped'
+  })
+  // The two FP-7 reasons exist so a system termination can never borrow the user's label.
+  eq('G4d a stalled run is a failure, not a Stop', terminalState(1, 'stalled'), {
+    status: 'error',
+    statusText: 'Failed'
+  })
+  eq('G4d a refused run is a failure, not a Stop', terminalState(-1, 'guard'), {
+    status: 'error',
+    statusText: 'Failed'
+  })
+  // FP3-01: a reason outranks the exit code both ways. A run the app killed is not a success
+  // just because the process it killed happened to exit cleanly.
+  eq('G4d a stalled run that exited 0 is still a failure', terminalState(0, 'stalled'), {
+    status: 'error',
+    statusText: 'Failed'
+  })
+  eq('G4d a refused run that exited 0 is still a failure', terminalState(0, 'guard'), {
+    status: 'error',
+    statusText: 'Failed'
+  })
 }
 
 // ── result ─────────────────────────────────────────────────────────────────────

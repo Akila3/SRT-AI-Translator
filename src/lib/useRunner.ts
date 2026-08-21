@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
+import {
+  appendLogLine,
+  readRetryState,
+  terminalState,
+  type LogRow,
+  type RetryState,
+  type RunStatus
+} from './logView'
 
-export type RunStatus = 'idle' | 'running' | 'done' | 'error'
+export type { RunStatus, LogRow, RetryState }
 
 export interface TokenTally {
   prompt: number
@@ -11,7 +19,12 @@ export interface TokenTally {
 
 export interface RunnerState {
   status: RunStatus
-  log: string[]
+  /**
+   * The log as the panel shows it: repeated blocks folded into a counter, the middle capped.
+   * See `logView.ts` — the folding is a display transform applied AFTER the parsing below, so
+   * a collapsed block still updates progress, tokens and status.
+   */
+  log: LogRow[]
   progress: number
   tokenStats: string
   tokens: TokenTally | null
@@ -22,19 +35,10 @@ export interface RunnerState {
   logPaths: string[]
   /** Advisory notes about the finished file, shown beside Save. Never blocks anything. */
   warnings: string[]
+  /** The batch the engine is currently retrying, if it is retrying one. */
+  retry: RetryState | null
   exitCode: number | null
 }
-
-/**
- * Upper bound on retained log lines.
- *
- * Appending copies the whole array, and every retained line is also a live DOM node, so both
- * costs grow with the run. A pathological run is not theoretical: an invalid key puts the
- * engine in a retry loop that emits ~25 lines a second with no ceiling. Well above any real
- * run — the largest observed was ~1,100 lines — so ordinary jobs keep their full log and only
- * runaway ones are trimmed, oldest first, since it is the tail that carries the failure.
- */
-const LOG_CAP = 5000
 
 const INITIAL: RunnerState = {
   status: 'idle',
@@ -48,6 +52,7 @@ const INITIAL: RunnerState = {
   outputPath: '',
   logPaths: [],
   warnings: [],
+  retry: null,
   exitCode: null
 }
 
@@ -114,13 +119,12 @@ function applyLine(s: RunnerState, clean: string): RunnerState {
   const st = deriveStatus(clean)
   if (st) statusText = st
 
-  // Keep a clean log for error inspection: drop spinner/progress noise,
-  // token lines (surfaced separately), and consecutive duplicates.
-  let log = s.log
+  // Keep a clean log for error inspection: drop spinner/progress noise and token lines, which
+  // are surfaced separately. Everything else goes through the collapser, which folds repeats
+  // rather than dropping them — note this happens AFTER the parsing above, because the same
+  // lines carry progress, token and status state and collapsing first would blank them.
   const skip = isSpinnerLine(clean) || tk !== null
-  if (!skip && clean !== s.log[s.log.length - 1]) {
-    log = s.log.length >= LOG_CAP ? [...s.log.slice(s.log.length - LOG_CAP + 1), clean] : [...s.log, clean]
-  }
+  const log = skip ? s.log : appendLogLine(s.log, clean)
 
   return { ...s, log, progress, tokenStats, tokens, currentLine, totalLines, statusText }
 }
@@ -173,7 +177,13 @@ export function useRunner(): {
       if (pending.current.length === 0) return
       const batch = pending.current
       pending.current = []
-      setState((s) => batch.reduce(applyLine, s))
+      setState((s) => {
+        const next = batch.reduce(applyLine, s)
+        // Once per commit, not once per line: the retry count is read off the collapsed rows,
+        // so it costs a pass over the panel's contents rather than a per-line tally that the
+        // engine's redraws would inflate.
+        return next.log === s.log ? next : { ...next, retry: readRetryState(next.log) }
+      })
     }
     flushPending.current = flush
 
@@ -186,15 +196,17 @@ export function useRunner(): {
       if (timer.current === null) timer.current = setTimeout(flush, FLUSH_MS)
     })
 
-    const offDone = window.api.onDone(({ code, outputPath, logPaths, warnings }) => {
+    const offDone = window.api.onDone(({ code, outputPath, logPaths, warnings, reason }) => {
       // The last lines of a run are usually the interesting ones, so they must be committed
       // before the terminal state rather than left to a timer that unmounting could cancel.
+      // A Stop ends the job through the same terminal event, so this covers it too.
       flush()
+      const end = terminalState(code, reason)
       setState((s) => ({
         ...s,
-        status: code === 0 ? 'done' : 'error',
-        progress: code === 0 ? 100 : s.progress,
-        statusText: code === 0 ? 'Completed' : 'Failed',
+        status: end.status,
+        progress: end.status === 'done' ? 100 : s.progress,
+        statusText: end.statusText,
         outputPath,
         logPaths: logPaths ?? [],
         warnings: warnings ?? [],
@@ -216,14 +228,18 @@ export function useRunner(): {
     try {
       await launch()
     } catch (e) {
-      setState((s) => ({ ...s, status: 'error', log: [...s.log, String(e)] }))
+      setState((s) => ({ ...s, status: 'error', log: appendLogLine(s.log, String(e)) }))
     }
   }, [])
 
   const stop = useCallback(async () => {
     await window.api.stop()
     flushPending.current?.()
-    setState((s) => ({ ...s, status: s.status === 'running' ? 'error' : s.status }))
+    // Deliberately does NOT set a terminal status. Every stop ends the job in the main process,
+    // which reports it as a user stop on the same `done` event every other ending uses — so the
+    // panel says "Stopped" because the app knows it was stopped, not because the renderer
+    // guessed from a non-zero exit code it cannot tell apart from a crash.
+    setState((s) => (s.status === 'running' ? { ...s, statusText: 'Stopping…' } : s))
   }, [])
 
   return { state, start, stop, reset }

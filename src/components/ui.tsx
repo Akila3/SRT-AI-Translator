@@ -1,4 +1,5 @@
 import React, { useState, useRef } from 'react'
+import type { LogRow, RetryState } from '../lib/logView'
 
 // ─── Tooltip ("?") ───────────────────────────────────────────────────────────
 export function Tooltip({ tip }: { tip: string }): React.JSX.Element {
@@ -380,25 +381,90 @@ export function StatusCard({
 }
 
 // ─── Log panel ───────────────────────────────────────────────────────────────
-export function LogPanel({ lines }: { lines: string[] }): React.JSX.Element {
+
+/**
+ * How close to the bottom still counts as "following the newest line".
+ *
+ * A couple of rows of slack, so a wrapped line or a sub-pixel scroll position does not silently
+ * stop the panel following — the default behaviour everyone expects.
+ */
+const FOLLOW_SLACK_PX = 24
+
+export function LogPanel({ rows }: { rows: LogRow[] }): React.JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
+  // Whether the view was at the bottom when the last line arrived. A ref, not state: it must
+  // not cause a render of its own, and it is read inside the effect that follows the log.
+  const following = useRef(true)
+
   React.useEffect(() => {
-    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight
-  }, [lines])
+    const el = ref.current
+    // A new run starts at the bottom of an empty panel, so it follows again even if the user
+    // had scrolled up during the previous one.
+    if (rows.length === 0) following.current = true
+    if (el && following.current) el.scrollTop = el.scrollHeight
+  }, [rows])
+
+  // Auto-scrolling used to be unconditional, which made the panel unreadable during a run: at
+  // 25 lines a second the user was thrown back to the bottom before they could read anything,
+  // let alone select it. Following is now something the user can leave and come back to simply
+  // by scrolling, and the default is unchanged.
+  const onScroll = (): void => {
+    const el = ref.current
+    if (el) following.current = el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK_PX
+  }
+
   return (
     <div
       ref={ref}
+      onScroll={onScroll}
       className="thin-scroll max-h-48 overflow-y-auto rounded-md bg-gray-900 p-3 font-mono text-[11px] leading-relaxed text-gray-100"
     >
-      {lines.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="text-gray-500">Waiting to start…</div>
       ) : (
-        lines.map((l, i) => (
-          <div key={i} className="log-row whitespace-pre-wrap">
-            {l}
-          </div>
-        ))
+        rows.map((row) =>
+          row.kind === 'gap' ? (
+            <div key={row.seq} className="log-row py-1 text-gray-500">
+              ··· {row.hiddenLines.toLocaleString()} earlier lines hidden ···
+            </div>
+          ) : (
+            row.lines.map((l, i) => (
+              <div key={`${row.seq}:${i}`} className="log-row whitespace-pre-wrap">
+                {l}
+                {/*
+                  On the block's FIRST line, so it reads as "this block, drawn N times" — the
+                  count belongs to the block, and hanging it off the last line would look like a
+                  claim about that line alone.
+                */}
+                {row.count > 1 && i === 0 && (
+                  <span className="ml-2 rounded bg-gray-700 px-1.5 py-px text-[10px] font-semibold text-amber-300">
+                    × {row.count.toLocaleString()}
+                  </span>
+                )}
+              </div>
+            ))
+          )
+        )
       )}
     </div>
+  )
+}
+
+/**
+ * Says the engine is re-attempting a batch, which is otherwise invisible.
+ *
+ * The engine retries a failed batch with no ceiling of its own — a measured run repeated one
+ * batch more than 250 times — and its own counter can sit at "1/3" throughout, so a run that is
+ * getting nowhere looks exactly like one that is working. This stops nothing and claims no
+ * count (see `readRetryState`): it states which batch is being re-attempted, and disappears the
+ * moment the run moves past it, so the user can decide whether to keep waiting.
+ */
+export function RetryNotice({ retry }: { retry: RetryState }): React.JSX.Element {
+  return (
+    <p className="text-sm text-amber-700 dark:text-amber-400">
+      The engine is re-attempting lines {retry.from.toLocaleString()}–{retry.to.toLocaleString()}. It
+      keeps trying until it succeeds, so this can take a while — press Stop if you would rather not
+      wait.
+    </p>
   )
 }

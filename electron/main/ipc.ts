@@ -543,14 +543,17 @@ export function registerIpc(): void {
     let logPaths: string[] = []
     const started = startTranslate(fullArgs, {
       onOutput: (stream, line) => send('translate:output', { stream, line }),
-      onDone: (code, op) =>
+      onDone: (code, op, reason) =>
         send('translate:done', {
           code,
           outputPath: op,
           logPaths,
+          reason,
           // Only a run the engine called successful is worth scanning. A failed run has no complete
           // output to judge, and warning about a file the user was already told about would be noise.
-          warnings: code === 0 ? scanOutputFiles(fullArgs.inputFile, op) : []
+          // A run the app ended is excluded for the same reason: its output is partial by
+          // definition, so "part of this does not look right" would be describing the Stop.
+          warnings: code === 0 && !reason ? scanOutputFiles(fullArgs.inputFile, op) : []
         })
     })
     logPaths = started.logPaths
@@ -563,7 +566,7 @@ export function registerIpc(): void {
     // unchanged, since `startTranscribe` was already a Promise across the IPC boundary.
     return await startTranscribe(args, {
       onOutput: (stream, line) => send('translate:output', { stream, line }),
-      onDone: (code, outputPath) => send('translate:done', { code, outputPath })
+      onDone: (code, outputPath, reason) => send('translate:done', { code, outputPath, reason })
     })
   })
 

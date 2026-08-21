@@ -1,7 +1,18 @@
 import React, { useEffect, useState } from 'react'
 import { useStore } from '../store/useStore'
-import { Box, BoxTitle, Label, FilePicker, Button, ProgressBar, LogPanel, Select } from '../components/ui'
+import {
+  Box,
+  BoxTitle,
+  Label,
+  FilePicker,
+  Button,
+  ProgressBar,
+  LogPanel,
+  RetryNotice,
+  Select
+} from '../components/ui'
 import { THINKING_LEVELS } from '../data/freeTier'
+import { retryIsCurrent } from '../lib/logView'
 import { useRunner } from '../lib/useRunner'
 import { modelCapabilities } from '../../electron/shared/modelCaps'
 import type { TranscribeArgs } from '../../electron/shared/types'
@@ -198,10 +209,13 @@ export default function TranscribePage(): React.JSX.Element {
           )}
         </div>
 
-        {(isRunning || state.status === 'done' || state.status === 'error') && (
+        {(isRunning || state.status === 'done' || state.status === 'error' || state.status === 'stopped') && (
           <div className="mt-4 space-y-3">
             <ProgressBar pct={state.progress} />
-            <LogPanel lines={state.log} />
+            {isRunning && retryIsCurrent(state.retry, state.currentLine) && state.retry && (
+              <RetryNotice retry={state.retry} />
+            )}
+            <LogPanel rows={state.log} />
             {state.status === 'done' && (
               <p className="text-sm font-medium text-green-700 dark:text-green-400">✅ Transcription saved → {state.outputPath}</p>
             )}
@@ -209,6 +223,17 @@ export default function TranscribePage(): React.JSX.Element {
               <p className="text-sm font-medium text-red-600 dark:text-red-400">
                 Process ended with an error (exit code {state.exitCode}). Check the log above.
               </p>
+            )}
+            {/* A run the user ended is not a failure — see MAN-1. */}
+            {state.status === 'stopped' && (
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                  Stopped. Nothing was saved.
+                </p>
+                <Button variant="ghost" onClick={reset}>
+                  New
+                </Button>
+              </div>
             )}
           </div>
         )}

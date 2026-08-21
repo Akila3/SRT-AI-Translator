@@ -133,10 +133,20 @@ keeps a bad network from quietly resetting someone's model.
    `startTranslate`.
 4. `startTranslate` normalises the input encoding, builds the argv, and spawns `gst`.
 5. Output is line-buffered and pushed to the renderer as it arrives; on close a single
-   `translate:done` carries the exit code, the output path, any log sidecars, and any sanity
-   warnings about the finished file.
+   `translate:done` carries the exit code, the output path, any log sidecars, any sanity warnings
+   about the finished file, and — when the app rather than the engine ended the run — the reason it
+   did. A killed process and a crashed one both exit non-zero, so only the main process can tell them
+   apart, and it says so instead of leaving the renderer to guess: a run the user stopped reads as
+   *Stopped*, never as a failure.
 6. `useRunner` parses the stream for progress and token counts; the page then copies the temp output
    and its sidecars to the user's chosen path, named from the extension the engine actually produced.
+
+The engine redraws its whole message history on every streamed chunk, so a run can emit thousands of
+lines that say one thing — one measured run produced 9,900 lines carrying eleven distinct messages.
+The panel therefore folds a redrawn block into a single row with a repeat counter and keeps a fixed
+head plus a rolling tail, marking how many lines the middle lost. Folding only ever removes text that
+is still on screen elsewhere. It also follows the newest line only while the view is already at the
+bottom, so scrolling up during a run holds position.
 
 On a successful run the main process reads the finished subtitle back and compares it against its
 source (`electron/shared/outputSanity.ts`). The engine validates a batch by *counting* items rather

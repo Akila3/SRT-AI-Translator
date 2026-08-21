@@ -171,10 +171,26 @@ export interface ProcOutput {
   line: string
 }
 
+/**
+ * Why a run ended, when something other than the engine decided it.
+ *
+ * A boolean would not do. A killed process and a crashed one both exit non-zero, so the
+ * renderer cannot tell them apart, and the main process is the only place that knows — but
+ * "the app ended this run" is not one thing: `user` is a button press and reads as Stopped,
+ * while `stalled` and `guard` are the app refusing to continue and must keep reading as
+ * failures. Reporting either of those as a Stop would tell the user they did something they
+ * did not do, and would bury the cause.
+ *
+ * Absent means the engine exited on its own and the exit code decides, as before.
+ */
+export type TerminalReason = 'user' | 'stalled' | 'guard'
+
 export interface ProcDone {
   code: number | null
   outputPath: string
   logPaths?: string[]
+  /** Set only when the app ended the run rather than the engine. Optional: absent is the norm. */
+  reason?: TerminalReason
   /**
    * Advisory messages about the output the engine just wrote — see `outputSanity.ts`. Optional, and
    * everything that ignores it keeps working: the renderer shows these beside Save so the user reads

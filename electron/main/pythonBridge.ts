@@ -7,7 +7,12 @@ import { convertAudioToMp3, envWithFfmpeg } from './ffmpeg'
 import { getSettings } from './store'
 import { orderKeySlots, type KeySlot } from '../shared/keyOrder'
 import { effectiveThinkingLevel, modelCapabilities } from '../shared/modelCaps'
-import { DEFAULT_RESUME_CONTEXT_SIZE, type TranslateArgs, type TranscribeArgs } from '../shared/types'
+import {
+  DEFAULT_RESUME_CONTEXT_SIZE,
+  type TerminalReason,
+  type TranslateArgs,
+  type TranscribeArgs
+} from '../shared/types'
 
 /**
  * The one job the app runs at a time.
@@ -28,7 +33,12 @@ interface Job {
   proc: ChildProcessWithoutNullStreams | null
   /** Aborts an in-flight preparation step. Null when nothing is being prepared. */
   prep: AbortController | null
-  cancelled: boolean
+  /**
+   * Set when the APP ends the run rather than the engine, and carried through to the renderer
+   * so it can say what happened. Non-null also means "this job has been told to stop", which is
+   * what the paths below check before doing any more work.
+   */
+  endReason: TerminalReason | null
   /** Temp files this job created and owns. Deleted when it ends, whatever the outcome. */
   scratch: string[]
   finished: boolean
@@ -44,7 +54,7 @@ function beginJob(handlers: SpawnHandlers, outputPath: string): Job | null {
   job = {
     proc: null,
     prep: null,
-    cancelled: false,
+    endReason: null,
     scratch: [],
     finished: false,
     handlers,
@@ -70,7 +80,7 @@ function finish(j: Job, code: number | null): void {
     }
   }
   j.scratch = []
-  j.handlers.onDone(code, j.outputPath)
+  j.handlers.onDone(code, j.outputPath, j.endReason ?? undefined)
 }
 
 /** Refuse a start request without leaving the caller's page spinning forever. */
@@ -273,7 +283,7 @@ function generationParamArgs(a: {
 
 export interface SpawnHandlers {
   onOutput: (stream: 'stdout' | 'stderr', line: string) => void
-  onDone: (code: number | null, outputPath: string) => void
+  onDone: (code: number | null, outputPath: string, reason?: TerminalReason) => void
 }
 
 /**
@@ -462,7 +472,7 @@ function run(j: Job, args: string[]): void {
   if (j.finished) return
   // A Stop during preparation must not be followed by a spawn: the window between the two
   // is exactly where a cancelled job would otherwise still reach the API and spend quota.
-  if (j.cancelled) {
+  if (j.endReason) {
     handlers.onOutput('stderr', 'Stopped before the engine started.')
     finish(j, -1)
     return
@@ -588,7 +598,7 @@ export async function startTranscribe(a: TranscribeArgs, handlers: SpawnHandlers
     if (j.finished) return a.outputFile
     // Cancellation is checked first: an aborted conversion also reports failure, and
     // "Could not prepare…" would be a confusing thing to say to someone who pressed Stop.
-    if (j.cancelled) {
+    if (j.endReason) {
       handlers.onOutput('stderr', 'Stopped while preparing the audio.')
       finish(j, -1)
       return a.outputFile
@@ -606,13 +616,20 @@ export async function startTranscribe(a: TranscribeArgs, handlers: SpawnHandlers
   return a.outputFile
 }
 
+/**
+ * End the current job because the USER asked to.
+ *
+ * `user` is set here and nowhere else: it is what makes the panel say "Stopped" instead of
+ * "Failed", so anything else that ends a run must carry its own reason rather than borrow this
+ * one, or a failure the user did not cause would be reported as their own doing.
+ */
 export function stopCurrent(): void {
   const j = job
   if (!j) return
-  j.cancelled = true
+  j.endReason = 'user'
 
-  // Cancel a conversion that has not finished. The awaiting `startTranscribe` sees
-  // `cancelled` and ends the job, so this path still produces exactly one terminal event.
+  // Cancel a conversion that has not finished. The awaiting `startTranscribe` sees the reason
+  // and ends the job, so this path still produces exactly one terminal event.
   j.prep?.abort()
 
   const proc = j.proc
