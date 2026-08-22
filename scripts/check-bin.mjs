@@ -18,14 +18,15 @@
  * PATH (the pip install), which is a supported development setup, so this must not run
  * there.
  *
- * Usage: `node scripts/check-bin.mjs [--target=win32|darwin|linux]`
- * (defaults to the host platform, which is correct for `--dir` builds).
+ * Usage: `node scripts/check-bin.mjs [--target=win32|darwin|linux] [--bin-dir=path]`
+ * (defaults to the host platform and `resources/bin`. `--bin-dir` is what the
+ * electron-builder afterPack hook uses to hash the *copied* artifact, not the
+ * source tree that extraResources read from.)
  */
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 
-const BIN_DIR = path.resolve('resources/bin')
 const STAMP = path.resolve('build/python/gst.buildstamp.json')
 
 /**
@@ -56,7 +57,19 @@ function parseTarget(argv) {
   return value
 }
 
+function parseBinDir(argv) {
+  const arg = argv.find((a) => a === '--bin-dir' || a.startsWith('--bin-dir='))
+  if (!arg) return path.resolve('resources/bin')
+  const value = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : argv[argv.indexOf(arg) + 1]
+  if (!value) {
+    console.error('\nRelease build blocked: --bin-dir requires a path.\n')
+    process.exit(1)
+  }
+  return path.resolve(value)
+}
+
 const TARGET = parseTarget(process.argv.slice(2))
+const BIN_DIR = parseBinDir(process.argv.slice(2))
 
 // Mirrors `const EXE` in ffmpeg.ts and the win32 branch of resolveGstBin().
 const EXE = TARGET === 'win32' ? '.exe' : ''

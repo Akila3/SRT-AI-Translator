@@ -217,21 +217,37 @@ function main(): void {
   console.log(`\n=== C3 — the same material, corrupted: ${detectionInputs.length} pairs ===`)
   let detected = 0
   let missed: string[] = []
+  let executed = 0
   for (const pair of detectionInputs) {
     // The measured fault: a 136-cue filler run starting partway through the file.
     const from = Math.min(463, Math.max(30, Math.floor(pair.source.length / 2)))
     const length = Math.min(136, pair.source.length - from)
     if (length < 30) continue
+    executed++
     const warnings = scanTranslatedOutput(toSrt(pair.source), toSrt(corrupt(pair.output, from, length)))
     const hit = warnings.some((w) => w.from <= from + 1 && w.to >= from + length - 5)
     if (hit) detected++
     else missed.push(`${pair.label}: ${warnings.map((w) => `${w.from}-${w.to}`).join(';') || 'nothing'}`)
   }
-  check(
-    `every corrupted variant is caught (${detected}/${detected + missed.length})`,
-    missed.length === 0,
-    missed.slice(0, 5).join('\n        ')
-  )
+  if (executed === 0) {
+    // 0/0 caught is not success (SOL-50). Absent corpus stays a skip, like C2.
+    // A corpus that produced no runnable pair is a failed calibration, not a skip.
+    if (works.length === 0) {
+      console.log('  SKIP  corrupted-variant detection — no .secrets/SRT corpus present')
+    } else {
+      check(
+        'at least one corrupted variant was tested',
+        false,
+        'no aligned pair had enough cues to run detection'
+      )
+    }
+  } else {
+    check(
+      `every corrupted variant is caught (${detected}/${executed})`,
+      missed.length === 0,
+      missed.slice(0, 5).join('\n        ')
+    )
+  }
 
   console.log(
     `\n${passed} passed, ${failed} failed — ${realPairs.length} real outputs, ${languagePairs} language pairs`

@@ -1,7 +1,7 @@
 import fs from 'fs'
 import Store from 'electron-store'
 import { DEFAULT_RESUME_CONTEXT_SIZE, type AppSettings, type ModelInfo } from '../shared/types'
-import { CURRENT_SCHEMA_VERSION, migrateSettings } from './migrations'
+import { CURRENT_SCHEMA_VERSION, migrateSettings, sanitizeSettingsView, readVersion } from './migrations'
 
 /**
  * Static seed model list.
@@ -73,7 +73,15 @@ const defaults: AppSettings = {
   modelsUpdatedAt: null
 }
 
-export const store = new Store<AppSettings>({ defaults })
+/** This build's AppSettings. Runtime-view fallback only — never Conf constructor defaults. */
+export const DEFAULT_SETTINGS: AppSettings = defaults
+
+export const store = new Store<AppSettings>({
+  // Empty on purpose. Conf writes `defaults ∪ file` at construction whenever they differ,
+  // which would dump this build's schema into a newer-build profile before migrations
+  // even run (SOL-35). This build's defaults are applied by sanitizeSettingsView.
+  defaults: {} as AppSettings
+})
 
 /**
  * Run the migration chain once, at module load, and write the result in a SINGLE call.
@@ -93,7 +101,14 @@ function runMigrations(): void {
   })
 
   for (const note of result.notes) console.log(`[settings-migration] ${note}`)
-  if (result.downgrade || !result.changed) return
+  if (result.downgrade) return
+
+  // Shape repair is a separate pass from the versioned steps: M4/M6 leave a non-array cache
+  // untouched so a bad field cannot loop, but consumers iterate it as ModelInfo[]. A current
+  // version with the same damage skips the chain entirely. Neither case may reach the UI.
+  const sanitized = sanitizeSettingsView(result.settings, DEFAULT_SETTINGS)
+  for (const note of sanitized.notes) console.log(`[settings-sanitize] ${note}`)
+  if (!result.changed && !sanitized.changed) return
 
   // One tiny backup before the first migrated write turns a migration bug from
   // unrecoverable into a support instruction.
@@ -107,21 +122,36 @@ function runMigrations(): void {
     console.warn(`[settings-migration] could not write the pre-migration backup: ${String(err)}`)
   }
 
-  store.set(result.settings as unknown as Partial<AppSettings>)
-  console.log(
-    `[settings-migration] migrated settings from schemaVersion ${result.fromVersion} to ${result.toVersion}`
-  )
+  store.set(sanitized.persist as unknown as Partial<AppSettings>)
+  if (result.changed) {
+    console.log(
+      `[settings-migration] migrated settings from schemaVersion ${result.fromVersion} to ${result.toVersion}`
+    )
+  }
 }
 
 runMigrations()
 
 export function getSettings(): AppSettings {
-  return store.store
+  const { settings } = sanitizeSettingsView(
+    store.store as unknown as Record<string, unknown>,
+    DEFAULT_SETTINGS
+  )
+  return settings as unknown as AppSettings
 }
 
 export function setSettings(patch: Partial<AppSettings>): AppSettings {
-  for (const [key, value] of Object.entries(patch)) {
-    store.set(key, value as never)
+  const rest = { ...patch }
+  delete rest.schemaVersion
+  const file = store.store as unknown as Record<string, unknown>
+  if (readVersion(file) > CURRENT_SCHEMA_VERSION) {
+    // Patch keys only. Spreading store.store would write this build's defaults (and Conf
+    // already merges them into the getter) into a profile this build does not own (SOL-35).
+    store.set(rest as unknown as Partial<AppSettings>)
+    return getSettings()
   }
-  return store.store
+  const merged = { ...file, ...rest }
+  const { persist } = sanitizeSettingsView(merged, DEFAULT_SETTINGS)
+  store.set(persist as unknown as Partial<AppSettings>)
+  return getSettings()
 }

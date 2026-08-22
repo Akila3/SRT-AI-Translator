@@ -12,6 +12,9 @@
  *  - **Positional and structural, never heuristic.** The value masked is the one *after* `-k`
  *    or `-k2`. Nothing here tries to recognise a string that "looks like" a key: a key of an
  *    unexpected shape would then be printed in full, and Google has changed key formats before.
+ *  - **Plus every configured key the caller supplies.** Translation emits at most two keys and
+ *    transcription emits one, so a reserve pasted into `-d` would otherwise print in full
+ *    (SOL-20). Extra secrets are swept by exact match; they do not replace positional masking.
  *  - **Built from the argv, never stored.** Nothing retains a redacted-plus-raw pair.
  *  - **One renderer.** This is the only function permitted to turn an argv array into text for
  *    display, a file or a console. No other code path may hand an argv array to `onOutput`.
@@ -53,7 +56,11 @@ function quote(arg: string): string {
  * the bare name, and both are true statements about different things (what will run, versus what
  * was asked for). Neither is ever a secret.
  */
-export function maskCommandLine(bin: string, args: readonly string[]): string {
+export function maskCommandLine(
+  bin: string,
+  args: readonly string[],
+  extraSecrets: readonly string[] = []
+): string {
   const secrets: string[] = []
   const shown: (string | null)[] = []
 
@@ -82,7 +89,19 @@ export function maskCommandLine(bin: string, args: readonly string[]): string {
     shown.push(arg)
   }
 
-  const sweepable = secrets.filter((s) => s.length >= MIN_SWEEP_LENGTH)
+  for (const raw of extraSecrets) {
+    const s = (raw ?? '').trim()
+    if (s) secrets.push(s)
+  }
+
+  // Longest first, and deduplicated. The sweep rewrites the text it is searching, so a SHORTER
+  // secret that happens to be a prefix of a longer one would consume its opening characters and
+  // leave the rest of the longer key standing in clear — `***IJK` instead of `***`. Replacing the
+  // longest candidate first makes that impossible: whatever is left afterwards cannot contain a
+  // longer secret, because a longer one would already have matched (validator finding SOL-09).
+  const sweepable = [...new Set(secrets.filter((s) => s.length >= MIN_SWEEP_LENGTH))].sort(
+    (a, b) => b.length - a.length
+  )
   const rendered = shown.map((arg) => {
     if (arg === null) return MASK
     let text = arg

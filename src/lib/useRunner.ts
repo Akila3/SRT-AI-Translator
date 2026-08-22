@@ -139,9 +139,22 @@ function applyLine(s: RunnerState, clean: string): RunnerState {
  */
 const FLUSH_MS = 100
 
+/**
+ * A name for one run, unique for the life of the window.
+ *
+ * `crypto.randomUUID` is present in Electron's renderer, but a counter and a timestamp are enough
+ * for something that only has to be distinct from the other runs of this session, and this cannot
+ * fail in a context where the crypto API is unavailable.
+ */
+let runSeq = 0
+function mintRunId(): string {
+  runSeq += 1
+  return `r${Date.now().toString(36)}-${runSeq}`
+}
+
 export function useRunner(): {
   state: RunnerState
-  start: (launch: () => Promise<string>) => Promise<void>
+  start: (launch: (runId: string) => Promise<string>) => Promise<void>
   stop: () => Promise<void>
   reset: () => void
 } {
@@ -150,6 +163,20 @@ export function useRunner(): {
   const pending = useRef<string[]>([])
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const flushPending = useRef<(() => void) | null>(null)
+  /**
+   * Which run this hook is currently listening for.
+   *
+   * Read inside the event handlers rather than captured, so it is always the CURRENT run: both
+   * pages stay mounted and both listen on the same two channels, so without this a finished
+   * translation would absorb a later transcription's ending — taking its `outputPath` and
+   * `logPaths` with it, which is what Save then copies (SOL-01).
+   */
+  const runId = useRef<string | null>(null)
+  /**
+   * Taken before any listener teardown so a second Start cannot orphan the first run (SOL-39).
+   * Cleared when the run ends, the launch throws, or the user hits New.
+   */
+  const armed = useRef(false)
 
   useEffect(() => {
     return () => cleanup.current.forEach((fn) => fn())
@@ -157,6 +184,8 @@ export function useRunner(): {
 
   const reset = useCallback(() => {
     pending.current = []
+    runId.current = null
+    armed.current = false
     if (timer.current !== null) {
       clearTimeout(timer.current)
       timer.current = null
@@ -164,9 +193,13 @@ export function useRunner(): {
     setState(INITIAL)
   }, [])
 
-  const start = useCallback(async (launch: () => Promise<string>) => {
+  const start = useCallback(async (launch: (id: string) => Promise<string>) => {
+    if (armed.current) return
+    armed.current = true
     cleanup.current.forEach((fn) => fn())
     cleanup.current = []
+    const id = mintRunId()
+    runId.current = id
     setState({ ...INITIAL, status: 'running' })
 
     const flush = (): void => {
@@ -187,7 +220,11 @@ export function useRunner(): {
     }
     flushPending.current = flush
 
-    const offOut = window.api.onOutput(({ line }) => {
+    const offOut = window.api.onOutput(({ line, runId: from }) => {
+      // Not ours: another page's run, or a run this hook has already finished with. An event
+      // without an id is accepted, so a producer that has not been taught to stamp one still
+      // reaches the only runner that can be listening.
+      if (from !== undefined && from !== runId.current) return
       if (!line) return
       const clean = line.replace(ANSI, '').trim()
       if (!clean) return
@@ -196,7 +233,12 @@ export function useRunner(): {
       if (timer.current === null) timer.current = setTimeout(flush, FLUSH_MS)
     })
 
-    const offDone = window.api.onDone(({ code, outputPath, logPaths, warnings, reason }) => {
+    const offDone = window.api.onDone(({ code, outputPath, logPaths, warnings, reason, runId: from }) => {
+      if (from !== undefined && from !== runId.current) return
+      // Nothing else can end this run now. Clearing the id first means a late stray from the same
+      // run — or a second terminal event, were one ever produced — cannot reopen a settled panel.
+      runId.current = null
+      armed.current = false
       // The last lines of a run are usually the interesting ones, so they must be committed
       // before the terminal state rather than left to a timer that unmounting could cancel.
       // A Stop ends the job through the same terminal event, so this covers it too.
@@ -226,8 +268,12 @@ export function useRunner(): {
     ]
 
     try {
-      await launch()
+      await launch(id)
     } catch (e) {
+      // The launch itself failed, so no terminal event is coming for this id. Retiring it here
+      // stops a later run's events being matched against a run that never began.
+      runId.current = null
+      armed.current = false
       setState((s) => ({ ...s, status: 'error', log: appendLogLine(s.log, String(e)) }))
     }
   }, [])

@@ -1,6 +1,7 @@
-import { spawn } from 'child_process'
+import { spawn, type ChildProcess } from 'child_process'
 import { keySlotsFor, resolveGstBin } from './pythonBridge'
 import { envWithFfmpeg } from './ffmpeg'
+import { waitForChildExit } from './processExit'
 import { DEFAULT_MODELS, getSettings } from './store'
 import { activeKeySlots } from '../shared/keyOrder'
 import type {
@@ -285,6 +286,21 @@ export interface RefreshResult {
   /** True only for `valid`. Kept so callers that only care whether a list arrived read the same. */
   keyValid: boolean
   error: string
+  /**
+   * The fetch was killed and its process is STILL ALIVE.
+   *
+   * Only ever set for a caller that passed `ownsJobSlot`, and it is the one field that is not about
+   * the key: it says that letting the caller proceed would put a second engine beside a first one.
+   * A caller holding a job slot must keep holding it (SOL-02).
+   */
+  orphaned?: boolean
+  /** The surviving pid, so the user can be told which process to end. */
+  orphanPid?: number
+  /**
+   * The surviving child itself. A pid is a reusable integer; this object is not (SOL-16).
+   * Only set when `orphaned` is true.
+   */
+  orphan?: ChildProcess
 }
 
 /**
@@ -305,6 +321,41 @@ export interface RefreshResult {
 const FETCH_TIMEOUT_MS = 60_000
 
 /**
+ * How long a caller that OWNS A JOB SLOT waits for a killed fetch to actually be gone.
+ *
+ * Only reached after a kill has been requested, so this is a grace period for the OS, not for the
+ * work. Short, because the ordinary answer arrives in milliseconds.
+ */
+const EXIT_GRACE_MS = 5_000
+
+export interface RefreshOptions {
+  /**
+   * Does the caller hold the single job slot?
+   *
+   * This is the whole of validator finding SOL-02, and it is a genuine cross-phase regression:
+   * this fetch was written for the Settings panel, where a bounded answer matters and nothing is
+   * protected — the comment on the kill below still says "there is no slot to protect here", and
+   * when it was written that was true. **FP-7 then reused this function inside the transcription
+   * preflight, where a slot exists.** There, resolving the moment a kill is *requested* lets
+   * `startTranscribe` call `finish()` and release the slot while the `list-models` process is
+   * still alive, so the next start puts a second engine on the same key — the exact invariant
+   * FP-8 spent three rounds establishing everywhere else.
+   *
+   * With this set, the promise settles only once the child is confirmed gone, or reports the
+   * surviving child so the caller can keep the slot. Left unset, the Settings refresh keeps its
+   * existing bounded behaviour, because it holds nothing that a survivor could corrupt.
+   */
+  ownsJobSlot?: boolean
+  /**
+   * Called the moment the fetch process exists, so a job can own it before this promise
+   * settles. Without it, application shutdown during the fetch has no handle to wait on or
+   * escalate against (SOL-04).
+   */
+  onChild?: (child: ChildProcess) => void
+}
+
+
+/**
  * Ask one API key what models it can see.
  *
  * Returns raw ids rather than a curated list on purpose: availability decisions
@@ -312,7 +363,11 @@ const FETCH_TIMEOUT_MS = 60_000
  * never on what our display curation chose to keep. Curating first would let a cosmetic
  * filter masquerade as proof that a model no longer exists.
  */
-export async function refreshModels(apiKey: string, signal?: AbortSignal): Promise<RefreshResult> {
+export async function refreshModels(
+  apiKey: string,
+  signal?: AbortSignal,
+  opts?: RefreshOptions
+): Promise<RefreshResult> {
   if (!apiKey || !apiKey.trim()) {
     // Nothing was asked, so nothing was learned — an empty slot is not a rejected one.
     return { ids: [], verdict: 'unchecked', keyValid: false, error: 'No API key provided.' }
@@ -325,7 +380,14 @@ export async function refreshModels(apiKey: string, signal?: AbortSignal): Promi
   // The exit code is deliberately not collected. This fetch decides on the ids it can parse,
   // because the engine's upgrade handler can exit 0 having done no work at all — a code check
   // here would read that as a successful fetch of zero models.
-  const { out, timedOut } = await new Promise<{ out: string; timedOut: boolean }>((resolve) => {
+  const { out, timedOut, orphaned, orphanPid, orphan } = await new Promise<{
+    out: string
+    timedOut: boolean
+    /** Set when a killed fetch is still alive — see `RefreshOptions.ownsJobSlot`. */
+    orphaned?: boolean
+    orphanPid?: number
+    orphan?: ChildProcess
+  }>((resolve) => {
     let stdout = ''
     let proc
     try {
@@ -341,6 +403,7 @@ export async function refreshModels(apiKey: string, signal?: AbortSignal): Promi
       return
     }
     const child = proc
+    opts?.onChild?.(child)
 
     // `--skip-upgrade` is registered on all four subcommands but only *assigned* for translate and
     // transcribe, so `list-models` runs the upgrade check regardless and asks "upgrade? (y/n)"
@@ -362,9 +425,12 @@ export async function refreshModels(apiKey: string, signal?: AbortSignal): Promi
       if (process.platform === 'win32' && child.pid) {
         // The same listener this file already attaches to stdin above, and for the same reason:
         // an unhandled 'error' on a child nobody kept is an uncaught exception, and a `taskkill`
-        // that cannot start would end the application over a model fetch. Nothing else about this
-        // child is worth keeping — unlike a translation, this promise resolves on its own timer
-        // whether the kill worked or not, so there is no slot to protect here (FP8-R02).
+        // that cannot start would end the application over a model fetch (FP8-R02).
+        //
+        // What is NOT true any more is the sentence that used to end this comment — "there is no
+        // slot to protect here". It was written when Settings was the only caller. FP-7 gave this
+        // function a second one inside the transcription preflight, which does hold the single job
+        // slot, and `settleAfterKill()` below is what tells the two cases apart (SOL-02).
         spawn('taskkill', ['/pid', String(child.pid), '/f', '/t']).on('error', () => {})
       } else {
           child.kill('SIGTERM')
@@ -374,9 +440,37 @@ export async function refreshModels(apiKey: string, signal?: AbortSignal): Promi
       }
     }
 
+    /**
+     * Settle after a kill — but for a caller that owns the job slot, only once the child is gone.
+     *
+     * `close` is the reliable witness, so the normal path is simply to wait for it: the handler
+     * below resolves, and a Promise ignores every later settle. `waitForExit` is the backstop for a
+     * kill that did not work, and it ESCALATES to a forced tree kill rather than merely counting.
+     *
+     * The first version of this fix polled to a deadline and then resolved whether the child was
+     * alive or not, which made its own documentation false: the deadline was an unconditional
+     * alternative to the liveness check, so a slow or failed kill still released the slot on time
+     * (validator finding SOL-02, round 2). Now a surviving child is REPORTED as `orphaned` and the
+     * caller decides — which for a job slot means keeping it.
+     */
+    const settleAfterKill = (payload: { out: string; timedOut: boolean }): void => {
+      if (!opts?.ownsJobSlot) {
+        resolve(payload)
+        return
+      }
+      void waitForChildExit(child, { graceMs: EXIT_GRACE_MS }).then((gone) =>
+        resolve({
+          ...payload,
+          orphaned: !gone,
+          orphanPid: gone ? undefined : child.pid,
+          orphan: gone ? undefined : child
+        })
+      )
+    }
+
     const timer = setTimeout(() => {
       kill()
-      resolve({ out: stdout, timedOut: true })
+      settleAfterKill({ out: stdout, timedOut: true })
     }, FETCH_TIMEOUT_MS)
 
     // Cancellation. The preflight added in FP-7 runs inside a transcription job, where Stop has
@@ -385,7 +479,7 @@ export async function refreshModels(apiKey: string, signal?: AbortSignal): Promi
     const onAbort = (): void => {
       clearTimeout(timer)
       kill()
-      resolve({ out: stdout, timedOut: false })
+      settleAfterKill({ out: stdout, timedOut: false })
     }
     signal?.addEventListener('abort', onAbort, { once: true })
 
@@ -400,18 +494,27 @@ export async function refreshModels(apiKey: string, signal?: AbortSignal): Promi
     // the OS may have recycled onto an unrelated process.
     child.on('error', () => {
       settle()
-      resolve({ out: stdout, timedOut: false })
+      // Routed through the same settlement as the kill paths, not straight to `resolve`. An `error`
+      // can arrive AFTER a kill has been requested — that is the one case where this handler would
+      // otherwise hand back a finished-looking result while the child is still alive, bypassing the
+      // very check `settleAfterKill` exists to perform (SOL-02, round 2). When there was never a
+      // child at all, `waitForExit` sees a dead pid and returns immediately, so the ordinary
+      // spawn-failure path is unchanged.
+      settleAfterKill({ out: stdout, timedOut: false })
     })
     child.on('close', () => {
       settle()
+      // A real exit. Nothing to wait for and nothing to escalate.
       resolve({ out: stdout, timedOut: false })
     })
   })
 
   // A cancelled fetch learned nothing, and must not be classified from the partial output it
-  // happened to have collected — an aborted read is not evidence about the key.
+  // happened to have collected — an aborted read is not evidence about the key. `orphaned` still
+  // travels, because it is a fact about a PROCESS rather than about the key, and it is precisely
+  // this path — a Stop during the preflight — where the caller needs it.
   if (signal?.aborted) {
-    return { ids: [], verdict: 'unchecked', keyValid: false, error: 'Cancelled.' }
+    return { ids: [], verdict: 'unchecked', keyValid: false, error: 'Cancelled.', orphaned, orphanPid, orphan }
   }
 
   const ids = new Set<string>()
@@ -439,12 +542,24 @@ export async function refreshModels(apiKey: string, signal?: AbortSignal): Promi
 
   // A fetch that ran long but still produced ids is a success — the ids are the evidence, and
   // abandoning them because the process was slow to exit would discard a correct answer.
+  // `orphaned` is carried on EVERY return, not just the cancelled one. The timeout path reaches
+  // here rather than the abort branch above, so dropping it there meant a timed-out fetch whose
+  // process survived escalation could still be followed by a `gst` spawn — the survivor is a fact
+  // about a process and is true regardless of what was learned about the key (SOL-02, round 3).
   if (ids.size === 0) {
     const { verdict, error } = classifyFetchFailure(out, timedOut)
-    return { ids: [], verdict, keyValid: false, error }
+    return { ids: [], verdict, keyValid: false, error, orphaned, orphanPid, orphan }
   }
 
-  return { ids: Array.from(ids), verdict: 'valid', keyValid: true, error: '' }
+  return {
+    ids: Array.from(ids),
+    verdict: 'valid',
+    keyValid: true,
+    error: '',
+    orphaned,
+    orphanPid,
+    orphan
+  }
 }
 
 export interface RefreshSummary {
@@ -646,6 +761,9 @@ export type ModelGuardVerdict = { ok: boolean; warning?: string; error?: string 
  * Deliberately asymmetric: it BLOCKS only on positive evidence of absence, and merely
  * WARNS when availability is unknown. Refusing to start because the network was down
  * would be worse than letting the engine report the truth.
+ *
+ * "May switch" is only a warning while the active set has more than one slot (translation).
+ * A one-slot set (transcription) cannot switch: absence on that slot is a refusal (SOL-23).
  */
 export function guardModelForSpawn(
   model: string,
@@ -674,6 +792,15 @@ export function guardModelForSpawn(
 
   const missingOn = activeSlots.filter((slot) => !entry.availableOn.includes(slot))
   if (missingOn.length > 0) {
+    if (activeSlots.length <= 1) {
+      return {
+        ok: false,
+        error:
+          `The selected model "${model}" was not reported by the API key this run will use` +
+          (missingOn.length ? ` (slot ${missingOn.map((i) => i + 1).join(', ')})` : '') +
+          '. Open Settings > Gemini API Keys, run "Fetch Models & Check API Keys", and pick a model that key can see.'
+      }
+    }
     return {
       ok: true,
       warning:

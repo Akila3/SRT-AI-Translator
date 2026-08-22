@@ -9,6 +9,7 @@
  * Covers:
  *   G1   migration fixtures F1-F8 + F3b
  *   G1b  fixture F9 (provenance backfill)
+ *   G1c  runtime sanitise of malformed settings (SOL-29/30), including typed overlay
  *   G2   the automatable half of the ASS gate (extension preserved, non-UTF-8 ASS refused,
  *        the user's original left byte-identical). The engine round-trip stays manual — it
  *        needs a real API key.
@@ -20,13 +21,15 @@
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
+import { spawn } from 'child_process'
 
 import {
   CURRENT_SCHEMA_VERSION,
   migrateSettings,
+  sanitizeSettingsView,
   type MigrationContext
 } from '../../electron/main/migrations'
-import { DEFAULT_MODELS, DEFAULT_MODEL_ID, store, setSettings } from '../../electron/main/store'
+import { DEFAULT_MODELS, DEFAULT_MODEL_ID, DEFAULT_SETTINGS, store, setSettings, getSettings } from '../../electron/main/store'
 import {
   buildModelList,
   classifyFetchFailure,
@@ -41,9 +44,11 @@ import {
   applyModelSelectionRules,
   keySnapshotChanged,
   retargetTokenReport,
+  leftoverCanonicals,
   scanOutputFiles,
   sidecarDestination,
-  singleKeyRefreshScope
+  singleKeyRefreshScope,
+  isHttpsUrl
 } from '../../electron/main/ipc'
 import {
   CONSOLE_LOG_SUFFIX,
@@ -64,7 +69,8 @@ import {
   buildTranscribeArgs,
   buildTranslateArgs,
   ensureUtf8Subtitle,
-  orderKeysByValidity
+  orderKeysByValidity,
+  survivorsIn
 } from '../../electron/main/pythonBridge'
 import {
   activeKeySlots,
@@ -100,12 +106,21 @@ import {
   uncheckedNote
 } from '../../src/lib/keyStatus'
 import { maskCommandLine } from '../../electron/shared/maskedCommand'
+import { copyExclusive, displaceExclusive, nthCandidate, writeExclusive } from '../../electron/main/exclusiveFile'
+import {
+  forceKillTree,
+  hasExited,
+  livePid,
+  pidIsAlive,
+  waitForChildExit
+} from '../../electron/main/processExit'
 import {
   TIER1_LINES,
   TIER1_QUIET_MS,
   createStallWatch
 } from '../../electron/shared/stallBudget'
 import type {
+  AppSettings,
   KeyCheck,
   ModelInfo,
   SlotFetchResult,
@@ -118,9 +133,15 @@ import type {
 let failures = 0
 let passes = 0
 let group = ''
+const sectionsRun: string[] = []
+
+/** Empty suites must not print ALL GATES PASSED (SOL-46). Floors are conservative on purpose. */
+const MIN_GATE_SECTIONS = 35
+const MIN_GATE_PASSES = 500
 
 function section(name: string): void {
   group = name
+  sectionsRun.push(name)
   console.log(`\n=== ${name} ===`)
 }
 
@@ -292,6 +313,148 @@ section('G1b — fixture F9 (provenance backfill)')
   eq('F9 label preserved', out[0].label, 'Gemini Flash Lite 3.1')
   eq('F9 existing provenance untouched', out[1].source, 'live')
   eq('F9 existing availability untouched', out[1].availableOn, [0])
+}
+
+// ── G1c: runtime shape repair is separate from the versioned chain (SOL-29) ────
+
+section('G1c — sanitizeSettingsView (typed view / lossless persist)')
+{
+  const malformed = { ...pristineProfile(), schemaVersion: CURRENT_SCHEMA_VERSION, cachedModels: {} }
+  const migrated = migrateSettings(malformed, CTX)
+  eq('G1c current-version migration does not rewrite a non-array cache', migrated.changed, false)
+  eq('G1c and leaves the object in place', migrated.settings.cachedModels, {})
+
+  const sanitized = sanitizeSettingsView(malformed, DEFAULT_SETTINGS)
+  check('G1c runtime view is an array', Array.isArray(sanitized.settings.cachedModels))
+  eq('G1c runtime view uses the seed list', (sanitized.settings.cachedModels as ModelInfo[]).length, DEFAULT_MODELS.length)
+  eq('G1c schemaVersion is untouched', sanitized.settings.schemaVersion, CURRENT_SCHEMA_VERSION)
+  const withMystery = sanitizeSettingsView({ ...malformed, mystery: 1 }, DEFAULT_SETTINGS)
+  eq('G1c unknown fields stay on persist', withMystery.persist.mystery, 1)
+  eq('G1c and do not appear on the typed view', withMystery.settings.mystery, undefined)
+  eq('G1c a non-array cache stays on disk', sanitized.persist.cachedModels, {})
+  eq('G1c and is not a persistable repair', sanitized.changed, false)
+
+  const withNulls = {
+    ...pristineProfile(),
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    cachedModels: [null, { id: 'gemini-3.1-flash-lite', label: 'Flash Lite 3.1' }, 12]
+  }
+  const dropped = sanitizeSettingsView(withNulls, DEFAULT_SETTINGS)
+  const kept = dropped.settings.cachedModels as ModelInfo[]
+  eq('G1c null and non-object entries are dropped', kept.length, 1)
+  eq('G1c the real entry survives', kept[0].id, 'gemini-3.1-flash-lite')
+
+  const liveBad = sanitizeSettingsView(
+    {
+      ...pristineProfile(),
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      cachedModels: [{ id: 'gemini-3.1-flash-lite', label: 'Flash Lite 3.1', source: 'live', availableOn: null }]
+    },
+    DEFAULT_SETTINGS
+  )
+  const liveEntry = (liveBad.settings.cachedModels as ModelInfo[])[0]
+  eq('G1c live evidence without an availableOn array degrades to seed', liveEntry.source, 'seed')
+  check('G1c and availableOn is an array', Array.isArray(liveEntry.availableOn))
+
+  const scalarKey = sanitizeSettingsView(
+    { ...pristineProfile(), schemaVersion: CURRENT_SCHEMA_VERSION, apiKeys: 'REAL_KEY' },
+    DEFAULT_SETTINGS
+  )
+  eq('G1c a scalar API key is wrapped, not deleted', scalarKey.persist.apiKeys, ['REAL_KEY'])
+  eq('G1c and the view matches', scalarKey.settings.apiKeys, ['REAL_KEY'])
+
+  const scalarFalse = sanitizeSettingsView(
+    {
+      ...pristineProfile(),
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      apiKeys: ['REAL_KEY'],
+      apiKeyValid: false
+    },
+    DEFAULT_SETTINGS
+  )
+  eq('G1c a scalar rejection is wrapped as [false]', scalarFalse.persist.apiKeyValid, [false])
+  eq(
+    'G1c and that credential stays out of the pool',
+    orderKeySlots([{ index: 0, valid: (scalarFalse.settings.apiKeyValid as Array<boolean | null>)[0], tier: 'free' }]),
+    []
+  )
+
+  const numericSlot = sanitizeSettingsView(
+    { ...pristineProfile(), schemaVersion: CURRENT_SCHEMA_VERSION, apiKeys: [123] },
+    DEFAULT_SETTINGS
+  )
+  eq('G1c a non-string key slot becomes an empty string', numericSlot.settings.apiKeys, [''])
+  eq('G1c and that type repair is persistable', numericSlot.persist.apiKeys, [''])
+
+  const unconvertible = sanitizeSettingsView(
+    { ...pristineProfile(), schemaVersion: CURRENT_SCHEMA_VERSION, apiKeys: { not: 'an-array' } },
+    DEFAULT_SETTINGS
+  )
+  eq('G1c an unconvertible key container stays on disk', unconvertible.persist.apiKeys, { not: 'an-array' })
+  eq('G1c while the view is an empty slot', unconvertible.settings.apiKeys, [''])
+  eq('G1c and changed is false so startup will not persist the empty slot', unconvertible.changed, false)
+
+  const badModel = sanitizeSettingsView(
+    { ...pristineProfile(), schemaVersion: CURRENT_SCHEMA_VERSION, model: 123 },
+    DEFAULT_SETTINGS
+  )
+  eq('G1c a numeric model is a string in the view', typeof badModel.settings.model, 'string')
+  eq('G1c and stays a number on disk', badModel.persist.model, 123)
+  eq('G1c and is not a persistable repair', badModel.changed, false)
+
+  const newer = { ...pristineProfile(), schemaVersion: 99, cachedModels: {}, futureField: true }
+  const left = sanitizeSettingsView(newer, DEFAULT_SETTINGS)
+  eq('G1c a newer-build profile is not rewritten', left.changed, false)
+  eq('G1c including its malformed cache on disk', left.persist.cachedModels, {})
+  check('G1c but the view is still iterable', Array.isArray(left.settings.cachedModels))
+  eq('G1c and futureField stays on persist only', left.persist.futureField, true)
+  eq('G1c not on the typed view', left.settings.futureField, undefined)
+
+  const newerFalse = sanitizeSettingsView(
+    { schemaVersion: 99, apiKeys: ['KEY'], apiKeyValid: false },
+    DEFAULT_SETTINGS
+  )
+  eq('G1c newer-schema scalar false is [false] in the view', newerFalse.settings.apiKeyValid, [false])
+  eq('G1c and the key string is kept in the view', newerFalse.settings.apiKeys, ['KEY'])
+  eq('G1c and the scalar false stays on disk', newerFalse.persist.apiKeyValid, false)
+  eq('G1c and changed is false so the wrap is not persisted', newerFalse.changed, false)
+  eq(
+    'G1c so that newer-schema rejected key is not in the pool',
+    orderKeySlots([
+      { index: 0, valid: (newerFalse.settings.apiKeyValid as Array<boolean | null>)[0], tier: 'free' }
+    ]),
+    []
+  )
+
+  store.set('cachedModels', {})
+  check('G1c getSettings exposes an array even if the store holds an object', Array.isArray(getSettings().cachedModels))
+  eq('G1c a read does not write the repair', store.get('cachedModels'), {})
+  const beforeVersion = (store.store as { schemaVersion: number }).schemaVersion
+  setSettings({ schemaVersion: 99, theme: 'dark' } as Partial<AppSettings>)
+  eq('G1c setSettings cannot write schemaVersion', (store.store as { schemaVersion: number }).schemaVersion, beforeVersion)
+  eq('G1c but still writes the rest of the patch', getSettings().theme, 'dark')
+  eq('G1c and does not persist the seed over a non-array cache', store.get('cachedModels'), {})
+
+  const fileBefore = { ...(store.store as Record<string, unknown>) }
+  ;(store as unknown as { __replace: (n: Record<string, unknown>) => void }).__replace({
+    schemaVersion: 99,
+    mysteryField: 'from-the-future',
+    theme: 'light'
+  })
+  setSettings({ theme: 'dark' })
+  eq('G1c a downgrade write keeps the newer schemaVersion', store.get('schemaVersion'), 99)
+  eq('G1c and keeps unknown fields', store.get('mysteryField'), 'from-the-future')
+  eq('G1c and writes the patch', store.get('theme'), 'dark')
+  eq('G1c and does not materialise this build\'s defaults', store.get('batchSize'), undefined)
+  ;(store as unknown as { __replace: (n: Record<string, unknown>) => void }).__replace(fileBefore)
+  setSettings({ theme: 'auto', cachedModels: DEFAULT_MODELS.map((m) => ({ ...m })) })
+
+  const restoreAfterSparse = { ...(store.store as Record<string, unknown>) }
+  ;(store as unknown as { __replace: (n: Record<string, unknown>) => void }).__replace({})
+  eq('G1c a sparse profile reports modelsUpdatedAt as null', getSettings().modelsUpdatedAt, null)
+  eq('G1c and model is a string', typeof getSettings().model, 'string')
+  eq('G1c while the raw store has no timestamp', store.get('modelsUpdatedAt'), undefined)
+  ;(store as unknown as { __replace: (n: Record<string, unknown>) => void }).__replace(restoreAfterSparse)
 }
 
 // ── version ordering and default selection ─────────────────────────────────────
@@ -490,6 +653,10 @@ section('Step 3b — pre-spawn guard')
   eq('present on only one active key is allowed', partial.ok, true)
   check('…but warned about', !!partial.warning)
 
+  const soleMissing = guardModelForSpawn('gemini-3.1-pro', [live('gemini-3.1-pro', [1])], [0])
+  eq('absent from the only spawn slot is blocked', soleMissing.ok, false)
+  check('and the refusal does not talk about switching', !(soleMissing.error ?? '').includes('may switch'))
+
   const fine = guardModelForSpawn('gemini-3.1-pro', [live('gemini-3.1-pro', [0, 1])], [0, 1])
   eq('fully available model passes silently', fine.ok && !fine.warning, true)
 }
@@ -515,7 +682,15 @@ section('C16/C17/C28/C36 — key ranking')
   ])
 
   const onlyInvalid = [{ index: 0, valid: false, tier: 'free' }]
-  eq('a single invalid key is still used as a last resort', orderKeySlots(onlyInvalid), [0])
+  eq('a single invalid key is not resurrected', orderKeySlots(onlyInvalid), [])
+  eq(
+    'nor is an all-rejected pair',
+    orderKeySlots([
+      { index: 0, valid: false, tier: 'free' },
+      { index: 1, valid: false, tier: 'paid' }
+    ]),
+    []
+  )
 
   // C36: one valid key plus invalid reserves => a ONE-slot active set.
   const oneValid = [
@@ -676,6 +851,32 @@ function flagValue(args: string[], flag: string): string | null {
   const single = buildTranslateArgs(baseArgs(), 'C:/out.srt')
   eq('a single key emits -k only', single.includes('-k2'), false)
   eq('free tier omits --paid-quota', single.includes('--paid-quota'), false)
+
+  setSettings({ apiKeys: ['DEAD'], apiKeyValid: [false], apiKeyTiers: ['free'] })
+  eq('C17 an all-rejected ranking is empty', orderKeysByValidity(['DEAD']).keys, [])
+  const refused = buildTranslateArgs(baseArgs({ apiKeys: ['DEAD'] }), 'C:/out.srt')
+  check('C17 and the argv does not resurrect it as -k', !refused.includes('DEAD'))
+
+  setSettings({
+    apiKeys: ['KEY-A', 'KEY-B'],
+    apiKeyValid: [null, true],
+    apiKeyTiers: ['free', 'free']
+  })
+  const accepted: { index: number; valid: boolean | null; tier: string }[] = [
+    { index: 0, valid: true, tier: 'free' },
+    { index: 1, valid: true, tier: 'free' }
+  ]
+  eq(
+    'C17 a spawn snapshot keeps the accepted primary after Settings moved',
+    orderKeysByValidity(['KEY-A', 'KEY-B'], accepted).keys[0],
+    'KEY-A'
+  )
+  eq(
+    'C17 live ranking would have promoted the remaining valid key',
+    orderKeysByValidity(['KEY-A', 'KEY-B']).keys[0],
+    'KEY-B'
+  )
+  setSettings({ apiKeys: ['KEY-A'], apiKeyValid: [true], apiKeyTiers: ['free'] })
 }
 
 {
@@ -1320,6 +1521,14 @@ section('G5b — where Google’s sampling deprecation begins')
   eq('G5b an unversioned id', accepts('gemini-exp-1206'), false)
   eq('G5b something that is not Gemini at all', accepts('gpt-4o'), false)
   eq('G5b nothing selected', accepts(''), false)
+  // A live or hand-stored id can contain a version token without being a canonical Gemini
+  // model id. Sampling's unknown default is withhold; substring matching must not override it.
+  eq('G5b a noncanonical id with an embedded version is still unrecognised', accepts('gemini-experimental-2.5-flash'), false)
+  eq(
+    'G5b thinking still follows the engine substring for that id',
+    modelCapabilities('gemini-experimental-2.5-flash').thinking,
+    'budget'
+  )
 
   // Adding this capability must not have disturbed the ones already there.
   eq('G5b thinking is unchanged for 2.5', modelCapabilities('gemini-2.5-pro').thinking, 'budget')
@@ -1571,6 +1780,20 @@ section('G8a — the command line is shown, the keys are not (MAN-7)')
   const realLine = maskCommandLine('gst', realArgs)
   check('G8a the real argv builder leaks no key either', !realLine.includes(KEY) && !realLine.includes(KEY2), realLine)
   check('G8a and its --paid-quota is visible', realLine.includes('--paid-quota'), realLine)
+
+  // SOL-20. Transcription emits only `-k`. A reserve that appears in `-d` is not positional,
+  // so it is only redacted when supplied as an extra secret (every configured key for the run).
+  const RESERVE = 'AIzaSyReserveKeyForSOL20xxxx'
+  const leaked = maskCommandLine('gst', ['transcribe', '-k', KEY, '-d', `use ${RESERVE} in the show`])
+  check('G8a a reserve not on argv is visible without extra secrets', leaked.includes(RESERVE), leaked)
+  const redacted = maskCommandLine(
+    'gst',
+    ['transcribe', '-k', KEY, '-d', `use ${RESERVE} in the show`],
+    [KEY, RESERVE]
+  )
+  check('G8a and is gone once configured keys are supplied', !redacted.includes(RESERVE), redacted)
+  check('G8a while the rest of the description survives', redacted.includes('use *** in the show'), redacted)
+
   setSettings({ apiKeys: [], apiKeyValid: [], apiKeyTiers: [] })
 }
 
@@ -1851,6 +2074,11 @@ section('G8d — a check that proves nothing does not undo what was proven (FP7-
     ),
     JSON.stringify([0])
   )
+  eq(
+    'G8d an all-rejected set is empty, not a last-resort pool',
+    JSON.stringify(orderKeySlots([{ index: 0, valid: false, tier: 'free' }])),
+    JSON.stringify([])
+  )
 }
 
 section('G8e — a result may not be applied to keys it was not learned from (FP7-R01)')
@@ -2040,11 +2268,281 @@ section('G9c — a run\u2019s console is named after its output, and found again
   check('G9c nor is no list at all', findConsoleLog(undefined) === '')
 }
 
+// ── G10 — the release audit's findings (round 1, GPT-5.6-Sol) ──────────────────
+
+{
+  section('G10a — one key that begins with another is still masked whole')
+  // SOL-09. The sweep rewrites the text it searches, so replacing a SHORTER secret first eats the
+  // opening characters of a longer one and leaves its tail standing in clear. Both values are
+  // configured keys here; the long one is also pasted into the description, which is the case the
+  // sweep exists for.
+  const short = 'AIzaSHORTKEY'
+  const long = `${short}-AND-MORE-SECRET`
+  const line = maskCommandLine('gst', ['-k', short, '-k2', long, '-d', `see ${long} here`])
+  check('G10a the positional values are gone', !line.includes(short) && !line.includes(long))
+  check(
+    'G10a and no tail of the longer key survives in the description',
+    !line.includes('-AND-MORE-SECRET'),
+    line
+  )
+  // The reverse order must be equally safe: the fix must not merely swap which case breaks.
+  const reversed = maskCommandLine('gst', ['-k', long, '-k2', short, '-d', `see ${long} here`])
+  check('G10a and the same holds when the longer key is declared first', !reversed.includes('-AND-MORE-SECRET'), reversed)
+  // Nothing else may change: a value below the sweep floor is still masked positionally only.
+  const tiny = maskCommandLine('gst', ['-k', 'ab', '-d', 'ab'])
+  check('G10a a short value is still masked where it stands', tiny.includes('-k ***'))
+  check('G10a but is not hunted through unrelated arguments', tiny.endsWith('-d ab'), tiny)
+
+  section('G10b — a partial tree kill names its survivors')
+  // SOL-05. `taskkill /t` can remove the bootloader and fail on the interpreter beneath it, so a
+  // liveness check on the pid we hold would report the whole tree gone. The pids are in the text.
+  const real =
+    'ERROR: The process with PID 4711 (child process of PID 4096) could not be terminated.\r\n' +
+    'Reason: Access is denied.'
+  const found = survivorsIn(real)
+  check('G10b both pids on the line are collected', found.includes(4711) && found.includes(4096), found.join(','))
+  check('G10b a clean kill names nobody', survivorsIn('').length === 0)
+  check(
+    'G10b SUCCESS output contributes no survivors',
+    survivorsIn('SUCCESS: The process with PID 4096 has been terminated.').length === 1,
+    // One pid IS named here — checking a pid that has just died is harmless (it reads as gone),
+    // whereas missing one is the defect. The asymmetry is deliberate.
+    survivorsIn('SUCCESS: The process with PID 4096 has been terminated.').join(',')
+  )
+  check('G10b duplicates collapse', survivorsIn('PID 12 ... PID 12').length === 1)
+  check('G10b and nonsense yields nothing', survivorsIn('Access is denied.').length === 0)
+}
+
+// ── G11 — the release audit's findings (round 2, GPT-5.6-Sol) ──────────────────
+
+{
+  section('G11a — a stepped name keeps its compound suffix, and never runs out')
+  // SOL-13. The first collision fix stopped after fifty numbered names and then returned no logger
+  // at all, trading a destructive overwrite for silently losing the feature. The counter must also
+  // go BEFORE the compound suffix: `episode.console-2.log` no longer ends in `.console.log` and is
+  // therefore invisible to `findConsoleLog()` and to the sidecar suffix table.
+  const c = (n: number): string => nthCandidate('/out/episode.console.log', '.console.log', n)
+  check('G11a the first candidate is the preferred name', c(1) === '/out/episode.console.log')
+  check('G11a the second is numbered', c(2) === '/out/episode-2.console.log', c(2))
+  check('G11a and every candidate still ends in the compound suffix', [1, 2, 3, 20, 21, 99].every((n) => c(n).endsWith('.console.log')))
+  check('G11a the counter never lands inside the suffix', !c(2).includes('.console-'), c(2))
+  // Past the numbered range it must still produce a name, and a DIFFERENT one each time.
+  const overflow = [c(500), c(500), c(500)]
+  check('G11a past the numbered range it still produces names', overflow.every(Boolean))
+  check('G11a and they are distinct, so it cannot run out', new Set(overflow).size === 3, overflow.join(' '))
+  // A path that does not carry the suffix must not be mangled into one that half does.
+  const bare = nthCandidate('/out/episode', '.console.log', 2)
+  check('G11a a name without the suffix gains it', bare === '/out/episode-2.console.log', bare)
+  // The other three sidecars share this machinery.
+  check(
+    'G11a the token report keeps both of its dots',
+    nthCandidate('/out/x.tokens.json', '.tokens.json', 2) === '/out/x-2.tokens.json'
+  )
+
+  section('G11b — every sidecar destination is exclusive except the subtitle')
+  // SOL-12. The save dialog obtains consent for ONE file. These four names are derived from it, so
+  // an existing one used to be overwritten silently. Proven against the real filesystem.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'g11-'))
+  const src = path.join(dir, 'src.console.log')
+  fs.writeFileSync(src, 'new run')
+  const occupied = path.join(dir, 'episode.console.log')
+  fs.writeFileSync(occupied, 'PRECIOUS')
+  const landed = copyExclusive(src, occupied, '.console.log')
+  check('G11b the existing sidecar is untouched', fs.readFileSync(occupied, 'utf-8') === 'PRECIOUS')
+  check('G11b the copy went somewhere else', landed !== null && landed !== occupied, String(landed))
+  check('G11b and it carries the new content', !!landed && fs.readFileSync(landed, 'utf-8') === 'new run')
+  check('G11b the reported name is the one on disk', !!landed && fs.existsSync(landed))
+  // A free name must be used as-is, or every ordinary save would start numbering.
+  const free = path.join(dir, 'other.console.log')
+  check('G11b a free name is taken unchanged', copyExclusive(src, free, '.console.log') === free)
+  // The rewritten sidecar (the token report) takes the same route.
+  const tokOccupied = path.join(dir, 'episode.tokens.json')
+  fs.writeFileSync(tokOccupied, 'OLD REPORT')
+  const tokLanded = writeExclusive('{"new":true}', tokOccupied, '.tokens.json')
+  check('G11b the existing token report survives', fs.readFileSync(tokOccupied, 'utf-8') === 'OLD REPORT')
+  check('G11b and the new one is beside it', !!tokLanded && tokLanded !== tokOccupied, String(tokLanded))
+  fs.rmSync(dir, { recursive: true, force: true })
+
+  section('G11c — waiting for an exit means waiting for the exit')
+  // SOL-02. Nothing to wait for must resolve at once, rather than sitting out a grace period.
+  const goneAt = Date.now()
+  const goneResult = await waitForChildExit(undefined)
+  check('G11c an absent process is gone immediately', goneResult === true)
+  check('G11c and it does not wait to say so', Date.now() - goneAt < 100)
+  check('G11c pidIsAlive agrees about this process', pidIsAlive(process.pid))
+  check('G11c and an undefined pid is not alive', !pidIsAlive(undefined))
+
+  // A child that exits on its own must be reported gone WITHOUT anything being killed. This is the
+  // SOL-14 property stated as a test: the helper used to poll a bare pid on its own timer, so it
+  // could still be watching — and still escalating — after the child it was hired to watch had been
+  // reaped and its pid handed to something else. Counting kills is how that is observable.
+  let kills = 0
+  const countKill = (): void => {
+    kills += 1
+  }
+  const quick = spawn(process.execPath, ['-e', 'setTimeout(()=>{},150)'])
+  const quickGone = await waitForChildExit(quick, { graceMs: 3_000, attempts: 3, kill: countKill })
+  check('G11c a child that exits on its own is reported gone', quickGone === true)
+  check('G11c and nothing was killed to achieve it', kills === 0, `kills=${kills}`)
+  // And after `close`, no poll may remain to act on that pid later.
+  const killsAtClose = kills
+  await new Promise((r) => setTimeout(r, 400))
+  check('G11c nor is anything killed after it closes', kills === killsAtClose, `kills=${kills}`)
+
+  // A child that will not leave must be escalated against, and reported honestly if it stays. It
+  // ignores SIGTERM, so only the real forced kill ends it — which is the escalation being tested.
+  kills = 0
+  const stubborn = spawn(process.execPath, [
+    '-e',
+    "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"
+  ])
+  await new Promise((r) => setTimeout(r, 200))
+  const stubbornGone = await waitForChildExit(stubborn, { graceMs: 200, attempts: 4 })
+  check('G11c a process that ignores SIGTERM is escalated against until it goes', stubbornGone === true)
+  check('G11c hasExited agrees once it has', hasExited(stubborn))
+  // A reaped child is never signalled: its pid may belong to someone else by now.
+  // SOL-44: the kill is injectable so "zero signals" is observed, not inferred from the
+  // pid being gone. Prove the spy is wired on a live child first, or kills===0 is vacuous.
+  kills = 0
+  const live = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'])
+  await new Promise((r) => setTimeout(r, 80))
+  forceKillTree(live, countKill)
+  check('G11c a live child is handed to the injected kill', kills === 1, `kills=${kills}`)
+  live.kill()
+  await new Promise<void>((r) => live.once('close', () => r()))
+  kills = 0
+  forceKillTree(stubborn, countKill)
+  check('G11c a reaped child is not signalled again', kills === 0, `kills=${kills}`)
+
+  section('G11d — a stepped sidecar is distinguishable from a canonical one')
+  // SOL-15. The panel tells the user which reports could not take their usual name, and it decides by
+  // asking whether the name begins with the subtitle's stem AND a dot. That is a CONTRACT between two
+  // modules that never import each other: the stepping in `exclusiveFile.ts` and the predicate in
+  // TranslatePage. If stepping ever produced `episode.2.tokens.json`, every stepped file would read
+  // as canonical and the warning would silently stop appearing. Pinned here so it cannot drift.
+  // 1 is the preferred name unchanged; stepping starts at 2, and past the numbered range the unique
+  // fallback must still read as stepped rather than as canonical.
+  const canonical = nthCandidate('/out/episode.tokens.json', '.tokens.json', 1)
+  const stepped = nthCandidate('/out/episode.tokens.json', '.tokens.json', 2)
+  const farStepped = nthCandidate('/out/episode.tokens.json', '.tokens.json', 500)
+  const nameOf = (p: string): string => p.split(/[\\/]/).pop() ?? ''
+  check('G11d the first candidate is the canonical name', nameOf(canonical) === 'episode.tokens.json')
+  check('G11d and it reads as belonging to the subtitle', nameOf(canonical).startsWith('episode.'))
+  check(
+    'G11d a stepped name does NOT read as belonging to it',
+    !nameOf(stepped).startsWith('episode.'),
+    nameOf(stepped)
+  )
+  check('G11d and it keeps the compound suffix', nameOf(stepped).endsWith('.tokens.json'))
+  check(
+    'G11d the unique fallback reads as stepped too',
+    !nameOf(farStepped).startsWith('episode.'),
+    nameOf(farStepped)
+  )
+
+  section('G11e — displaceExclusive moves without destroying, and is not how save works')
+  // The primitive is still the right answer to "move this file to a free name". The save handler
+  // no longer uses it (SOL-17: Transcribe's picker-only call would have renamed four reports
+  // nobody agreed to move). G11e pins the primitive; G11f pins what save actually does.
+  const box = fs.mkdtempSync(path.join(os.tmpdir(), 'srt-g11e-'))
+  const tokens = path.join(box, 'episode.tokens.json')
+  const stranger = path.join(box, 'episode-2.tokens.json')
+  fs.writeFileSync(tokens, 'OLD REPORT')
+  fs.writeFileSync(stranger, 'SOMEONE ELSE')
+  const moved = displaceExclusive(tokens, '.tokens.json')
+  check('G11e the canonical name is now free', !fs.existsSync(tokens))
+  check('G11e the stranger at -2 was not overwritten', fs.readFileSync(stranger, 'utf-8') === 'SOMEONE ELSE')
+  check('G11e the old report still exists under a stepped name', !!moved && fs.existsSync(moved), String(moved))
+  check('G11e and it still holds the old bytes', !!moved && fs.readFileSync(moved, 'utf-8') === 'OLD REPORT')
+  check('G11e a missing file displaces nothing', displaceExclusive(path.join(box, 'absent.console.log'), '.console.log') === null)
+  fs.rmSync(box, { recursive: true, force: true })
+
+  section('G11f — leftover canonicals are reported, not renamed')
+  // SOL-12 / SOL-15 / SOL-17. After a real translation save, names this run did not write that
+  // still sit at the canonical path must be listed, and the files themselves must not move.
+  const nest = fs.mkdtempSync(path.join(os.tmpdir(), 'srt-g11f-'))
+  const saved = path.join(nest, 'episode.srt')
+  const oldTokens = path.join(nest, 'episode.tokens.json')
+  const newProgress = path.join(nest, 'episode.progress.log')
+  const steppedThoughts = path.join(nest, 'episode-2.thoughts.log')
+  fs.writeFileSync(oldTokens, 'OLD TOKENS')
+  fs.writeFileSync(newProgress, 'THIS RUN')
+  fs.writeFileSync(steppedThoughts, 'STEPPED')
+  const leftover = leftoverCanonicals(saved, [newProgress, steppedThoughts])
+  check(
+    'G11f a type this run did not write is leftover',
+    leftover.includes(oldTokens),
+    leftover.join(' ')
+  )
+  check('G11f a canonical this run DID write is not leftover', !leftover.includes(newProgress))
+  check('G11f a stepped path is not treated as a leftover canonical', !leftover.includes(steppedThoughts))
+  check('G11f and the old file is still at its name', fs.readFileSync(oldTokens, 'utf-8') === 'OLD TOKENS')
+  check(
+    'G11f a missing type is not leftover',
+    !leftoverCanonicals(saved, [newProgress]).some((p) => p.endsWith('.console.log'))
+  )
+  fs.rmSync(nest, { recursive: true, force: true })
+
+  section('G11g — once the child we own has closed, nothing may kill its former number')
+  // SOL-18. Round 5 kept a copy of the PGID and SIGKILLed it three seconds later, even after
+  // `close`. That number is reusable. `waitForChildExit` of an already-reaped child must
+  // resolve immediately and must not escalate — the same contract `forceKillTree` already
+  // keeps by refusing `hasExited`. There is no delayed bare-PGID kill left to call.
+  kills = 0
+  const alreadyGone = spawn(process.execPath, ['-e', 'process.exit(0)'])
+  await new Promise<void>((r) => alreadyGone.once('close', () => r()))
+  const afterClose = Date.now()
+  const afterGone = await waitForChildExit(alreadyGone, { graceMs: 3_000, attempts: 3, kill: countKill })
+  check('G11g a reaped child is reported gone immediately', afterGone === true)
+  check('G11g and it does not sit out a grace period', Date.now() - afterClose < 100)
+  check('G11g and nothing is killed on the strength of its old pid', kills === 0, `kills=${kills}`)
+  check('G11g hasExited is what keeps forceKillTree off that pid', hasExited(alreadyGone))
+
+  section('G11h — a pid is not signalable once Node has reaped the child')
+  // SOL-19. `close` can lag `exit` while stdio drains; the job is still Stop-able in that gap.
+  // `livePid` must refuse as soon as `hasExited`, not wait for `close`.
+  const held = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'])
+  await new Promise((r) => setTimeout(r, 80))
+  check('G11h a live child still has a signalable pid', livePid(held) === held.pid && livePid(held) !== undefined)
+  let closeHadFired = false
+  held.once('close', () => {
+    closeHadFired = true
+  })
+  const atExit = await new Promise<{ live: number | undefined; closeHadFired: boolean }>((resolve) => {
+    held.once('exit', () => resolve({ live: livePid(held), closeHadFired }))
+    held.kill()
+  })
+  check('G11h livePid is gone on exit', atExit.live === undefined)
+  check('G11h because hasExited, not because pid was cleared', hasExited(held) && held.pid !== undefined)
+  // A handle that never declared exitCode is not reaped. `!== null` used to say it was, and Stop
+  // then skipped the tree kill of a still-running engine (the console-log probe's FakeChild).
+  const stub = { pid: 42 } as unknown as import('child_process').ChildProcess
+  check('G11h a missing exitCode is not a reap', !hasExited(stub) && livePid(stub) === 42)
+}
+
+{
+  section('G12 — HTTPS-only external open (SOL-24)')
+  check('G12 https is approved', isHttpsUrl('https://aistudio.google.com/apikey'))
+  check('G12 a trailing path is still https', isHttpsUrl('https://www.imdb.com/title/tt1/'))
+  check('G12 http is not', !isHttpsUrl('http://example.com'))
+  check('G12 file is not', !isHttpsUrl('file:///C:/secret.txt'))
+  check('G12 a custom protocol is not', !isHttpsUrl('myapp:open'))
+  check('G12 javascript is not', !isHttpsUrl('javascript:alert(1)'))
+  check('G12 empty is not', !isHttpsUrl(''))
+  check('G12 malformed is not', !isHttpsUrl('not a url'))
+}
+
 // ── result ─────────────────────────────────────────────────────────────────────
 
 console.log(`\n${passes} passed, ${failures} failed`)
 if (failures > 0) {
   console.log('\nGATE FAILED — do not proceed to the next step until this is green.')
+  process.exit(1)
+}
+if (sectionsRun.length < MIN_GATE_SECTIONS || passes < MIN_GATE_PASSES) {
+  console.log(
+    `\nGATE FAILED — suite too small to count as a pass (${sectionsRun.length} sections, ${passes} passes; need >= ${MIN_GATE_SECTIONS} sections and >= ${MIN_GATE_PASSES} passes).`
+  )
   process.exit(1)
 }
 console.log('\nALL GATES PASSED')

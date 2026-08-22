@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store/useStore'
 import {
   Label,
@@ -19,6 +19,7 @@ import {
 } from '../lib/keyStatus'
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from '../data/languages'
 import { THINKING_LEVELS, SERVICE_TIERS, paidQuotaTooltip, RATE_LIMITS_URL } from '../data/freeTier'
+import { openExternalLink } from '../lib/openExternal'
 import {
   activeKeySlots,
   forgetSlotEvidence,
@@ -41,6 +42,35 @@ import {
 } from '../../electron/shared/types'
 
 const PRICING_URL = 'https://ai.google.dev/gemini-api/docs/pricing'
+
+function ExternalLink({
+  url,
+  className,
+  title,
+  children
+}: {
+  url: string
+  className?: string
+  title?: string
+  children: React.ReactNode
+}): React.JSX.Element {
+  const [err, setErr] = useState('')
+  return (
+    <>
+      <button
+        type="button"
+        className={className}
+        title={title}
+        onClick={() => {
+          void openExternalLink(url).then(setErr)
+        }}
+      >
+        {children}
+      </button>
+      {err ? <span className="ml-1 text-red-600 dark:text-red-400">{err}</span> : null}
+    </>
+  )
+}
 
 /**
  * Slot descriptors for the configured keys, in the shape `shared/keyOrder` ranks.
@@ -72,7 +102,7 @@ function effectivePrimary(settings: AppSettings): { slot: number | null; paid: b
 }
 
 const KEYS_TIP =
-  "Your Gemini API key(s) from Google AI Studio, in priority order. A run passes the two highest-ranked keys to the engine as -k and -k2; any further keys are a reserve pool that is promoted only when a key above becomes invalid. Keys marked invalid by the last check are skipped entirely. Use the eye icon to reveal a key. Set each key's tier (Free / Paid) yourself — Google's API cannot report it — as the primary key's tier controls rate-limiting. Adding a second key is only worth doing if it comes from a DIFFERENT Google Cloud project: free-tier quota is counted per project, not per key, so extra keys from the same project share one pool and buy you no additional throughput — only a spare to fall back on if one key stops working. Get a free key at aistudio.google.com/apikey."
+  "Your Gemini API key(s) from Google AI Studio, in priority order. A translation passes the two highest-ranked keys to the engine as -k and -k2; transcription sends only the primary as -k. Further keys are a reserve pool that is promoted only when a key above becomes invalid. Keys marked invalid by the last check are skipped entirely. Use the eye icon to reveal a key. Set each key's tier (Free / Paid) yourself — Google's API cannot report it — as the primary key's tier controls rate-limiting. Adding a second key is only worth doing if it comes from a DIFFERENT Google Cloud project: free-tier quota is counted per project, not per key, so extra keys from the same project share one pool and buy you no additional throughput — only a spare to fall back on if one key stops working. Get a free key at aistudio.google.com/apikey."
 
 function Eye(): React.JSX.Element {
   return (
@@ -148,12 +178,55 @@ const THEME_OPTIONS = [
 export default function SettingsPage(): React.JSX.Element {
   const settings = useStore((s) => s.settings)
   const patch = useStore((s) => s.patch)
+  const reload = useStore((s) => s.load)
   const [sec, setSec] = useState('languages')
+  // Owned here, not in SectionApiKeys: navigating to Model unmounts that section and used
+  // to drop the in-flight lock while checkApiKeys was still running (SOL-38).
+  const [refreshing, setRefreshing] = useState(false)
+  const [modelCount, setModelCount] = useState<number | null>(null)
+  const [notice, setNotice] = useState('')
+  const refreshGen = useRef(0)
+  const refreshInFlight = useRef(false)
 
   if (!settings) return <div className="p-6 text-sm text-gray-500 dark:text-gray-400">Loading settings…</div>
+  const current = settings
 
   function set<K extends keyof AppSettings>(key: K, value: AppSettings[K]): void {
     void patch({ [key]: value } as Partial<AppSettings>)
+  }
+
+  async function refreshKeys(): Promise<void> {
+    const keys = current.apiKeys.length ? current.apiKeys : ['']
+    if (refreshInFlight.current || !keys.some((k) => k.trim())) return
+    const gen = ++refreshGen.current
+    refreshInFlight.current = true
+    setRefreshing(true)
+    setModelCount(null)
+    setNotice('')
+    try {
+      const res = await window.api.checkApiKeys(keys)
+      if (gen !== refreshGen.current) return
+      // The main process has already persisted validity, the model cache and any model
+      // change the Step 4a rules made. Re-read rather than writing the same values back:
+      // a second write here would race the rules and could resurrect the old selection.
+      await reload()
+      if (gen !== refreshGen.current) return
+      // Report a count only for a refresh that was actually persisted. An incomplete
+      // refresh keeps the previous list, so quoting the number it happened to return
+      // would claim a fetch succeeded when the picker did not change. A DISCARDED result
+      // is the same situation arrived at differently: the fetch may have been complete,
+      // but it described keys that are no longer the ones on screen.
+      const persisted =
+        !res.discarded &&
+        (res.refreshOutcome === 'allComplete' || res.refreshOutcome === 'activeComplete')
+      setModelCount(persisted ? res.models.length : null)
+      setNotice(res.notice)
+    } finally {
+      if (gen === refreshGen.current) {
+        refreshInFlight.current = false
+        setRefreshing(false)
+      }
+    }
   }
 
   return (
@@ -181,7 +254,17 @@ export default function SettingsPage(): React.JSX.Element {
       <div className="min-w-0 flex-1 pt-1">
         {sec === 'appearance' && <SectionAppearance settings={settings} set={set} />}
         {sec === 'languages' && <SectionLanguages settings={settings} set={set} />}
-        {sec === 'api-keys' && <SectionApiKeys settings={settings} set={set} />}
+        {sec === 'api-keys' && (
+          <SectionApiKeys
+            settings={settings}
+            set={set}
+            refreshing={refreshing}
+            modelCount={modelCount}
+            notice={notice}
+            onRefresh={refreshKeys}
+            onCountReset={() => setModelCount(null)}
+          />
+        )}
         {sec === 'model' && <SectionModel settings={settings} set={set} />}
         {sec === 'service' && <SectionService settings={settings} set={set} />}
         {sec === 'tmdb' && <SectionTmdb settings={settings} set={set} />}
@@ -272,8 +355,10 @@ function RoleBadge({ role }: { role: KeyRole | undefined }): React.JSX.Element |
       className={`w-24 flex-shrink-0 rounded-full px-2 py-0.5 text-center text-[11px] font-semibold ${tone}`}
       title={
         role === 'reserve'
-          ? 'Held in reserve. Each run passes only two keys to the engine, so this one is used only if a key above it becomes invalid.'
-          : 'This key will be passed to the engine on the next run.'
+          ? 'Held in reserve. Translation passes two keys and transcription one, so this one is used only if a key above it becomes invalid.'
+          : role === 'fallback'
+            ? 'Passed as -k2 on the next translation. Transcription sends only the primary.'
+            : 'Passed as -k on the next translation or transcription.'
       }
     >
       {ROLE_LABEL[role]}
@@ -281,16 +366,28 @@ function RoleBadge({ role }: { role: KeyRole | undefined }): React.JSX.Element |
   )
 }
 
-function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
-  const reload = useStore((s) => s.load)
+interface SectionApiKeysProps extends SectionProps {
+  refreshing: boolean
+  modelCount: number | null
+  notice: string
+  onRefresh: () => Promise<void>
+  onCountReset: () => void
+}
+
+function SectionApiKeys({
+  settings,
+  set,
+  refreshing,
+  modelCount,
+  notice,
+  onRefresh,
+  onCountReset
+}: SectionApiKeysProps): React.JSX.Element {
   const updatedAt = useStore((s) => s.modelsUpdatedAt)
-  const [refreshing, setRefreshing] = useState(false)
-  const [modelCount, setModelCount] = useState<number | null>(null)
-  const [notice, setNotice] = useState('')
+  const [revealed, setRevealed] = useState<Record<number, boolean>>({})
   // Which slots could not be checked is no longer local state: it is read from the same
   // persisted verdict the ✗/? marks use, so the summary cannot disagree with the marks — which
   // is precisely how MAN-4's two contradictory sentences came to be shown side by side.
-  const [revealed, setRevealed] = useState<Record<number, boolean>>({})
   const keys = settings.apiKeys.length ? settings.apiKeys : ['']
   const tiers = keys.map((_, i) => settings.apiKeyTiers?.[i] ?? 'free')
   const valids = keys.map((_, i) => settings.apiKeyValid?.[i] ?? null)
@@ -323,7 +420,7 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
     // evidence came from a different key. Left alone, the pre-spawn guard would keep
     // treating it as positive proof for a key it has never seen.
     set('cachedModels', forgetSlotEvidence(settings.cachedModels ?? [], i))
-    setModelCount(null)
+    onCountReset()
   }
   function setTier(i: number, val: string): void {
     const next = [...tiers]
@@ -349,32 +446,15 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
     // Removing a slot renumbers every slot above it, so stored availability evidence has
     // to follow the keys it came from or it starts describing the wrong ones.
     set('cachedModels', reindexEvidenceAfterRemoval(settings.cachedModels ?? [], i))
-  }
-
-  async function refresh(): Promise<void> {
-    if (!keys.some((k) => k.trim())) return
-    setRefreshing(true)
-    setModelCount(null)
-    setNotice('')
-    try {
-      const res = await window.api.checkApiKeys(keys)
-      // The main process has already persisted validity, the model cache and any model
-      // change the Step 4a rules made. Re-read rather than writing the same values back:
-      // a second write here would race the rules and could resurrect the old selection.
-      await reload()
-      // Report a count only for a refresh that was actually persisted. An incomplete
-      // refresh keeps the previous list, so quoting the number it happened to return
-      // would claim a fetch succeeded when the picker did not change. A DISCARDED result
-      // is the same situation arrived at differently: the fetch may have been complete,
-      // but it described keys that are no longer the ones on screen.
-      const persisted =
-        !res.discarded &&
-        (res.refreshOutcome === 'allComplete' || res.refreshOutcome === 'activeComplete')
-      setModelCount(persisted ? res.models.length : null)
-      setNotice(res.notice)
-    } finally {
-      setRefreshing(false)
-    }
+    setRevealed((r) => {
+      const next: Record<number, boolean> = {}
+      for (const key of Object.keys(r)) {
+        const idx = Number(key)
+        if (idx === i || !r[idx]) continue
+        next[idx > i ? idx - 1 : idx] = true
+      }
+      return next
+    })
   }
 
   // Counting moved into `src/lib/keyStatus.ts`, where it can be gated: every one of MAN-4's
@@ -401,11 +481,12 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
       <div>
         <Label tip={KEYS_TIP}>API Keys (up to 5)</Label>
         <p className="mb-2 text-xs text-gray-500 dark:text-gray-400">
-          Each run passes exactly <strong>two</strong> keys to the engine — a primary
+          A translation passes exactly <strong>two</strong> keys to the engine — a primary
           (&#8209;k) and one fallback (&#8209;k2) it switches to when the primary hits its
-          quota. Extra keys are a <strong>reserve pool</strong>: they are not used during a
-          run, but are promoted automatically when a key above them turns out to be
-          invalid. Keys are ranked below in the order they will actually be used.
+          quota. Transcription sends only the primary. Extra keys are a{' '}
+          <strong>reserve pool</strong>: they are not used during a run, but are promoted
+          automatically when a key above them turns out to be invalid. Keys are ranked below
+          in the order they will actually be used.
         </p>
         <div className="space-y-2">
           {keys.map((k, i) => (
@@ -475,11 +556,11 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
       <Divider />
 
       <div>
-        <Label tip="Validates every saved API key individually (each gets a ✓ or ✗ next to it) and retrieves the model list from EVERY valid key, not just the first. The Model dropdown offers the combined list; a model that only some of your keys can see is marked, because a run may switch between your two active keys. New models Google releases show up here automatically, and the list is cached so it loads instantly next time. Run this after entering your keys. (Tier is set per key above — Google's API can't report it automatically.)">
+        <Label tip="Validates every saved API key individually (each gets a ✓ or ✗ next to it) and retrieves the model list from EVERY valid key, not just the first. The Model dropdown offers the combined list; a model that only some of your keys can see is marked, because a translation may switch between your two active keys, while transcription uses only the primary. New models Google releases show up here automatically, and the list is cached so it loads instantly next time. Run this after entering your keys. (Tier is set per key above — Google's API can't report it automatically.)">
           Fetch Models &amp; Check API Keys
         </Label>
         <div className="flex flex-wrap items-center gap-3">
-          <Button variant="secondary" onClick={refresh} disabled={refreshing || !keys.some((k) => k.trim())}>
+          <Button variant="secondary" onClick={() => void onRefresh()} disabled={refreshing || !keys.some((k) => k.trim())}>
             {refreshing ? 'Checking…' : 'Fetch Models & Check API Keys'}
           </Button>
           <span
@@ -494,14 +575,13 @@ function SectionApiKeys({ settings, set }: SectionProps): React.JSX.Element {
               ? 'Primary key tier: —'
               : `Primary key tier (Key ${primarySlot + 1}): ${tierLabel}`}
           </span>
-          <button
-            type="button"
-            onClick={() => void window.api.openExternal(RATE_LIMITS_URL)}
+          <ExternalLink
+            url={RATE_LIMITS_URL}
             className="text-xs font-medium text-brand hover:underline"
             title="Google's live rate-limit table — the authoritative source. Any figure shown in this app is a rounded approximation and can go out of date."
           >
             View current rate limits ↗
-          </button>
+          </ExternalLink>
           {updatedAt && (
             <span className="text-xs text-gray-500 dark:text-gray-400">
               Last updated: {new Date(updatedAt).toLocaleString()}
@@ -631,13 +711,9 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
             Cost varies enormously by tier — a pro model can cost more than ten times a
             flash-lite one for the same file, and a newer model is not automatically
             cheaper.{' '}
-            <button
-              type="button"
-              onClick={() => void window.api.openExternal(PRICING_URL)}
-              className="font-medium text-brand hover:underline"
-            >
+            <ExternalLink url={PRICING_URL} className="font-medium text-brand hover:underline">
               Current pricing ↗
-            </button>
+            </ExternalLink>
           </p>
           {!verifiedAny && (
             <p className="text-amber-600 dark:text-amber-400">

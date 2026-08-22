@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Button, Select, TextInput, Pill, Label } from './ui'
+import { openExternalLink } from '../lib/openExternal'
 import type { TmdbResult, TmdbDetails } from '../../electron/shared/types'
 
 function yearRange(d: TmdbDetails): string {
@@ -35,6 +36,8 @@ export function TmdbSearch({
   const [detail, setDetail] = useState<TmdbDetails | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  /** Launch failures from TMDB/IMDb badges — not search/detail errors (SOL-28). */
+  const [linkError, setLinkError] = useState('')
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Debounced autocomplete as the user types.
@@ -61,6 +64,7 @@ export function TmdbSearch({
     if (!query.trim()) return
     setLoading(true)
     setError('')
+    setLinkError('')
     setResults([])
     setShowSuggest(false)
     try {
@@ -81,6 +85,7 @@ export function TmdbSearch({
     setShowSuggest(false)
     setLoading(true)
     setError('')
+    setLinkError('')
     try {
       const d = await window.api.tmdbCast(r.id, r.mediaType)
       setDetail(d)
@@ -104,6 +109,7 @@ export function TmdbSearch({
     setSelected(null)
     setDetail(null)
     setQuery('')
+    setLinkError('')
   }
 
   const headerYear = detail?.yearStart || selected?.year
@@ -196,6 +202,7 @@ export function TmdbSearch({
           )}
 
           {error && <p className="text-xs text-red-500 dark:text-red-400">{error}</p>}
+          {linkError && <p className="text-xs text-red-500 dark:text-red-400">{linkError}</p>}
 
           {/* Full results list (from the Search button) */}
           {!selected && results.length > 0 && (
@@ -213,7 +220,9 @@ export function TmdbSearch({
                       {r.type} · {r.year}
                     </div>
                     <div className="mt-1">
-                      <Badge href={tmdbUrl(r.mediaType, r.id)}>TMDB #{r.id}</Badge>
+                      <Badge href={tmdbUrl(r.mediaType, r.id)} onLink={setLinkError}>
+                        TMDB #{r.id}
+                      </Badge>
                     </div>
                   </div>
                 </button>
@@ -235,10 +244,17 @@ export function TmdbSearch({
                       : `${selected.type} · ${selected.year}`}
                 </div>
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                  <Badge href={tmdbUrl(detail?.mediaType ?? selected.mediaType, detail?.tmdbId || selected.id)}>
+                  <Badge
+                    href={tmdbUrl(detail?.mediaType ?? selected.mediaType, detail?.tmdbId || selected.id)}
+                    onLink={setLinkError}
+                  >
                     TMDB #{detail?.tmdbId || selected.id}
                   </Badge>
-                  {detail?.imdbId && <Badge href={imdbUrl(detail.imdbId)}>IMDb {detail.imdbId}</Badge>}
+                  {detail?.imdbId && (
+                    <Badge href={imdbUrl(detail.imdbId)} onLink={setLinkError}>
+                      IMDb {detail.imdbId}
+                    </Badge>
+                  )}
                 </div>
               </div>
               <button
@@ -307,7 +323,15 @@ function Poster({ src, large }: { src: string | null; large?: boolean }): React.
   )
 }
 
-function Badge({ children, href }: { children: React.ReactNode; href?: string }): React.JSX.Element {
+function Badge({
+  children,
+  href,
+  onLink
+}: {
+  children: React.ReactNode
+  href?: string
+  onLink?: (msg: string) => void
+}): React.JSX.Element {
   const cls =
     'rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300'
   if (href) {
@@ -317,7 +341,9 @@ function Badge({ children, href }: { children: React.ReactNode; href?: string })
         onClick={(e) => {
           e.preventDefault()
           e.stopPropagation()
-          window.api.openExternal(href)
+          void openExternalLink(href).then((err) => {
+            onLink?.(err)
+          })
         }}
         className={`${cls} hover:bg-gray-200 hover:text-brand hover:underline dark:hover:bg-gray-600`}
       >

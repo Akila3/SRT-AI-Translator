@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useRef } from 'react'
 import { useStore } from '../store/useStore'
 import {
   Box,
@@ -43,6 +43,7 @@ export default function TranscribePage(): React.JSX.Element {
    * would quietly under-report every conversion.
    */
   const [convert, setConvert] = useState<{ pct: number | null; startedAt: number } | null>(null)
+  const startOwned = useRef(false)
 
   useEffect(() => {
     if (mediaFile && !outputFile) {
@@ -88,6 +89,7 @@ export default function TranscribePage(): React.JSX.Element {
   }
 
   async function handleStart(): Promise<void> {
+    if (startOwned.current) return
     setStartError('')
     if (!settings) return
     if (!mediaFile) {
@@ -103,24 +105,29 @@ export default function TranscribePage(): React.JSX.Element {
       )
       return
     }
-    const args: TranscribeArgs = {
-      mediaFile,
-      outputFile: outputFile || mediaFile.replace(/\.[^.]+$/, '') + '.srt',
-      targetLang: '',
-      model: settings.model,
-      apiKeys: settings.apiKeys,
-      thinkingLevel: settings.thinkingLevel,
-      thinkingBudget: settings.thinkingBudget,
-      customGenerationParams: settings.customGenerationParams,
-      temperature: settings.temperature,
-      topP: settings.topP,
-      topK: settings.topK,
-      description: description || undefined,
-      ffmpegPath: settings.ffmpegPath || undefined
+    startOwned.current = true
+    try {
+      const args: TranscribeArgs = {
+        mediaFile,
+        outputFile: outputFile || mediaFile.replace(/\.[^.]+$/, '') + '.srt',
+        targetLang: '',
+        model: settings.model,
+        apiKeys: settings.apiKeys,
+        thinkingLevel: settings.thinkingLevel,
+        thinkingBudget: settings.thinkingBudget,
+        customGenerationParams: settings.customGenerationParams,
+        temperature: settings.temperature,
+        topP: settings.topP,
+        topK: settings.topK,
+        description: description || undefined,
+        ffmpegPath: settings.ffmpegPath || undefined
+      }
+      setRunStartedAt(Date.now())
+      setConvert(null)
+      await start((runId) => window.api.startTranscribe({ ...args, runId }))
+    } finally {
+      startOwned.current = false
     }
-    setRunStartedAt(Date.now())
-    setConvert(null)
-    await start(() => window.api.startTranscribe(args))
   }
 
   return (
@@ -170,7 +177,12 @@ export default function TranscribePage(): React.JSX.Element {
               value={outputFile}
               placeholder="Output .srt path"
               onPick={async () => {
-                const p = await window.api.saveFile({ defaultName: outputFile || 'transcription.srt' })
+                // Destination picker only: no source file. dialog:saveFile must not copy, rename
+                // or displace anything on this path (SOL-17). Transcription writes straight to
+                // the chosen file later.
+                const { path: p } = await window.api.saveFile({
+                  defaultName: outputFile || 'transcription.srt'
+                })
                 if (p) setOutputFile(p)
               }}
               onClear={() => setOutputFile('')}
@@ -230,11 +242,25 @@ export default function TranscribePage(): React.JSX.Element {
         {startError && <p className="mb-3 text-sm text-red-600 dark:text-red-400">{startError}</p>}
         <div className="flex items-center gap-2">
           {!isRunning ? (
-            <Button onClick={handleStart} disabled={!mediaFile || !caps.supportsTranscription}>
+            <Button
+              key="run-start"
+              onClick={(e) => {
+                if (e.detail > 1) return
+                void handleStart()
+              }}
+              disabled={!mediaFile || !caps.supportsTranscription}
+            >
               Start Transcription
             </Button>
           ) : (
-            <Button variant="danger" onClick={stop}>
+            <Button
+              key="run-stop"
+              variant="danger"
+              onClick={(e) => {
+                if (e.detail > 1) return
+                void stop()
+              }}
+            >
               Stop
             </Button>
           )}
@@ -303,11 +329,18 @@ export default function TranscribePage(): React.JSX.Element {
                 Process ended with an error (exit code {state.exitCode}). Check the log above.
               </p>
             )}
-            {/* A run the user ended is not a failure — see MAN-1. */}
+            {/*
+              A run the user ended is not a failure — see MAN-1. Transcription writes straight
+              to the chosen path, so a Stop can leave a partial file there (SOL-41). Translate's
+              output stays temporary until Save; that page's "Nothing was saved" is accurate.
+            */}
             {state.status === 'stopped' && (
               <div className="flex items-center gap-2">
                 <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                  Stopped. Nothing was saved.
+                  Stopped.
+                  {state.outputPath || outputFile
+                    ? ` A partial transcription may already be at ${state.outputPath || outputFile}.`
+                    : ' Nothing was written.'}
                 </p>
                 <Button variant="ghost" onClick={reset}>
                   New

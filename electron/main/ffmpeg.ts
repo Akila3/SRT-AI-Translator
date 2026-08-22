@@ -1,8 +1,9 @@
-import { spawn } from 'child_process'
+import { spawn, type ChildProcess } from 'child_process'
 import { app } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import { normalizeTrackLang } from '../shared/languages'
+import { waitForChildExit } from './processExit'
 import { durationFromProbe, percentOf, readProgressChunk } from '../shared/ffmpegProgress'
 import type { SubtitleTrack } from '../shared/types'
 
@@ -14,7 +15,7 @@ const EXE = process.platform === 'win32' ? '.exe' : ''
  *   2. A copy bundled next to the app (resources/bin) — fully portable
  *   3. The system PATH (developer machines / users who have FFmpeg installed)
  */
-function bundledBinDir(): string {
+export function bundledBinDir(): string {
   return app.isPackaged
     ? path.join(process.resourcesPath, 'bin')
     : path.join(app.getAppPath(), 'resources', 'bin')
@@ -44,25 +45,47 @@ export function ffmpegPathDirs(ffmpegPath?: string): string[] {
 }
 
 /**
- * Build a child-process env with the resolved ffmpeg dir(s) APPENDED to PATH.
- * We append (not prepend) on purpose: the bundled bin dir also contains gst.exe,
- * and prepending it would shadow the intended `gst` (e.g. the pip install in dev)
- * — which broke non-UTF-8 output. Appending keeps the right gst while still
- * making ffmpeg discoverable for gst's internal calls.
+ * Build a child-process env with the resolved ffmpeg dir(s) PREPENDED to PATH.
+ *
+ * Prepending is the whole point, and getting here took two rounds. `gst` shells out to a bare
+ * `ffmpeg`, so PATH order is what decides which one the engine uses — and this used to APPEND,
+ * which meant any system install earlier on PATH beat both the bundled copy and the user's explicit
+ * Settings override. The documented priority was therefore true only of the app's own calls, which
+ * go through `resolveTool()` and are absolute (validator finding SOL-06).
+ *
+ * The reason it appended was real: the bundled directory holds `gst.exe` as well as `ffmpeg.exe`, so
+ * prepending it in development would have shadowed a developer's pip-installed engine. That is now
+ * fixed at the source instead of worked around here — `resolveGstBin()` resolves the engine to an
+ * ABSOLUTE path in both modes, and an absolute path is not affected by PATH at all. So there is no
+ * longer a second question for this ordering to get wrong.
  */
 export function envWithFfmpeg(ffmpegPath?: string, extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const dirs = ffmpegPathDirs(ffmpegPath)
   const sep = process.platform === 'win32' ? ';' : ':'
   const base = process.env.PATH ?? process.env.Path ?? ''
-  const PATH = dirs.length ? [base, ...dirs].join(sep) : base
+  const PATH = [...dirs, base].filter(Boolean).join(sep)
   return { ...process.env, ...extra, PATH }
 }
 
 function execCapture(
   cmd: string,
   args: string[],
-  opts?: { signal?: AbortSignal; onStdout?: (chunk: string) => void }
-): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  opts?: {
+    signal?: AbortSignal
+    onStdout?: (chunk: string) => void
+    /** Called the moment the child exists, so a job can own it before this promise settles. */
+    onChild?: (child: ChildProcess) => void
+  }
+): Promise<{
+  code: number | null
+  stdout: string
+  stderr: string
+  /** Set when the child was cancelled and outlived an escalated kill. */
+  orphaned?: boolean
+  orphanPid?: number
+  /** The surviving child itself — a pid is reusable, this is not (SOL-16). */
+  orphan?: ChildProcess
+}> {
   return new Promise((resolve) => {
     let stdout = ''
     let stderr = ''
@@ -73,14 +96,40 @@ function execCapture(
       resolve({ code: -1, stdout: '', stderr: (err as Error).message })
       return
     }
-    proc.stdout.on('data', (d) => {
+    const child = proc
+    opts?.onChild?.(child)
+    child.stdout.on('data', (d) => {
       const text = d.toString()
       stdout += text
       opts?.onStdout?.(text)
     })
-    proc.stderr.on('data', (d) => (stderr += d.toString()))
-    proc.on('error', (err) => resolve({ code: -1, stdout, stderr: err.message }))
-    proc.on('close', (code) => resolve({ code, stdout, stderr }))
+    child.stderr.on('data', (d) => (stderr += d.toString()))
+    child.on('error', (err) => {
+      // An ABORT arrives here, and it arrives when Node asks the child to die — not when it does.
+      // Resolving now hands the caller a finished-looking result while ffmpeg or ffprobe is still
+      // running, and for the audio conversion that caller then releases the job slot, so the next
+      // start runs alongside a process the app has stopped tracking (validator finding SOL-02).
+      // `close` is the witness, so the abort path waits for it and only gives up if the child
+      // survives an escalated kill.
+      if (opts?.signal?.aborted) {
+        // The boolean is the answer, not a diagnostic. Discarding it — which the first version of
+        // this did — released the caller as though the kill had worked even when the child survived
+        // escalation, and for the audio conversion that caller then releases the job slot (SOL-02).
+        void waitForChildExit(child).then((gone) =>
+          resolve({
+            code: -1,
+            stdout,
+            stderr: err.message,
+            orphaned: !gone,
+            orphanPid: gone ? undefined : child.pid,
+            orphan: gone ? undefined : child
+          })
+        )
+        return
+      }
+      resolve({ code: -1, stdout, stderr: err.message })
+    })
+    child.on('close', (code) => resolve({ code, stdout, stderr }))
   })
 }
 
@@ -108,7 +157,8 @@ export type ProgressReporter = (pct: number | null, elapsedMs: number) => void
 export async function probeDuration(
   filePath: string,
   ffmpegPath?: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onChild?: (child: ChildProcess) => void
 ): Promise<number | null> {
   const ffprobe = resolveTool('ffprobe', ffmpegPath)
   const { stdout } = await execCapture(
@@ -119,7 +169,7 @@ export async function probeDuration(
       '-of', 'default=noprint_wrappers=1:nokey=1',
       filePath
     ],
-    { signal }
+    { signal, onChild }
   )
   return durationFromProbe(stdout)
 }
@@ -144,10 +194,18 @@ async function execFfmpeg(
     ffmpegPath?: string
     signal?: AbortSignal
     onProgress?: ProgressReporter
+    onChild?: (child: ChildProcess) => void
   }
-): Promise<{ code: number | null; stdout: string; stderr: string }> {
+): Promise<{
+  code: number | null
+  stdout: string
+  stderr: string
+  orphaned?: boolean
+  orphanPid?: number
+  orphan?: ChildProcess
+}> {
   const { onProgress } = opts
-  if (!onProgress) return execCapture(ffmpeg, args, { signal: opts.signal })
+  if (!onProgress) return execCapture(ffmpeg, args, { signal: opts.signal, onChild: opts.onChild })
 
   const startedAt = Date.now()
   // The signal goes to the probe as well as to the work. Without it a Stop pressed during
@@ -155,7 +213,7 @@ async function execFfmpeg(
   // finished of its own accord, which on a stalled network path may be never, and the job
   // slot stays held for all of it (validator finding FP6-01). The check stays as well — an
   // abort makes the probe resolve, and resolving must not then start the conversion.
-  const duration = await probeDuration(opts.source, opts.ffmpegPath, opts.signal)
+  const duration = await probeDuration(opts.source, opts.ffmpegPath, opts.signal, opts.onChild)
   if (opts.signal?.aborted) return { code: -1, stdout: '', stderr: 'Aborted.' }
 
   // Only whole lines are ever parsed. A pipe read can end mid-number, and `out_time_us=1000`
@@ -166,6 +224,7 @@ async function execFfmpeg(
   const withProgress = ['-progress', 'pipe:1', '-nostats', ...args]
   return execCapture(ffmpeg, withProgress, {
     signal: opts.signal,
+    onChild: opts.onChild,
     onStdout: (chunk) => {
       carry += chunk
       const lastBreak = carry.lastIndexOf('\n')
@@ -234,10 +293,17 @@ export async function convertAudioToMp3(
   outPath: string,
   ffmpegPath?: string,
   signal?: AbortSignal,
-  onProgress?: ProgressReporter
-): Promise<{ ok: boolean; error?: string }> {
+  onProgress?: ProgressReporter,
+  onChild?: (child: ChildProcess) => void
+): Promise<{
+  ok: boolean
+  error?: string
+  orphaned?: boolean
+  orphanPid?: number
+  orphan?: ChildProcess
+}> {
   const ffmpeg = resolveTool('ffmpeg', ffmpegPath)
-  const { code, stderr } = await execFfmpeg(
+  const { code, stderr, orphaned, orphanPid, orphan } = await execFfmpeg(
     ffmpeg,
     [
       '-y', '-i', inputPath,
@@ -245,7 +311,7 @@ export async function convertAudioToMp3(
       '-ac', '1', '-ar', '22050', '-c:a', 'libmp3lame', '-b:a', '64k',
       outPath
     ],
-    { source: inputPath, ffmpegPath, signal, onProgress }
+    { source: inputPath, ffmpegPath, signal, onProgress, onChild }
   )
   if (code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) return { ok: true }
 
@@ -257,7 +323,10 @@ export async function convertAudioToMp3(
     /* best effort */
   }
   const detail = stderr.trim().split(/\r?\n/).slice(-3).join(' ').trim()
-  return { ok: false, error: detail || `ffmpeg exited with code ${code}` }
+  // `orphaned` travels with the failure because it is a statement about a PROCESS, not about the
+  // conversion: a cancelled conversion whose ffmpeg outlived its kill must not let the caller
+  // release the job slot (SOL-02).
+  return { ok: false, error: detail || `ffmpeg exited with code ${code}`, orphaned, orphanPid, orphan }
 }
 
 /**

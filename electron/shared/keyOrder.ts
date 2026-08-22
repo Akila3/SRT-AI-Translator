@@ -23,19 +23,23 @@ export interface KeySlot {
   tier: string
 }
 
-/** The engine accepts exactly two keys: `-k` (primary) and `-k2` (fallback). */
+/**
+ * Translation emits two keys (`-k` / `-k2`). Transcription emits only the primary.
+ * This constant is the translation/active-set size; a spawn that cannot switch must
+ * slice the ranked list to 1 itself (SOL-23).
+ */
 export const ACTIVE_SET_SIZE = 2
 
 /**
  * Rank slots so a known-valid key is always primary: valid first, unchecked next,
- * known-invalid dropped entirely — unless nothing else is available, in which case the
- * full list is ranked as a last resort. Ties keep the caller's original order.
+ * known-invalid dropped entirely. An all-rejected set is empty — a start must refuse
+ * rather than resurrect credentials the API already refused (SOL-30). Ties keep the
+ * caller's original order.
  */
-export function orderKeySlots(slots: KeySlot[]): number[] {
+export function orderKeySlots(slots: readonly KeySlot[]): number[] {
   const rank = (v: boolean | null): number => (v === true ? 0 : v === null ? 1 : 2)
-  const usable = slots.filter((s) => s.valid !== false)
-  const pool = usable.length ? usable : slots
-  return pool
+  return slots
+    .filter((s) => s.valid !== false)
     .map((slot, position) => ({ slot, position }))
     .sort((a, b) => rank(a.slot.valid) - rank(b.slot.valid) || a.position - b.position)
     .map((e) => e.slot.index)

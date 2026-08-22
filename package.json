@@ -60,6 +60,9 @@
         ]
       }
     ],
+    "beforePack": "./scripts/electron-builder-beforePack.cjs",
+    "afterPack": "./scripts/electron-builder-afterPack.cjs",
+    "afterAllArtifactBuild": "./scripts/electron-builder-afterAllArtifactBuild.cjs",
     "asar": true,
     "win": {
       "target": [

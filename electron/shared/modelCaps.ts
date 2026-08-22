@@ -87,9 +87,18 @@ const SAMPLING_DEPRECATED_FROM = { major: 3, minor: 5 }
  */
 const SAMPLING_EXEMPT_AT_BOUNDARY = ['gemini-3.5-flash']
 
-/** First `major.minor` in the id, or null when it carries no version at all. */
+/**
+ * Version taken from the canonical Gemini id grammar, or null when the whole id is
+ * unrecognised.
+ *
+ * Sampling is withheld for anything unrecognised, so this must not pick a `major.minor`
+ * out of an otherwise unknown name (`gemini-experimental-2.5-flash` is not a 2.5 model
+ * we have classified). The optional `models/` prefix is the API's own spelling of the
+ * same id, not a different one. Thinking/transcription still use substring matching —
+ * that is the engine's grammar, and this function is not it.
+ */
 function modelVersion(model: string): { major: number; minor: number } | null {
-  const m = model.match(/(\d+)\.(\d+)/)
+  const m = model.match(/^(?:models\/)?gemini-(\d+)\.(\d+)(?:-[a-z0-9]+)*$/)
   return m ? { major: parseInt(m[1], 10), minor: parseInt(m[2], 10) } : null
 }
 

@@ -14,13 +14,18 @@
  *    contained one of four ids; M4 removes only the offending entries.
  *  - Idempotent throughout, because electron-store gives no cross-key transaction: a
  *    crash between the write and the version bump must be harmless on the next launch.
- *  - Malformed data is left untouched and noted rather than "repaired", and the version
- *    still bumps, so a bad field can never wedge the app in a migration loop.
+ *  - Versioned steps do not invent a replacement for a malformed field (anti-loop: a bad
+ *    value must never wedge the chain). Runtime sanitisation (`sanitizeSettingsView`) is a
+ *    separate pass: it exposes this build's AppSettings types to every consumer (arrays
+ *    and scalars). Persistable repairs are only lossless coercions (a scalar key becomes
+ *    a one-element array). Unconvertible values stay on disk; the seed list and empty
+ *    slots exist only in the runtime view. A newer build's profile is never written by
+ *    this pass.
  *
  * Kept free of electron-store and electron imports so the gate G1/G1b fixtures can run
  * the real chain rather than a copy of it.
  */
-import type { AppSettings } from '../shared/types'
+import type { AppSettings, ModelInfo } from '../shared/types'
 
 /** Bumped by the step that owns the migration: Steps 5 (1-3) and 3b (4). */
 export const CURRENT_SCHEMA_VERSION = 4
@@ -66,7 +71,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
 }
 
-function readVersion(raw: Record<string, unknown>): number {
+export function readVersion(raw: Record<string, unknown>): number {
   const v = raw.schemaVersion
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0
 }
@@ -253,6 +258,233 @@ export function migrateSettings(
     downgrade: false,
     notes: changed ? notes : [...notes, 'no field changes were required; version bumped only']
   }
+}
+
+/**
+ * Runtime shape repair, not a versioned migration.
+ *
+ * `migrateSettings` certifies a version even when a field was unreadable, so consumers must
+ * not be handed `cachedModels: {}`, `[null]`, or `model: 123` just because the profile is
+ * "current". The `settings` view is this build's AppSettings: iterable arrays, and every
+ * other field overlaid only when its runtime type matches. Persistable repairs are only
+ * lossless (a scalar key or `apiKeyValid: false` becomes a one-element array). Unconvertible
+ * values stay on disk. A newer-schema profile gets the same view wraps without a write.
+ */
+export function sanitizeSettingsView(
+  raw: Record<string, unknown>,
+  fallback: AppSettings
+): {
+  settings: Record<string, unknown>
+  persist: Record<string, unknown>
+  notes: string[]
+  changed: boolean
+} {
+  const from = readVersion(raw)
+  if (from > CURRENT_SCHEMA_VERSION) {
+    return {
+      settings: runtimeSafe(raw, fallback),
+      persist: raw,
+      notes: [],
+      changed: false
+    }
+  }
+
+  const notes: string[] = []
+  const persist: Record<string, unknown> = { ...raw }
+  let changed = false
+
+  const keys = losslessStringList(raw.apiKeys)
+  if (keys.converted) {
+    persist.apiKeys = keys.value
+    changed = true
+    notes.push(keys.note)
+  }
+  const valid = losslessTriStateList(raw.apiKeyValid)
+  if (valid.converted) {
+    persist.apiKeyValid = valid.value
+    changed = true
+    notes.push(valid.note)
+  }
+  const errors = losslessStringList(raw.apiKeyError)
+  if (errors.converted) {
+    persist.apiKeyError = errors.value
+    changed = true
+    notes.push(errors.note)
+  }
+  const tiers = losslessStringList(raw.apiKeyTiers, 'free')
+  if (tiers.converted) {
+    persist.apiKeyTiers = tiers.value
+    changed = true
+    notes.push(tiers.note)
+  }
+  const cached = losslessCachedModels(raw.cachedModels)
+  if (cached.converted) {
+    persist.cachedModels = cached.value
+    changed = true
+    notes.push(cached.note)
+  }
+
+  return {
+    settings: runtimeSafe(persist, fallback),
+    persist,
+    notes,
+    changed
+  }
+}
+
+function losslessStringList(
+  v: unknown,
+  nonStringInArray = ''
+): { converted: boolean; value: string[]; note: string } {
+  if (typeof v === 'string') {
+    return { converted: true, value: [v], note: 'wrapped a scalar string into a one-element array' }
+  }
+  if (!Array.isArray(v)) {
+    return { converted: false, value: [], note: '' }
+  }
+  const value = v.map((x) => (typeof x === 'string' ? x : nonStringInArray))
+  const converted = value.some((x, i) => x !== v[i])
+  return {
+    converted,
+    value,
+    note: converted ? 'coerced non-string array entries' : ''
+  }
+}
+
+function losslessTriStateList(v: unknown): {
+  converted: boolean
+  value: Array<boolean | null>
+  note: string
+} {
+  if (v === true || v === false || v === null) {
+    return {
+      converted: true,
+      value: [v],
+      note: 'wrapped a scalar validity verdict into a one-element array'
+    }
+  }
+  if (!Array.isArray(v)) {
+    return { converted: false, value: [], note: '' }
+  }
+  const value = v.map((x) => (x === true || x === false ? x : null))
+  const converted = value.some((x, i) => x !== v[i])
+  return {
+    converted,
+    value,
+    note: converted ? 'coerced non-tristate validity entries to unchecked' : ''
+  }
+}
+
+function losslessCachedModels(v: unknown): {
+  converted: boolean
+  value: ModelInfo[]
+  note: string
+} {
+  if (!Array.isArray(v)) {
+    return { converted: false, value: [], note: '' }
+  }
+  const kept: ModelInfo[] = []
+  let mutated = false
+  for (const entry of v) {
+    const n = normalizeCachedEntry(entry)
+    if (!n) {
+      mutated = true
+      continue
+    }
+    kept.push(n)
+    if (!cachedEntryEqual(entry, n)) mutated = true
+  }
+  return {
+    converted: mutated,
+    value: kept,
+    note: mutated
+      ? 'normalised cached model entries (dropped unusable ones; live evidence needs an availableOn array)'
+      : ''
+  }
+}
+
+/**
+ * This build's AppSettings, with only values whose runtime type consumers already
+ * assume. Starts from `fallback` so a garbage field (`model: 123`) cannot override a
+ * string and crash every mounted page (SOL-29). Scalar key/validity wraps land in the
+ * view even on a newer-schema profile, without being persisted (SOL-30).
+ */
+function runtimeSafe(raw: Record<string, unknown>, fallback: AppSettings): Record<string, unknown> {
+  const view: Record<string, unknown> = { ...fallback }
+  view.schemaVersion = readVersion(raw)
+
+  const keys = losslessStringList(raw.apiKeys)
+  view.apiKeys = typeof raw.apiKeys === 'string' || Array.isArray(raw.apiKeys) ? keys.value : fallback.apiKeys
+  const valid = losslessTriStateList(raw.apiKeyValid)
+  view.apiKeyValid =
+    raw.apiKeyValid === true || raw.apiKeyValid === false || raw.apiKeyValid === null || Array.isArray(raw.apiKeyValid)
+      ? valid.value
+      : fallback.apiKeyValid
+  const errors = losslessStringList(raw.apiKeyError)
+  view.apiKeyError =
+    typeof raw.apiKeyError === 'string' || Array.isArray(raw.apiKeyError) ? errors.value : fallback.apiKeyError
+  const tiers = losslessStringList(raw.apiKeyTiers, 'free')
+  view.apiKeyTiers =
+    typeof raw.apiKeyTiers === 'string' || Array.isArray(raw.apiKeyTiers) ? tiers.value : fallback.apiKeyTiers
+
+  if (!Array.isArray(raw.cachedModels)) {
+    view.cachedModels = fallback.cachedModels.map((m) => ({ ...m }))
+  } else {
+    view.cachedModels = raw.cachedModels
+      .map(normalizeCachedEntry)
+      .filter((m): m is ModelInfo => m !== null)
+  }
+
+  const skip = new Set([
+    'schemaVersion',
+    'apiKeys',
+    'apiKeyValid',
+    'apiKeyError',
+    'apiKeyTiers',
+    'cachedModels'
+  ])
+  for (const key of Object.keys(fallback) as (keyof AppSettings)[]) {
+    if (skip.has(key)) continue
+    view[key] = overlayField(key, fallback[key], raw[key])
+  }
+  return view
+}
+
+function overlayField(key: keyof AppSettings, fallbackVal: unknown, incoming: unknown): unknown {
+  if (incoming === undefined) return fallbackVal
+  if (key === 'topK') {
+    if (incoming === null) return null
+    return typeof incoming === 'number' && Number.isFinite(incoming) ? incoming : fallbackVal
+  }
+  if (key === 'modelsUpdatedAt') {
+    if (incoming === null) return null
+    return typeof incoming === 'string' ? incoming : fallbackVal
+  }
+  if (typeof fallbackVal === 'string') return typeof incoming === 'string' ? incoming : fallbackVal
+  if (typeof fallbackVal === 'boolean') return typeof incoming === 'boolean' ? incoming : fallbackVal
+  if (typeof fallbackVal === 'number') {
+    return typeof incoming === 'number' && Number.isFinite(incoming) ? incoming : fallbackVal
+  }
+  return fallbackVal
+}
+
+function normalizeCachedEntry(m: unknown): ModelInfo | null {
+  if (!isPlainObject(m) || typeof m.id !== 'string' || !m.id) return null
+  const label = typeof m.label === 'string' && m.label ? m.label : m.id
+  const slots = Array.isArray(m.availableOn)
+    ? m.availableOn.filter((n): n is number => typeof n === 'number' && Number.isFinite(n))
+    : null
+  if (m.source === 'live' && slots) {
+    return { ...m, id: m.id, label, source: 'live', availableOn: slots }
+  }
+  return { ...m, id: m.id, label, source: 'seed', availableOn: [] }
+}
+
+function cachedEntryEqual(raw: unknown, n: ModelInfo): boolean {
+  if (!isPlainObject(raw)) return false
+  if (raw.id !== n.id || raw.label !== n.label || raw.source !== n.source) return false
+  if (!Array.isArray(raw.availableOn) || raw.availableOn.length !== n.availableOn.length) return false
+  return raw.availableOn.every((slot, i) => slot === n.availableOn[i])
 }
 
 /** Convenience for callers that already hold a typed settings object. */

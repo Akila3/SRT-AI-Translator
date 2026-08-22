@@ -121,6 +121,8 @@ export interface CheckKeysResult {
 }
 
 export interface TranslateArgs {
+  /** Minted by the renderer so it can recognise its own events — see `RunId`. */
+  runId?: RunId
   inputFile: string
   videoFile?: string
   audioFile?: string
@@ -151,6 +153,8 @@ export interface TranslateArgs {
 }
 
 export interface TranscribeArgs {
+  /** Minted by the renderer so it can recognise its own events — see `RunId`. */
+  runId?: RunId
   mediaFile: string
   outputFile: string
   targetLang: string
@@ -166,9 +170,27 @@ export interface TranscribeArgs {
   ffmpegPath?: string
 }
 
+/**
+ * Which run an event belongs to.
+ *
+ * Both pages stay mounted for the life of the app (App.tsx keeps them so their inputs survive a
+ * tab switch), and both listen on the SAME two channels — there is one `translate:output` and one
+ * `translate:done` for translation and transcription alike. Nothing addressed those events, so
+ * every runner received every event and a finished run's state was overwritten by the next run of
+ * the other kind: its `outputPath` and `logPaths` were replaced, and Save would then copy the
+ * other run's file under this one's name (validator finding SOL-01).
+ *
+ * The id is minted by the RENDERER, before it asks main to start anything, because output begins
+ * arriving during that call and an id handed back afterwards would come too late to filter it.
+ * Optional in the type only so an older payload cannot fail to compile; every producer sets it.
+ */
+export type RunId = string
+
 export interface ProcOutput {
   stream: 'stdout' | 'stderr'
   line: string
+  /** The run this line came from. A runner ignores anything that is not its own. */
+  runId?: RunId
 }
 
 /**
@@ -243,6 +265,14 @@ export interface ProcDone {
   code: number | null
   outputPath: string
   logPaths?: string[]
+  /**
+   * The run this ending belongs to — see `RunId`.
+   *
+   * It matters most on the path that is easiest to overlook: a start REFUSED because another job
+   * holds the slot also emits a terminal event, and unaddressed that event reached the runner of
+   * the job actually running, telling a healthy run it had failed while its engine carried on.
+   */
+  runId?: RunId
   /** Set only when the app ended the run rather than the engine. Optional: absent is the norm. */
   reason?: TerminalReason
   /**
@@ -251,6 +281,52 @@ export interface ProcDone {
    * them *before* choosing where to put the file. Nothing here ever blocks a save or alters a file.
    */
   warnings?: string[]
+}
+
+/**
+ * What the save dialog resolves to.
+ *
+ * It used to be the subtitle's path alone, and the renderer DERIVED the sidecar names from it. That
+ * stopped being safe once sidecars stopped overwriting strangers' files: an occupied name is stepped,
+ * so the destination is no longer predictable and has to be reported (SOL-12). `path` is `''` when
+ * the user cancelled, exactly as the bare string was.
+ *
+ * Declared HERE rather than in the preload, where it started, so the main-process handler that
+ * produces it is checked against it. While it lived on the renderer side alone, one branch of that
+ * handler was still returning the bare string this type replaced and nothing objected (SOL-15).
+ */
+export interface SaveResult {
+  path: string
+  /** Where the console log actually landed, or '' if there was none to copy. */
+  consolePath: string
+  /**
+   * Where EVERY sidecar actually landed — console, token report, progress, thoughts.
+   *
+   * Reporting only the console left the other three unaccounted for: a stepped
+   * `episode-2.tokens.json` existed and nothing in the app ever mentioned it (SOL-15). With the full
+   * list the panel can say plainly that a report was saved under a different name.
+   */
+  sidecars: string[]
+  /**
+   * Kept for wire compatibility. `dialog:saveFile` no longer moves sidecars (SOL-12/17, round 5);
+   * it always returns `[]`. Leftovers are `stale`.
+   */
+  displaced: string[]
+  /**
+   * Canonical sidecar names that still exist beside the saved subtitle and were NOT written by
+   * this save — an older run's report, or another tool's file of the same name (SOL-12, SOL-15).
+   * They were left untouched; the panel must say so, because their names otherwise look like
+   * they belong to the subtitle just saved.
+   */
+  stale: string[]
+  /**
+   * Why this save is not a clean success (SOL-22).
+   *
+   * Absent on cancel and on a picker-only call (`srcPath` omitted). Set with an empty `path`
+   * when the subtitle itself could not be written. Set *with* a `path` when the subtitle landed
+   * but a requested sidecar did not — the page must still say the report is missing.
+   */
+  error?: string
 }
 
 export interface TmdbResult {

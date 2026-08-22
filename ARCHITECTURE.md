@@ -303,7 +303,7 @@ Rules to preserve when touching `pythonBridge.ts`:
 
 ## IPC surface
 
-Twenty request/response channels plus two push events, registered in `main/ipc.ts`, exposed
+Twenty request/response channels plus three push events, registered in `main/ipc.ts`, exposed
 through the preload bridge and typed in `electron/preload/index.d.ts`.
 
 | `window.api` | Channel | Notes |
@@ -312,8 +312,8 @@ through the preload bridge and typed in `electron/preload/index.d.ts`.
 | `getCachedModels` | `models:getCached` | re-curates, preserving stored provenance |
 | `refreshModels` | `models:refresh` | exposed but unused by the renderer |
 | `checkApiKeys` | `models:checkKeys` | the path Settings actually uses |
-| `openFile` / `openFolder` / `saveFile` | `dialog:*` | `saveFile` also copies log sidecars, matching each by its **full compound suffix** — `path.extname()` sees only the last dot, which would flatten `.progress.log`, `.thoughts.log` and `.console.log` onto one name |
-| `showItemInFolder` / `openExternal` | `shell:*` | |
+| `openFile` / `openFolder` / `saveFile` | `dialog:*` | `saveFile` also copies log sidecars, matching each by its **full compound suffix** — `path.extname()` sees only the last dot, which would flatten `.progress.log`, `.thoughts.log` and `.console.log` onto one name. A missing or failed subtitle copy returns `error` and an empty `path`; a sidecar failure returns `path` plus `error`. |
+| `showItemInFolder` / `openExternal` | `shell:*` | `openExternal` allowlists `https:` only; a valid HTTPS URL the OS cannot open rejects the invoke, and the renderer shows that |
 | `probeTracks` / `extractTrack` / `extractToTemp` | `video:*` | ffprobe / ffmpeg |
 | `tmdbSearch` / `tmdbCast` | `tmdb:*` | |
 | `startTranslate` / `startTranscribe` | `translate:start` / `transcribe:start` | return the output path |
@@ -356,7 +356,7 @@ Notable helpers, and the promise each makes:
 | `readProgressChunk()` / `percentOf()` (`electron/shared/ffmpegProgress.ts`) | Report what ffmpeg said, or nothing. `out_time_ms` is never read — it has carried *microseconds* for years, a bug preserved for compatibility. `N/A` is not zero. The percentage is capped at 99 while the process is alive, because a bar that reads 100% and keeps working is the same complaint in a different costume. |
 | `probeDuration()` (`electron/main/ffmpeg.ts`) | The one `ffprobe` that turns a position into a percentage. It runs *before* the work it measures, so it takes the caller's `AbortSignal` and forwards it: without that, Stop cannot end a job until an unbounded read on an unreachable path finishes by itself. A file that will not state its duration costs a percentage, never an error. |
 | `companionName()` / `extractedTrackName()` (`src/lib/outputName.ts`) | The single definition of what a written file is called: `<source stem>_<suffix><ext>`. A saved translation is named from its source and the target language; an extracted track is named from **its own** language, never the target — which is the same name for a track that happens to match, and a correct one for every other track. An untagged track falls back to its index, and only tracks alike in language *and* type need one, since the extension already separates `.srt` from `.sup`. |
-| `maskCommandLine()` (`electron/shared/maskedCommand.ts`) | The **only** thing permitted to turn an argv array into text. Keys are masked by **position** — the element after `-k`/`-k2` — never by recognising something that looks like a key, because the key that does not look like one is exactly the one that would be printed in full. A value already known to be a secret is then swept from the rest of the line by exact match, so a key pasted into the description field does not come back out. |
+| `maskCommandLine()` (`electron/shared/maskedCommand.ts`) | The **only** thing permitted to turn an argv array into text. Keys are masked by **position** — the element after `-k`/`-k2` — never by recognising something that looks like a key, because the key that does not look like one is exactly the one that would be printed in full. Configured keys that a given run does not emit (transcription's fallback, translation's reserves) are supplied as extra secrets and swept by exact match, so a key pasted into the description field does not come back out. |
 | `createStallWatch()` (`electron/shared/stallBudget.ts`) | Decides when a run has stopped getting anywhere. Counts *absence of novelty*, never repetition; takes the clock as a parameter so the shipped thresholds are testable without a ten-minute test; and returns its verdict exactly once. |
 | `describeEngine()` (`electron/main/pythonBridge.ts`) | Which `gst` will actually run, and whether it is the bundled copy. The same answer feeds the startup console line, every run's command line and Settings > Advanced, so the three cannot disagree. Worth knowing: in a **dev** run this resolves through PATH, where a pip-installed engine can win over `resources/bin` — a packaged build always uses the bundled absolute path. |
 | `classifyFetchFailure()` (`electron/main/modelsList.ts`) / `src/lib/keyStatus.ts` | A key is only ever branded invalid when **the API refused it**. A DNS failure, a timeout, an exhausted quota and an error we do not recognise all mean *unchecked* — which is persisted as `null`, not `false`, because a false rejection silently demotes a working key at spawn time. `keyStatus.ts` owns every sentence the panel says about a check, since the failure mode here is wording rather than logic. |
@@ -371,7 +371,7 @@ any function signature.
 |---|---|---|
 | `modelNeedsVerification` | `boolean` on settings. Set when a stored model id looks suspicious but is unproven | **Yes.** Advisory only — it must never authorise a reset. Cleared by the first complete refresh that finds the id |
 | `refreshOutcome` | `allComplete` / `activeComplete` / `partial` / `failed` | **No.** It describes one fetch attempt, not stored state. Persisting it would let a stale outcome authorise a later reset |
-| The **active set** | The ranked key slots truncated to two, exactly matching what the argument builder emits as `-k` / `-k2` | Derived, never stored |
+| The **active set** | The ranked key slots truncated to two, matching what **translation** emits as `-k` / `-k2`. Transcription spawn slices the same ranked list to **one** and does not change this definition. | Derived, never stored |
 
 The active set has one property worth stating explicitly, because assuming otherwise breaks the most
 common setup: **its size comes from the ranked list, not from how many slots are configured.** The
@@ -399,7 +399,7 @@ already imports both, so it supplies the check and the bridge stays unaware of w
 
 | Question | Answer |
 |---|---|
-| How many API keys? | **Exactly two** per run. The engine toggles between `-k` and `-k2` only; further keys exist in this app as ranked reserves. |
+| How many API keys? | **Translation: exactly two** per run (`-k` and `-k2`). **Transcription: only `-k`.** Further keys exist in this app as ranked reserves and are not sent during a run. |
 | Are temperature / top-p / top-k optional? | Yes — all default to unset, meaning model defaults. |
 | Trap when sending them | The CLI tests truthiness, so a literal **`0`** is silently dropped. |
 | Is there a model whitelist? | **No.** The list is whatever the key can see, filtered to models supporting `generateContent`. New Google models work with no code change. |

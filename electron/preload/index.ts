@@ -13,7 +13,8 @@ import type {
   FfmpegProgress,
   KeyCheck,
   SlotFetchResult,
-  RefreshOutcome
+  RefreshOutcome,
+  SaveResult
 } from '../shared/types'
 
 /**
@@ -43,6 +44,22 @@ export interface CheckKeysResponse {
   updatedAt: string
   anyValid: boolean
 }
+
+/**
+ * What the save dialog resolves to.
+ *
+ * It used to be the subtitle's path alone, and the renderer DERIVED the console log's name from it.
+ * That stopped being safe once sidecars are written exclusively: an occupied name is stepped, so
+ * the destination is no longer predictable and has to be reported (SOL-12). `path` is `''` when the
+ * user cancelled, exactly as the bare string was.
+ */
+/**
+ * Re-exported so existing importers keep working. The declaration itself now lives in
+ * `shared/types.ts`, where the MAIN process can see it too — it was declared here alone, so the
+ * handler that produces it was unchecked against it, and one branch had gone on returning the bare
+ * string this replaced (SOL-15).
+ */
+export type { SaveResult }
 
 const api = {
   // settings
@@ -76,7 +93,7 @@ const api = {
     logPaths?: string[]
     /** The file the user chose to translate, so the token report can name it instead of a temp path. */
     inputPath?: string
-  }): Promise<string> => ipcRenderer.invoke('dialog:saveFile', args),
+  }): Promise<SaveResult> => ipcRenderer.invoke('dialog:saveFile', args),
 
   // engine
   /** Which gst binary a run will use — the answer to "am I running the packaged engine?". */

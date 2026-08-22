@@ -695,8 +695,7 @@ async function main(): Promise<void> {
   )
   check(
     'it does not hard-exit complaining about ffmpeg',
-    !/ffmpeg.*(not found|required|install)/i.test(mask(noFfmpeg.stdout + noFfmpeg.stderr)) ||
-      noFfmpeg.code === 0
+    !/ffmpeg.*(not found|required|install)/i.test(mask(noFfmpeg.stdout + noFfmpeg.stderr))
   )
 
   // ── C21 — embedded subtitle track: probe, extract, translate (stage 2) ──

@@ -17,6 +17,7 @@ Source Codes/
 *.local.json
 *.log
 *.tsbuildinfo
+__pycache__/
 .DS_Store
 .vite/
 build/python/

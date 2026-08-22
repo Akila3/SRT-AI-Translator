@@ -271,6 +271,7 @@ async function main(): Promise<void> {
     console.log(`        the engine ended it on its own (reason: ${storm.done[0]?.reason ?? 'none'})`)
   }
   check('the log did not grow without bound', storm.lines.length < 20_000, `${storm.lines.length} lines`)
+  check('and the job slot is free afterwards', !storm.runningAfter)
 
   // ── B4 — the masked command line, from real emitted output ─────────────────
   // The gate proves the renderer. This proves the only thing that finally matters: that the key

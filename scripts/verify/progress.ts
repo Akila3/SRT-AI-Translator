@@ -115,7 +115,7 @@ async function main(): Promise<void> {
     '-c:a', 'aac', '-b:a', '96k', rawM4a
   ])
   if (built !== 0 || !fs.existsSync(rawM4a)) {
-    skip('the audio conversion', 'ffmpeg could not build the .m4a fixture')
+    check('the audio conversion fixture was built', false, 'ffmpeg could not build the .m4a fixture')
   } else {
     const duration = await probeDuration(rawM4a)
     check(
@@ -224,6 +224,10 @@ async function main(): Promise<void> {
   fs.rmSync(WORK, { recursive: true, force: true })
   if (failures > 0) {
     console.log('\nPROBE FAILED — ffmpeg progress is not behaving as the UI now claims.')
+    process.exit(1)
+  }
+  if (passes === 0) {
+    console.log('\nPROBE FAILED — no progress scenario ran, so this is not a pass.')
     process.exit(1)
   }
   console.log('\nALL PROGRESS PROBES PASSED')

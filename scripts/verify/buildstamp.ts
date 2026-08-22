@@ -31,6 +31,7 @@ import { spawnSync } from 'child_process'
 
 const ROOT = process.cwd()
 const CHECK_BIN = path.join(ROOT, 'scripts', 'check-bin.mjs')
+const VERIFY = path.join(ROOT, 'scripts', 'electron-builder-verify.cjs')
 
 /** Mirrors `REQUIRED_INPUTS` in check-bin.mjs and `BUILD_INPUTS` in build_python.py. */
 const INPUTS = [
@@ -118,8 +119,8 @@ interface Outcome {
   output: string
 }
 
-function preflight(dir: string): Outcome {
-  const res = spawnSync(process.execPath, [CHECK_BIN, '--target=win32'], {
+function preflight(dir: string, extraArgs: string[] = []): Outcome {
+  const res = spawnSync(process.execPath, [CHECK_BIN, '--target=win32', ...extraArgs], {
     cwd: dir,
     encoding: 'utf8'
   })
@@ -132,14 +133,44 @@ function preflight(dir: string): Outcome {
  * Each scenario gets its own sandbox so a mutation cannot leak into the next assertion — the
  * failure mode of a shared fixture is a test that passes for the wrong reason.
  */
-function scenario(mutate: (dir: string) => void): Outcome {
+function scenario(mutate: (dir: string) => void, extraArgs: string[] = []): Outcome {
   const dir = sandbox()
   try {
     mutate(dir)
-    return preflight(dir)
+    return preflight(dir, extraArgs)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
+}
+
+function stagePackedCopy(dir: string): string {
+  const packed = path.join(dir, 'packed', 'resources', 'bin')
+  fs.mkdirSync(packed, { recursive: true })
+  for (const name of ['gst.exe', 'ffmpeg.exe', 'ffprobe.exe']) {
+    fs.copyFileSync(path.join(dir, 'resources', 'bin', name), path.join(packed, name))
+  }
+  return packed
+}
+
+function sevenZa(): string {
+  const plat = process.platform === 'win32' ? 'win' : process.platform === 'darwin' ? 'mac' : 'linux'
+  const exe = process.platform === 'win32' ? '7za.exe' : '7za'
+  return path.join(ROOT, 'node_modules', '7zip-bin', plat, process.arch, exe)
+}
+
+function makeZip(dir: string, zipName: string, members: string[]): void {
+  const zip = path.join(dir, zipName)
+  const res = spawnSync(sevenZa(), ['a', '-tzip', zip, ...members], { cwd: dir, encoding: 'utf8' })
+  if (res.status !== 0) {
+    throw new Error(`7za could not write ${zipName}: ${res.stderr || res.stdout}`)
+  }
+}
+
+function archiveCheck(zipPath: string, stampPath: string): Outcome {
+  const src =
+    `require(${JSON.stringify(VERIFY)}).verifyPackedArchive(${JSON.stringify(zipPath)}, ${JSON.stringify(stampPath)})`
+  const res = spawnSync(process.execPath, ['-e', src], { encoding: 'utf8' })
+  return { blocked: res.status !== 0, output: `${res.stdout ?? ''}${res.stderr ?? ''}` }
 }
 
 function main(): void {
@@ -286,6 +317,100 @@ function main(): void {
   })
   check('a stale-engine refusal names the command that fixes it', /npm run build:python/.test(stale.output))
   check('and explains what shipping it would revert', /line buffering|silently reverts/.test(stale.output))
+
+  // ── The packed copy electron-builder actually ships (SOL-42 afterPack) ──────
+  section('H — afterPack hashes the copied artifact, not the source tree')
+
+  const packedOk = scenario((dir) => {
+    stagePackedCopy(dir)
+  }, ['--bin-dir=packed/resources/bin'])
+  check('a packed copy that still matches the stamp passes', !packedOk.blocked, packedOk.output.trim().split('\n').pop())
+
+  const packedReplaced = scenario((dir) => {
+    const packed = stagePackedCopy(dir)
+    fs.writeFileSync(path.join(packed, 'gst.exe'), 'swapped after extraResources copy\n')
+  }, ['--bin-dir=packed/resources/bin'])
+  check(
+    'replacing the packed engine after the copy is refused',
+    packedReplaced.blocked,
+    packedReplaced.output.trim().split('\n').pop()
+  )
+  check('and says the packed contents are unknown', /has been replaced|unknown/.test(packedReplaced.output))
+
+  // ── The archive electron-builder emits after afterPack (SOL-42 remainder) ──
+  section('I — the ZIP that ships is hashed, not only the unpacked copy')
+
+  const zipDir = sandbox()
+  try {
+    const members = [
+      path.join('resources', 'bin', 'gst.exe'),
+      path.join('resources', 'bin', 'ffmpeg.exe'),
+      path.join('resources', 'bin', 'ffprobe.exe')
+    ]
+    const stampFile = path.join(zipDir, 'build', 'python', 'gst.buildstamp.json')
+    const gstBytes = fs.readFileSync(path.join(zipDir, 'resources', 'bin', 'gst.exe'))
+    makeZip(zipDir, 'ship.zip', members)
+    const zipOk = archiveCheck(path.join(zipDir, 'ship.zip'), stampFile)
+    check('a zip whose gst matches the stamp is accepted', !zipOk.blocked, zipOk.output.trim())
+
+    fs.writeFileSync(path.join(zipDir, 'resources', 'bin', 'gst.exe'), 'swapped after afterPack\n')
+    makeZip(zipDir, 'ship-bad.zip', members)
+    const zipBad = archiveCheck(path.join(zipDir, 'ship-bad.zip'), stampFile)
+    check('a zip whose gst was swapped after the unpacked check is refused', zipBad.blocked)
+    check(
+      'and says the shipped engine is not the one that was checked',
+      /does not match the freeze stamp|shipped engine/.test(zipBad.output),
+      zipBad.output.trim().split('\n').pop()
+    )
+
+    fs.mkdirSync(path.join(zipDir, 'unrelated'), { recursive: true })
+    fs.writeFileSync(path.join(zipDir, 'unrelated', 'gst.exe'), gstBytes)
+    makeZip(zipDir, 'ship-wrong-path.zip', [path.join('unrelated', 'gst.exe')])
+    const zipWrong = archiveCheck(path.join(zipDir, 'ship-wrong-path.zip'), stampFile)
+    check('a zip whose stamped gst is not at resources/bin is refused', zipWrong.blocked)
+    check(
+      'and names the Windows runtime path',
+      /resources\/bin\/gst\.exe/.test(zipWrong.output) && !/Contents\/Resources/.test(zipWrong.output),
+      zipWrong.output.trim().split('\n').pop()
+    )
+
+    const macLayout = path.join('Contents', 'Resources', 'bin', 'gst.exe')
+    fs.mkdirSync(path.join(zipDir, 'Contents', 'Resources', 'bin'), { recursive: true })
+    fs.writeFileSync(path.join(zipDir, macLayout), gstBytes)
+    makeZip(zipDir, 'ship-mac-path.zip', [macLayout])
+    const zipMac = archiveCheck(path.join(zipDir, 'ship-mac-path.zip'), stampFile)
+    check('a Windows zip whose gst is only at the macOS path is refused', zipMac.blocked)
+    check(
+      'and still names resources/bin, not the macOS layout',
+      /resources\/bin\/gst\.exe/.test(zipMac.output),
+      zipMac.output.trim().split('\n').pop()
+    )
+  } finally {
+    fs.rmSync(zipDir, { recursive: true, force: true })
+  }
+
+  const macStampDir = sandbox()
+  try {
+    const linuxLayout = path.join('resources', 'bin', 'gst')
+    fs.copyFileSync(path.join(macStampDir, 'resources', 'bin', 'gst.exe'), path.join(macStampDir, linuxLayout))
+    const s = readStamp(macStampDir)
+    s.binary = 'gst'
+    s.binarySha256 = sha256(path.join(macStampDir, linuxLayout))
+    writeStamp(macStampDir, s)
+    makeZip(macStampDir, 'ship-linux-layout.zip', [linuxLayout])
+    const zipLinuxOnMac = archiveCheck(
+      path.join(macStampDir, 'ship-linux-layout.zip'),
+      path.join(macStampDir, 'build', 'python', 'gst.buildstamp.json')
+    )
+    check('a macOS zip whose gst is only at the Linux path is refused', zipLinuxOnMac.blocked)
+    check(
+      'and names Contents/Resources/bin',
+      /Contents\/Resources\/bin\/gst/.test(zipLinuxOnMac.output),
+      zipLinuxOnMac.output.trim().split('\n').pop()
+    )
+  } finally {
+    fs.rmSync(macStampDir, { recursive: true, force: true })
+  }
 
   console.log(`\n${passes} passed, ${failures} failed`)
   if (failures > 0) {

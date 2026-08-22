@@ -43,6 +43,25 @@ interface FfmpegTask {
   startedAt: number
 }
 
+/**
+ * Which of the saved reports did NOT get the name they are supposed to have.
+ *
+ * The reports are named after the subtitle — `episode.srt` gets `episode.tokens.json` — so a name
+ * already occupied by a stranger's file is stepped to `episode-2.tokens.json` rather than overwriting
+ * it. That is the right trade, and it has a cost worth stating out loud: the file that still LOOKS
+ * like this run's report is the older one, and this run's real report is somewhere nobody was told
+ * about (SOL-15). A stepped name is anything that does not begin with the subtitle's stem and a dot.
+ */
+function renamedAmong(sidecars: string[], subtitlePath: string): string[] {
+  const base = subtitlePath.split(/[\\/]/).pop() ?? ''
+  const stem = base.replace(/\.[^.]*$/, '')
+  if (!stem) return []
+  return sidecars.filter((p) => {
+    const name = p.split(/[\\/]/).pop() ?? ''
+    return !name.startsWith(`${stem}.`)
+  })
+}
+
 export default function TranslatePage(): React.JSX.Element {
   const settings = useStore((s) => s.settings)
   const { state, start, stop, reset } = useRunner()
@@ -58,6 +77,14 @@ export default function TranslatePage(): React.JSX.Element {
   const [description, setDescription] = useState('')
   const [tmdbResetKey, setTmdbResetKey] = useState(0)
   const [savedPath, setSavedPath] = useState('')
+  /** Where the save put the console log — its name is stepped if one was already there (SOL-12). */
+  const [savedConsolePath, setSavedConsolePath] = useState('')
+  /** Reports that could not take their usual name, so the panel can say which (SOL-15). */
+  const [renamedSidecars, setRenamedSidecars] = useState<string[]>([])
+  /** Canonical names still sitting beside the saved subtitle that this run did not write (SOL-15). */
+  const [staleSidecars, setStaleSidecars] = useState<string[]>([])
+  /** Why Save failed, or why a sidecar did not land beside a successful subtitle (SOL-22). */
+  const [saveError, setSaveError] = useState('')
   /**
    * What the user chose to translate, frozen when the run started.
    *
@@ -91,15 +118,12 @@ export default function TranslatePage(): React.JSX.Element {
   /**
    * The console log's name once it has a home, or '' while the run has none.
    *
-   * Derived from the SAVED path rather than read out of `logPaths`, because the path in there is
-   * the temp original: `dialog:saveFile` copies every sidecar onto the destination the user
-   * picked. `logPaths` is still what decides whether to mention it at all — no entry means the
-   * file was never opened, and naming one that does not exist is worse than saying nothing.
+   * Taken from what the save actually WROTE rather than derived from the saved subtitle's name.
+   * It used to be derived, on the reasoning that the sidecar lands on a destination re-derived from
+   * the same base — true until sidecars became non-destructive, at which point an occupied name is
+   * stepped to a free one and the derivation would name a file that does not exist (SOL-12).
    */
-  const consoleLogName =
-    savedPath && findConsoleLog(state.logPaths)
-      ? (consoleLogPathFor(savedPath).split(/[\\/]/).pop() ?? '')
-      : ''
+  const consoleLogName = savedConsolePath.split(/[\\/]/).pop() ?? ''
 
   /**
    * Where the console log is RIGHT NOW, for a run with no saved subtitle to sit beside.
@@ -134,6 +158,16 @@ export default function TranslatePage(): React.JSX.Element {
   // re-run on every settings change: the page stays mounted across tabs, and
   // re-seeding would wipe an in-progress selection if the user edits Settings.
   const langSeeded = useRef(false)
+  /**
+   * Which probe (or Clear) currently owns the track list.
+   *
+   * `probeTracks` is async and a later pick can finish first. Applying whichever promise
+   * resolves last would show A's streams against B's path — then Start extracts the wrong
+   * index (SOL-37). Bumping this on every pick and on Clear makes a stale completion a no-op.
+   */
+  const probeEpoch = useRef(0)
+  /** Sync lock for Start: React's `isRunning` / `ffmpeg` flags lag a second click (SOL-39). */
+  const startOwned = useRef(false)
   useEffect(() => {
     if (settings && !langSeeded.current) {
       langSeeded.current = true
@@ -145,6 +179,7 @@ export default function TranslatePage(): React.JSX.Element {
   async function pickVideo(): Promise<void> {
     const p = await window.api.openFile(VIDEO_FILTERS)
     if (!p) return
+    const epoch = ++probeEpoch.current
     setVideoFile(p)
     setProbing(true)
     setProbeStartedAt(Date.now())
@@ -152,10 +187,11 @@ export default function TranslatePage(): React.JSX.Element {
     setSelectedTrack(null)
     try {
       const t = await window.api.probeTracks(p)
+      if (epoch !== probeEpoch.current) return
       setTracks(t)
       autoSelect(t)
     } finally {
-      setProbing(false)
+      if (epoch === probeEpoch.current) setProbing(false)
     }
   }
 
@@ -170,9 +206,11 @@ export default function TranslatePage(): React.JSX.Element {
   }
 
   function clearVideo(): void {
+    probeEpoch.current += 1
     setVideoFile('')
     setTracks([])
     setSelectedTrack(null)
+    setProbing(false)
   }
 
   /**
@@ -235,8 +273,13 @@ export default function TranslatePage(): React.JSX.Element {
   }
 
   async function handleStart(): Promise<void> {
+    if (startOwned.current) return
     setStartError('')
     setSavedPath('')
+    setSavedConsolePath('')
+    setRenamedSidecars([])
+    setStaleSidecars([])
+    setSaveError('')
     setShowLog(false)
     const cfg = settings
     if (!cfg) return
@@ -246,7 +289,9 @@ export default function TranslatePage(): React.JSX.Element {
       setStartError(refusal)
       return
     }
+    startOwned.current = true
 
+    try {
     // Read before the first await, not after: extracting a track from a large video runs for
     // minutes, and nothing stops the user editing the pickers while it does.
     const chosenSource = srtFile || videoFile
@@ -312,11 +357,24 @@ export default function TranslatePage(): React.JSX.Element {
     }
     setRunSource(chosenSource)
     setRunStartedAt(Date.now())
-    await start(() => window.api.startTranslate(args))
+    await start((runId) => window.api.startTranslate({ ...args, runId }))
+    } finally {
+      startOwned.current = false
+    }
+  }
+
+  function handleNew(): void {
+    reset()
+    setSavedPath('')
+    setSavedConsolePath('')
+    setRenamedSidecars([])
+    setStaleSidecars([])
+    setSaveError('')
   }
 
   async function handleSave(): Promise<void> {
     if (!state.outputPath) return
+    setSaveError('')
     // Keep the format the engine actually produced. It writes according to the output
     // path's extension, so proposing ".srt" for an ASS job would mislabel the file.
     const ext = /\.ass$/i.test(state.outputPath) ? '.ass' : '.srt'
@@ -324,18 +382,40 @@ export default function TranslatePage(): React.JSX.Element {
     // whatever happens to be in the pickers now. The convention itself now lives in one place,
     // shared with track extraction — see `outputName.ts`.
     const name = companionName(runSource, tgtLang, ext)
-    const saved = await window.api.saveFile({
-      srcPath: state.outputPath,
-      defaultName: name,
-      defaultDir: settings?.outputFolder || undefined,
-      logPaths: state.logPaths.length ? state.logPaths : undefined,
-      // What the user picked for THIS run, not what the engine was handed and not whatever the
-      // pickers hold now: for a video the engine received an extracted temp track, and for a
-      // re-encoded subtitle a temp `.utf8.srt`. Neither exists by the time they open the token
-      // report sitting next to the file they saved.
-      inputPath: runSource || undefined
-    })
-    if (saved) setSavedPath(saved)
+    let saved
+    try {
+      saved = await window.api.saveFile({
+        srcPath: state.outputPath,
+        defaultName: name,
+        defaultDir: settings?.outputFolder || undefined,
+        logPaths: state.logPaths.length ? state.logPaths : undefined,
+        // What the user picked for THIS run, not what the engine was handed and not whatever the
+        // pickers hold now: for a video the engine received an extracted temp track, and for a
+        // re-encoded subtitle a temp `.utf8.srt`. Neither exists by the time they open the token
+        // report sitting next to the file they saved.
+        inputPath: runSource || undefined
+      })
+    } catch (e) {
+      setSaveError(`Could not save: ${e instanceof Error ? e.message : String(e)}`)
+      return
+    }
+    if (saved.error && !saved.path) {
+      setSaveError(saved.error)
+      return
+    }
+    if (saved.path) {
+      setSavedPath(saved.path)
+      // Reported, not derived. The sidecar is written exclusively, so a name already in use is
+      // stepped and `consoleLogPathFor(savedPath)` would name a file that is not there (SOL-12).
+      setSavedConsolePath(saved.consolePath)
+      // A stepped name is worth SAYING. The reports are named after the subtitle, so one that had to
+      // take a different name no longer looks like it belongs to this run — and the file that does
+      // look like it belongs is the older one still sitting there. Naming them is what keeps the
+      // association honest (SOL-15).
+      setRenamedSidecars(renamedAmong(saved.sidecars, saved.path))
+      setStaleSidecars(saved.stale ?? [])
+      if (saved.error) setSaveError(saved.error)
+    }
   }
 
   return (
@@ -461,12 +541,30 @@ export default function TranslatePage(): React.JSX.Element {
               The label changes during preparation because the reported complaint was
               precisely that it did not: a button still offering to start something is the
               strongest possible claim that nothing has started.
+
+              `key` on Start vs Stop is load-bearing (SOL-39). Keyboard clicks have
+              `detail === 0`, which the pointer filter cannot catch. Reusing the same
+              DOM node would let a leftover Enter/Space activate Stop.
             */
-            <Button onClick={handleStart} disabled={isRunning || ffmpeg !== null}>
+            <Button
+              key="run-start"
+              onClick={(e) => {
+                if (e.detail > 1) return
+                void handleStart()
+              }}
+              disabled={isRunning || ffmpeg !== null}
+            >
               {ffmpeg?.kind === 'prepare' ? 'Extracting track…' : 'Start Translation'}
             </Button>
           ) : (
-            <Button variant="danger" onClick={stop}>
+            <Button
+              key="run-stop"
+              variant="danger"
+              onClick={(e) => {
+                if (e.detail > 1) return
+                void stop()
+              }}
+            >
               Stop
             </Button>
           )}
@@ -475,7 +573,7 @@ export default function TranslatePage(): React.JSX.Element {
               <Button variant="secondary" onClick={handleSave}>
                 Save Subtitles…
               </Button>
-              <Button variant="ghost" onClick={reset}>
+              <Button variant="ghost" onClick={handleNew}>
                 New
               </Button>
             </>
@@ -564,7 +662,7 @@ export default function TranslatePage(): React.JSX.Element {
                 <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
                   Stopped. Nothing was saved.
                 </p>
-                <Button variant="ghost" onClick={reset}>
+                <Button variant="ghost" onClick={handleNew}>
                   New
                 </Button>
               </div>
@@ -587,6 +685,10 @@ export default function TranslatePage(): React.JSX.Element {
               </div>
             )}
 
+            {saveError && !savedPath && (
+              <p className="text-sm text-red-600 dark:text-red-400">{saveError}</p>
+            )}
+
             {savedPath && (
               <>
                 <p className="text-sm text-gray-700 dark:text-gray-300">
@@ -606,6 +708,28 @@ export default function TranslatePage(): React.JSX.Element {
                     The complete console for this run was saved beside it, as {consoleLogName} —
                     uncapped and uncollapsed, unlike the panel above.
                   </p>
+                )}
+                {/*
+                  Said rather than left to be discovered. A report that had to take another name is
+                  still this run's report, and the file holding its usual name belongs to an older
+                  one — which is exactly the wrong way round for anyone reading the folder (SOL-15).
+                */}
+                {renamedSidecars.length > 0 && (
+                  <p className="text-xs text-amber-700 dark:text-amber-500">
+                    Files of those names were already there and were left alone, so{' '}
+                    {renamedSidecars.length === 1 ? 'this run’s report was' : 'this run’s reports were'}{' '}
+                    saved as {renamedSidecars.map((p) => p.split(/[\\/]/).pop()).join(', ')}.
+                  </p>
+                )}
+                {staleSidecars.length > 0 && (
+                  <p className="text-xs text-amber-700 dark:text-amber-500">
+                    Older files still sitting beside this subtitle under their usual names (
+                    {staleSidecars.map((p) => p.split(/[\\/]/).pop()).join(', ')}) were left
+                    alone — they are not this run.
+                  </p>
+                )}
+                {saveError && (
+                  <p className="text-xs text-amber-700 dark:text-amber-500">{saveError}</p>
                 )}
               </>
             )}

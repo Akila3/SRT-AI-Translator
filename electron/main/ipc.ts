@@ -1,7 +1,8 @@
 import { ipcMain, dialog, shell, BrowserWindow } from 'electron'
+import type { ChildProcess } from 'child_process'
 import fs from 'fs'
 import path from 'path'
-import { getSettings, setSettings, store } from './store'
+import { getSettings, setSettings } from './store'
 import { probeTracks, extractTrack } from './ffmpeg'
 import { tmdbSearch, tmdbCast } from './tmdb'
 import {
@@ -22,9 +23,11 @@ import {
   tempOutputPath,
   describeEngine,
   keySlotsFor,
+  noUsableApiKeyMessage,
   type KeyPreflight
 } from './pythonBridge'
-import { activeKeySlots } from '../shared/keyOrder'
+import { copyExclusive, writeExclusive } from './exclusiveFile'
+import { ACTIVE_SET_SIZE, activeKeySlots, orderKeySlots } from '../shared/keyOrder'
 import { CONSOLE_LOG_SUFFIX } from '../shared/consoleLog'
 import { scanTranslatedOutput } from '../shared/outputSanity'
 import type {
@@ -35,16 +38,42 @@ import type {
   FfmpegTaskKind,
   ModelInfo,
   RefreshOutcome,
+  SaveResult,
   SlotFetchResult
 } from '../shared/types'
 
 let win: BrowserWindow | null = null
 export function setMainWindow(w: BrowserWindow): void {
   win = w
+  // Dropped as soon as it goes, because from SOL-04 onwards the main process deliberately OUTLIVES
+  // it: `before-quit` holds the app open while the engine is terminated, and every engine line,
+  // progress tick and terminal event produced during that window used to be pushed at a destroyed
+  // object. That throws in the main process, and it would throw part-way through the very shutdown
+  // sequence that was added to stop orphaning the engine (SOL-11).
+  w.on('closed', () => {
+    if (win === w) win = null
+  })
 }
 
+/**
+ * Push an event to the renderer, if there is still a renderer.
+ *
+ * Both halves are checked. `win.isDestroyed()` is not enough on its own: the WebContents can be
+ * gone while the BrowserWindow object is still reachable, and it is `webContents.send` that throws.
+ * Dropping an event here is always the right answer — there is nothing left to display it, and the
+ * shutdown path's real work is terminating the child, deleting scratch files and closing the
+ * console, none of which needs a window.
+ */
 function send(channel: string, payload: unknown): void {
-  win?.webContents.send(channel, payload)
+  if (!win || win.isDestroyed()) return
+  const wc = win.webContents
+  if (!wc || wc.isDestroyed()) return
+  try {
+    wc.send(channel, payload)
+  } catch {
+    // A renderer that went away between the check and the send. Nothing to deliver to, and this
+    // sits on the path that ends a run — throwing here would strand the job it is ending.
+  }
 }
 
 /**
@@ -102,7 +131,12 @@ export function retargetTokenReport(json: string, inputPath: string, outputPath:
  * last one copied would silently overwrite the others. The list is therefore exhaustive by
  * obligation — anything that starts writing a new sidecar has to appear here in the same change.
  */
-const KNOWN_SIDECAR_SUFFIXES = ['.tokens.json', '.progress.log', '.thoughts.log', CONSOLE_LOG_SUFFIX]
+export const KNOWN_SIDECAR_SUFFIXES = [
+  '.tokens.json',
+  '.progress.log',
+  '.thoughts.log',
+  CONSOLE_LOG_SUFFIX
+]
 
 /**
  * Where a sidecar lands when its subtitle is saved to `savedPath`.
@@ -118,6 +152,39 @@ const KNOWN_SIDECAR_SUFFIXES = ['.tokens.json', '.progress.log', '.thoughts.log'
 export function sidecarDestination(logPath: string, savedPath: string): string {
   const suffix = KNOWN_SIDECAR_SUFFIXES.find((s) => logPath.endsWith(s)) ?? path.extname(logPath)
   return `${savedPath.replace(/\.[^.]+$/, '')}${suffix}`
+}
+
+/**
+ * Canonical sidecar paths that exist beside `savedPath` and were not written by this save.
+ *
+ * They keep looking like reports about the subtitle the user just saved, which is SOL-15's
+ * leftover class — including types this run never generated. Scanning after the write, rather
+ * than hoping a rename succeeded, is what makes the warning honest (SOL-15, round 5). The
+ * save handler does not move these files; it reports them.
+ */
+export function leftoverCanonicals(savedPath: string, written: readonly string[]): string[] {
+  const stem = savedPath.replace(/\.[^.]+$/, '')
+  const writtenAbs = new Set(written.map((p) => path.resolve(p)))
+  const leftover: string[] = []
+  for (const suffix of KNOWN_SIDECAR_SUFFIXES) {
+    const canonical = `${stem}${suffix}`
+    try {
+      if (!fs.existsSync(canonical)) continue
+    } catch {
+      continue
+    }
+    if (writtenAbs.has(path.resolve(canonical))) continue
+    leftover.push(canonical)
+  }
+  return leftover
+}
+
+const EMPTY_SAVE: SaveResult = {
+  path: '',
+  consolePath: '',
+  sidecars: [],
+  displaced: [],
+  stale: []
 }
 
 export interface SingleKeyRefreshScope {
@@ -160,6 +227,31 @@ export function singleKeyRefreshScope(
     activeSlots: activeKeySlots(keySlotsFor(configured)),
     authoritative: true
   }
+}
+
+/**
+ * HTTPS only. `shell.openExternal` and `setWindowOpenHandler` used to forward any scheme;
+ * a compromised renderer or a future caller with untrusted content could launch `file:` or
+ * a registered custom protocol (SOL-24). Parse failures and anything else are refusals.
+ */
+export function isHttpsUrl(url: string): boolean {
+  try {
+    return new URL(url).protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Open an approved HTTPS URL.
+ *
+ * Non-HTTPS is a refusal, not a launch, and resolves without opening. A valid HTTPS URL
+ * that the OS cannot open rejects, so `shell:openExternal` can surface it (SOL-24).
+ * `setWindowOpenHandler` has no caller to tell — it must catch.
+ */
+export function openApprovedExternal(url: string): Promise<void> {
+  if (!isHttpsUrl(url)) return Promise.resolve()
+  return shell.openExternal(url)
 }
 
 /**
@@ -287,8 +379,11 @@ export function registerIpc(): void {
     // Re-curate cached ids through the current rules so older caches get the corrected
     // friendly names / filtering without forcing a re-fetch. Provenance is fed back in so
     // re-curation never upgrades a seed entry into a "live" one, nor forgets which key
-    // slots reported a live one.
-    const cached = (store.get('cachedModels') as ModelInfo[]) || []
+    // slots reported a live one. Read through getSettings() so a malformed persisted
+    // cache cannot throw on `.map` (SOL-29). updatedAt comes from the same view so a
+    // missing Conf key is `null`, matching preload's `string | null` (SOL-36).
+    const s = getSettings()
+    const cached = s.cachedModels
     const availability: ModelAvailability = {}
     for (const m of cached) {
       if (m?.source === 'live' && Array.isArray(m.availableOn) && m.availableOn.length) {
@@ -296,7 +391,7 @@ export function registerIpc(): void {
       }
     }
     const models = buildModelList(cached.map((m) => m.id), availability)
-    return { models, updatedAt: store.get('modelsUpdatedAt') }
+    return { models, updatedAt: s.modelsUpdatedAt ?? null }
   })
 
   // Single-key refresh (kept for callers that only have one key at hand). The list is
@@ -469,8 +564,13 @@ export function registerIpc(): void {
         /** The file the user chose to translate, so the token report can name it (REP-1). */
         inputPath?: string
       }
-    ) => {
-      if (!win) return ''
+    ): Promise<SaveResult> => {
+      // Annotated, and the empty return corrected with it. This handler used to return a bare string
+      // and was changed to return an object; the no-window path kept returning `''`, which the
+      // declared `SaveResult` says cannot happen. Nothing crashed — `''.path` is merely `undefined`
+      // and every caller tests it — but a type that is wrong in one branch is a type nobody can rely
+      // on, and this round adds a third field to it (SOL-15).
+      if (!win) return EMPTY_SAVE
       const defaultPath = args.defaultDir
         ? path.join(args.defaultDir, args.defaultName)
         : args.defaultName
@@ -481,34 +581,102 @@ export function registerIpc(): void {
           { name: 'All Files', extensions: ['*'] }
         ]
       })
-      if (res.canceled || !res.filePath) return ''
-      if (args.srcPath && fs.existsSync(args.srcPath)) {
-        fs.copyFileSync(args.srcPath, res.filePath)
+      if (res.canceled || !res.filePath) return EMPTY_SAVE
+      // Transcribe uses this handler as a DESTINATION PICKER: no source file, no logs, just a
+      // path. Round 4 displaced every canonical sidecar whenever that path already existed, so
+      // merely choosing `episode.srt` renamed four reports the user never agreed to move, and
+      // Transcribe never mentioned it (SOL-17). A picker must not mutate the disk.
+      if (!args.srcPath) {
+        return { path: res.filePath, consolePath: '', sidecars: [], displaced: [], stale: [] }
       }
-      // Copy any log/report files (token report, progress, thoughts, console) next to the saved
-      // SRT. Each temp log path shares the same base as the temp SRT; the destination is
-      // re-derived from the same compound suffix so they land alongside the user-chosen file.
+
+      // The subtitle itself IS the file the dialog obtained consent for, so overwriting here is
+      // the user's own decision and must stay a plain copy. A missing temp, a thrown copy, or a
+      // failed exclusive sidecar used to look like success (SOL-22): the invoke rejected with no
+      // renderer catch, or returned a path after writing nothing / swallowing the report error.
+      let destExisted = false
+      try {
+        destExisted = fs.existsSync(res.filePath)
+      } catch {
+        destExisted = false
+      }
+      try {
+        if (!fs.existsSync(args.srcPath)) {
+          return {
+            ...EMPTY_SAVE,
+            error: 'The translated subtitle is no longer available to save.'
+          }
+        }
+        fs.copyFileSync(args.srcPath, res.filePath)
+      } catch (e) {
+        if (!destExisted) {
+          try {
+            fs.unlinkSync(res.filePath)
+          } catch {
+            /* partial dest we created */
+          }
+        }
+        const detail = e instanceof Error ? e.message : String(e)
+        return { ...EMPTY_SAVE, error: `Could not save the subtitle: ${detail}` }
+      }
+
+      // Sidecars are never overwritten and never renamed. The dialog named one file. Moving a
+      // stranger's `episode.console.log` aside "to keep the association honest" was still acting
+      // on a file nobody consented to touch (SOL-12, round 5). Exclusive create steps around
+      // whatever is already there; leftover canonical names are REPORTED as `stale` so they
+      // cannot silently look like this run (SOL-15). A sidecar that cannot be written is
+      // reported on `error` rather than swallowed — the subtitle has already landed (SOL-22).
+      let consolePath = ''
+      const sidecars: string[] = []
+      const sidecarErrors: string[] = []
       if (args.logPaths?.length) {
         for (const logPath of args.logPaths) {
-          if (fs.existsSync(logPath)) {
-            const dest = sidecarDestination(logPath, res.filePath)
-            try {
-              // The token report records the temp paths the engine was handed, so the user opens a
-              // file next to their subtitle and reads two paths that no longer exist (REP-1). Only
-              // this one sidecar is rewritten; everything else is still copied byte for byte.
-              if (dest.endsWith('.tokens.json')) {
-                const report = fs.readFileSync(logPath, 'utf-8')
-                fs.writeFileSync(dest, retargetTokenReport(report, args.inputPath ?? '', res.filePath))
-              } else {
-                fs.copyFileSync(logPath, dest)
-              }
-            } catch {
-              // Non-fatal: log file copy failure should not block the SRT save.
+          if (!fs.existsSync(logPath)) {
+            sidecarErrors.push(`could not find ${path.basename(logPath)}`)
+            continue
+          }
+          const dest = sidecarDestination(logPath, res.filePath)
+          const suffix =
+            KNOWN_SIDECAR_SUFFIXES.find((s) => dest.endsWith(s)) ?? path.extname(dest)
+          try {
+            const body = dest.endsWith('.tokens.json')
+              ? retargetTokenReport(
+                  fs.readFileSync(logPath, 'utf-8'),
+                  args.inputPath ?? '',
+                  res.filePath
+                )
+              : null
+            const written =
+              body !== null
+                ? writeExclusive(body, dest, suffix)
+                : copyExclusive(logPath, dest, suffix)
+            if (written) {
+              sidecars.push(written)
+              if (suffix === CONSOLE_LOG_SUFFIX) consolePath = written
+            } else {
+              sidecarErrors.push(`could not write ${path.basename(dest)}`)
             }
+          } catch (e) {
+            const detail = e instanceof Error ? e.message : String(e)
+            sidecarErrors.push(`${path.basename(logPath)}: ${detail}`)
           }
         }
       }
-      return res.filePath
+      return {
+        path: res.filePath,
+        consolePath,
+        sidecars,
+        displaced: [],
+        stale: leftoverCanonicals(res.filePath, sidecars),
+        ...(sidecarErrors.length
+          ? {
+              error:
+                sidecarErrors.length === 1
+                  ? `The subtitle was saved, but a report was not: ${sidecarErrors[0]}`
+                  : `The subtitle was saved, but some reports were not: ${sidecarErrors.join('; ')}`
+            }
+          : {})
+      }
     }
   )
 
@@ -522,7 +690,7 @@ export function registerIpc(): void {
   ipcMain.handle('shell:showItem', (_e, p: string) => {
     if (p) shell.showItemInFolder(p)
   })
-  ipcMain.handle('shell:openExternal', (_e, url: string) => shell.openExternal(url))
+  ipcMain.handle('shell:openExternal', (_e, url: string) => openApprovedExternal(url))
 
   // ---- Video tracks ----
   ipcMain.handle('video:probeTracks', async (_e, filePath: string) => {
@@ -625,18 +793,46 @@ export function registerIpc(): void {
    *
    * Returns false when the run must not start; the refusal is reported on the same output
    * channel a failed run uses, so the UI needs no new path to surface it.
+   *
+   * `runId` is not optional in spirit. This is a REFUSAL, and a refusal emits a terminal event —
+   * so unaddressed it reaches whichever run is genuinely in progress on the other page and tells
+   * it that it has failed, while its engine carries on. Same shape as `refuseStart()`, same
+   * remedy (SOL-01).
    */
-  const passesModelGuard = (model: string, keys: string[]): boolean => {
+  const passesModelGuard = (
+    model: string,
+    keys: string[],
+    runId?: string,
+    activeLimit = ACTIVE_SET_SIZE
+  ): boolean => {
     const s = getSettings()
+    const slots = keySlotsFor(keys)
+    const ranked = orderKeySlots(slots)
+    if (ranked.length === 0) {
+      send('translate:output', {
+        stream: 'stderr',
+        line: noUsableApiKeyMessage(slots),
+        runId
+      })
+      send('translate:done', { code: -1, outputPath: '', runId, reason: 'guard' })
+      return false
+    }
     const verdict = guardModelForSpawn(
       model,
-      (s.cachedModels as ModelInfo[]) ?? [],
-      activeKeySlots(keySlotsFor(keys))
+      s.cachedModels,
+      // Slice the ranked full list. Passing a one-element keys array would renumber slots
+      // and mis-read `availableOn` (SOL-23). Transcription never emits `-k2`, so its limit is 1.
+      ranked.slice(0, activeLimit)
     )
-    if (verdict.warning) send('translate:output', { stream: 'stderr', line: verdict.warning })
+    if (verdict.warning)
+      send('translate:output', { stream: 'stderr', line: verdict.warning, runId })
     if (!verdict.ok) {
-      send('translate:output', { stream: 'stderr', line: verdict.error ?? 'Model unavailable.' })
-      send('translate:done', { code: -1, outputPath: '' })
+      send('translate:output', {
+        stream: 'stderr',
+        line: verdict.error ?? 'Model unavailable.',
+        runId
+      })
+      send('translate:done', { code: -1, outputPath: '', runId, reason: 'guard' })
       return false
     }
     return true
@@ -644,7 +840,7 @@ export function registerIpc(): void {
 
   ipcMain.handle('translate:start', (_e, args: TranslateArgs) => {
     const { writeTokenReport, progressLog, thoughtsLog, resumeContextSize } = getSettings()
-    if (!passesModelGuard(args.model, args.apiKeys)) return ''
+    if (!passesModelGuard(args.model, args.apiKeys, args.runId)) return ''
     const fullArgs: TranslateArgs = {
       ...args,
       writeTokenReport,
@@ -659,11 +855,21 @@ export function registerIpc(): void {
     // turned every one of those refusals into a ReferenceError. There are no sidecars to
     // report when a job never started, so an empty list is the correct value for them.
     let logPaths: string[] = []
+    // The path the engine actually read. Declared before the call for the same TDZ reason as
+    // `logPaths`. Warnings only fire on a later successful `close`, by which time this has
+    // been rewritten to the UTF-8 copy when one was made (SOL-21).
+    let sourcePath = fullArgs.inputFile
+    // Stamped on every event this request produces, including the ones emitted synchronously
+    // before `startTranslate` returns and including a refusal. Both pages listen on these two
+    // channels for the whole life of the app, so an unaddressed event is delivered to runs it has
+    // nothing to do with (SOL-01).
+    const runId = args.runId
     const started = startTranslate(fullArgs, {
-      onOutput: (stream, line) => send('translate:output', { stream, line }),
+      onOutput: (stream, line) => send('translate:output', { stream, line, runId }),
       onDone: (code, op, reason, ownLogs) =>
         send('translate:done', {
           code,
+          runId,
           outputPath: op,
           // Two sources, because the two are known at different times and by different things:
           // the engine's sidecars are named up front from the arguments it was given, while the
@@ -675,10 +881,11 @@ export function registerIpc(): void {
           // output to judge, and warning about a file the user was already told about would be noise.
           // A run the app ended is excluded for the same reason: its output is partial by
           // definition, so "part of this does not look right" would be describing the Stop.
-          warnings: code === 0 && !reason ? scanOutputFiles(fullArgs.inputFile, op) : []
+          warnings: code === 0 && !reason ? scanOutputFiles(sourcePath, op) : []
         })
     })
     logPaths = started.logPaths
+    sourcePath = started.sourcePath
     return started.outputPath
   })
 
@@ -692,11 +899,23 @@ export function registerIpc(): void {
    * — one `list-models` round trip — so the classification of "rejected" versus "could not be
    * checked" is shared with the Settings panel rather than re-derived here.
    */
-  const keyPreflight = async (apiKey: string, signal: AbortSignal): Promise<KeyPreflight> => {
-    const res = await refreshModels(apiKey, signal)
-    if (res.verdict === 'valid') return { verdict: 'valid', message: '' }
+  const keyPreflight = async (
+    apiKey: string,
+    signal: AbortSignal,
+    adopt?: (child: ChildProcess) => void
+  ): Promise<KeyPreflight> => {
+    // `ownsJobSlot` is the difference between this caller and the Settings panel, and it is not
+    // cosmetic: this one runs inside a reserved transcription slot, so a Stop here must not let
+    // `startTranscribe` release that slot while the fetch's own process is still alive. Settings
+    // deliberately keeps the bounded behaviour, because it protects nothing (SOL-02).
+    const res = await refreshModels(apiKey, signal, { ownsJobSlot: true, onChild: adopt })
+    // Carried on every verdict, because it is a statement about a process rather than about the
+    // key: a fetch that survived its kill matters just as much when the key turned out to be fine.
+    const survivor = { orphaned: res.orphaned, orphanPid: res.orphanPid, orphan: res.orphan }
+    if (res.verdict === 'valid') return { verdict: 'valid', message: '', ...survivor }
     if (res.verdict === 'rejected') {
       return {
+        ...survivor,
         verdict: 'rejected',
         message:
           `The API rejected this key before the transcription started: ${res.error} ` +
@@ -704,24 +923,26 @@ export function registerIpc(): void {
       }
     }
     return {
+      ...survivor,
       verdict: 'unchecked',
       message: `The API key could not be checked first: ${res.error} Starting anyway.`
     }
   }
 
   ipcMain.handle('transcribe:start', async (_e, args: TranscribeArgs) => {
-    if (!passesModelGuard(args.model, args.apiKeys)) return ''
+    if (!passesModelGuard(args.model, args.apiKeys, args.runId, 1)) return ''
     // Awaited because unreadable audio is converted first; the renderer's contract is
     // unchanged, since `startTranscribe` was already a Promise across the IPC boundary.
+    const runId = args.runId
     return await startTranscribe(
       args,
       {
-        onOutput: (stream, line) => send('translate:output', { stream, line }),
+        onOutput: (stream, line) => send('translate:output', { stream, line, runId }),
         // Transcription has no Save step — the output path was chosen before the run — so its
         // console log is already sitting beside that output and never travels through
         // `dialog:saveFile`. It is reported here purely so the panel can point at it.
         onDone: (code, outputPath, reason, logPaths) =>
-          send('translate:done', { code, outputPath, reason, logPaths }),
+          send('translate:done', { code, outputPath, reason, logPaths, runId }),
         // The payload is built by the bridge, which is the only thing that knows whether the
         // conversion is still running; this just forwards it.
         onProgress: (p) => send('ffmpeg:progress', p)
