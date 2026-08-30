@@ -12,6 +12,7 @@ import { openExclusive } from './exclusiveFile'
 import { forceKillTree, hasExited, livePid, waitForChildExit } from './processExit'
 import { createStallWatch } from '../shared/stallBudget'
 import { effectiveThinkingLevel, modelCapabilities } from '../shared/modelCaps'
+import { sourceFragmentNote } from '../shared/outputSanity'
 import {
   DEFAULT_RESUME_CONTEXT_SIZE,
   type EngineInfo,
@@ -163,10 +164,11 @@ function beginJob(handlers: SpawnHandlers, outputPath: string): Job | null {
     prepChild: null,
     console: consoleLog,
     finished: false,
-    // Teed here rather than at each call site so the file gets what the panel gets, from every
-    // path that reports anything: the masked command line, the preparation notices, the
-    // engine's own two streams, the stall budget's verdict. A site that forgot to tee would be
-    // a line the user can see but cannot send.
+    // Teed here rather than at each call site so every path that reports to the
+    // panel also reaches the file: the masked command line, the preparation
+    // notices, the engine's own two streams, the stall budget's verdict. The
+    // file then reduces terminal chrome (REP-26); a site that forgot to tee
+    // would still be a line the user can see but cannot send.
     handlers: consoleLog
       ? {
           ...handlers,
@@ -761,12 +763,27 @@ export function ensureUtf8Subtitle(inputPath: string): SubtitleNormalizeResult {
  */
 function thinkingArgs(level: string, budget: number, model: string): string[] {
   const caps = modelCapabilities(model)
-  if (level === 'disabled' && caps.canDisableThinking) return ['--no-thinking']
   if (caps.thinking === 'level') {
-    return ['--thinking-level', effectiveThinkingLevel(model, level)]
+    const effective = effectiveThinkingLevel(model, level)
+    if (effective === 'default') return []
+    return ['--thinking-level', effective]
   }
   if (caps.thinking === 'budget') {
+    // cli.py `if args.thinking_budget:` drops a literal 0. On non-Pro 2.5 that 0 is Google's
+    // documented disable, so clamping it to 1 would send a real budget the user never asked
+    // for — skip-and-log, same as generationParamArgs. On 2.5 Pro the floor is 128: a stale
+    // 0 (shared field after a Flash→Pro switch, leftover from an older build) is just another
+    // below-minimum value and must clamp, not omit. Omitting would let Pro run at its own
+    // default, which is not the previous 128 and can cost far more.
+    if (!budget && caps.thinkingBudgetMin < 128) {
+      console.warn(`[gst] skipping --thinking-budget ${budget}: the engine silently ignores a zero value`)
+      return []
+    }
     const clamped = Math.min(caps.thinkingBudgetMax, Math.max(caps.thinkingBudgetMin, budget))
+    if (!clamped) {
+      console.warn(`[gst] skipping --thinking-budget ${clamped}: the engine silently ignores a zero value`)
+      return []
+    }
     return ['--thinking-budget', String(clamped)]
   }
   return []
@@ -1284,6 +1301,16 @@ export function startTranslate(a: TranslateArgs, handlers: SpawnHandlers): Start
     return { outputPath, logPaths: [], sourcePath: a.inputFile }
   }
   const normalized: TranslateArgs = { ...a, inputFile: norm.path }
+  // Cheap, before spawn: a YouTube-style auto-transcript that breaks mid-sentence is the measured
+  // trigger for cue merging (REP-32). This is a log diagnostic, not a Start-button gate — it does
+  // not block, and a read or parse that fails must not skip the run. The Translate page lifts the
+  // same line out of the runner log so it is visible while the raw log is collapsed.
+  try {
+    const note = sourceFragmentNote(fs.readFileSync(norm.path, 'utf-8'))
+    if (note) handlers.onOutput('stdout', note)
+  } catch {
+    // ignore
+  }
   // The normalized subtitle is deliberately NOT scratch: gst names the progress and thoughts
   // logs from this path, and TranslatePage copies those sidecars after the job ends.
   run(j, buildTranslateArgs(normalized, outputPath), normalized.apiKeys)

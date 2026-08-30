@@ -6,37 +6,55 @@
  * That divergence is how the `-latest` bug survived: the UI happily offered a Thinking
  * Level control for an id the engine classified as "no thinking config at all".
  *
- * Every rule below mirrors the engine's own substring matching, in the same order, so
- * the UI can never offer a combination the engine will reject:
+ * Thinking / transcription substring matching still mirrors the engine, in the same
+ * order, so the UI can never offer a combination the engine will reject:
  *
  *   main.py:210  `if "2.0" in model or "gemini" not in model:`  -> no thinking config
  *   main.py:212  `elif "2.5" in model:`                          -> thinking_budget
  *   main.py:227  `elif "3" in model:`                            -> thinking_level
- *   main.py:229  Gemini 3 Pro rejects "minimal" (coerced to "low")
- *   main.py:235  thinking cannot be disabled for 3.x (coerced to the lowest level)
  *   main.py:214  Gemini 2.5 Pro cannot disable thinking; budget floor is 128
- *   main.py:603  non-pro 2.5 budget range 0..24576; main.py:609 pro range 128..32768
+ *   main.py:603  non-pro 2.5 budget range; engine accepts 0, this app cannot deliver it
  *   main.py:1544 transcription requires "gemini" AND ("2.5" OR "3")
  *
- * Verified against `Source Codes/gemini-srt-translator-3.7.0.zip`.
+ * Two deliberate divergences, both in the safe direction (declining to send a flag
+ * rather than inventing one):
  *
- * `acceptsSamplingParams` is the one rule here that comes from GOOGLE rather than from the
- * engine, and it is the only one that is about the future rather than the present. See
- * `SAMPLING_DEPRECATED_FROM`.
+ *   - An id containing `transcribe` is `thinking: 'none'` even though the engine's
+ *     grammar classifies it as 3.x. Dedicated transcription models reject thinking
+ *     configuration (REP-28). `supportsTranscription` stays true — that test is
+ *     separate, or the Transcribe page would refuse the model it exists for.
+ *   - Per-model thinking *levels* are transcribed from Google's docs, not from the
+ *     engine's single `pro → reject minimal` rule (REP-31).
+ *
+ * `acceptsSamplingParams` is the one rule here that comes from GOOGLE rather than from
+ * the engine, and it is the only one that is about the future rather than the present.
+ * See `SAMPLING_DEPRECATED_FROM`.
  */
 
 export type ThinkingMode = 'level' | 'budget' | 'none'
 
+/** Values Gemini 3.x `thinking_level` accepts. `default` means omit the flag. */
+export type ThinkingLevelId = 'default' | 'minimal' | 'low' | 'medium' | 'high'
+
 export interface ModelCapabilities {
   /** Which thinking control (if any) the engine reads for this model. */
   thinking: ThinkingMode
-  /** Whether `--no-thinking` is honoured rather than silently coerced. */
+  /**
+   * Whether this app can actually turn thinking off for the model.
+   *
+   * Always false. Google documents `thinkingBudget = 0` as a disable for 2.5 Flash /
+   * Flash-Lite, and the engine's `--no-thinking` exists, but `--no-thinking` coerces 3.x
+   * to `minimal` and `cli.py` drops a falsy 0, so neither path is deliverable.
+   */
   canDisableThinking: boolean
   /** Valid `--thinking-budget` range; only meaningful when `thinking === 'budget'`. */
   thinkingBudgetMin: number
   thinkingBudgetMax: number
-  /** Gemini 3 Pro coerces `minimal` to `low`, so the UI should not offer it. */
-  rejectsMinimalLevel: boolean
+  /**
+   * Thinking-level values this model accepts, including `default` (send nothing).
+   * Empty when `thinking !== 'level'`.
+   */
+  acceptedThinkingLevels: ThinkingLevelId[]
   /** `gst transcribe` hard-errors for anything that is not a Gemini 2.5/3.x model. */
   supportsTranscription: boolean
   /**
@@ -122,7 +140,75 @@ const NO_THINKING: Omit<ModelCapabilities, 'supportsTranscription' | 'acceptsSam
   canDisableThinking: false,
   thinkingBudgetMin: 0,
   thinkingBudgetMax: 0,
-  rejectsMinimalLevel: false
+  acceptedThinkingLevels: []
+}
+
+/**
+ * Google's per-model `thinking_level` sets, without `default`.
+ *
+ * Transcribed 2026-08-29 from:
+ *   https://ai.google.dev/gemini-api/docs/generate-content/thinking
+ *   https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking
+ *   https://firebase.google.com/docs/ai-logic/thinking
+ *
+ * `low` and `high` are the only two every level-model in that table supports. An id
+ * that is not recognised here falls back to those two (plus `default`), never to the
+ * full set — offering `minimal` on a guess is how REP-28 happened.
+ *
+ * Re-read those pages when Google ships a model; the fallback is what keeps a stale
+ * row from becoming a 400.
+ */
+const ALL_LEVELS: Exclude<ThinkingLevelId, 'default'>[] = ['minimal', 'low', 'medium', 'high']
+
+function documentedThinkingLevels(model: string): Exclude<ThinkingLevelId, 'default'>[] | null {
+  // Image models are named ids, not a substring family. `image` + `flash` would otherwise
+  // hand every future `*-flash-image` Minimal, and `image` + `pro` would hand every
+  // `*-pro-image` High-only — both skip the unknown fallback. Suffixes after `-image`
+  // (`-preview`, dated builds) are the same model; the `models/` prefix is too.
+  //
+  // Gemini 3 Pro Image: HIGH only.
+  if (/(?:^|\/)gemini-3(?:\.0)?-pro-image(?:-|$)/.test(model)) {
+    return ['high']
+  }
+  // Gemini 3.1 Flash Image / Flash-Lite Image: MINIMAL + HIGH.
+  if (/(?:^|\/)gemini-3\.1-flash(?:-lite)?-image(?:-|$)/.test(model)) {
+    return ['minimal', 'high']
+  }
+  // Any other image id is unknown. Return before the text-model rules so
+  // `gemini-3.5-flash-image` cannot inherit 3.5 Flash's full set via substring.
+  if (model.includes('image')) {
+    return null
+  }
+  // Gemini 3.7 Flash: LOW, MEDIUM, HIGH. MINIMAL is a documented 400. No "pro" in the id.
+  if (model.includes('3.7') && model.includes('flash') && !model.includes('lite')) {
+    return ['low', 'medium', 'high']
+  }
+  // Gemini 3.1 Pro: LOW, MEDIUM, HIGH.
+  if (model.includes('3.1') && model.includes('pro')) {
+    return ['low', 'medium', 'high']
+  }
+  // Gemini 3 Pro / 3.0 Pro (not 3.1+, not image): LOW and HIGH only. MEDIUM 400s.
+  if (/(?:^|\/)gemini-3(?:\.0)?-pro(?:-|$)/.test(model)) {
+    return ['low', 'high']
+  }
+  // Families Google lists as accepting all four discrete levels. 3.5 Flash-Lite and
+  // 3.1 Flash-Lite are in that table; 3.6 Flash-Lite and 3 Flash-Lite are not, so they
+  // must not inherit the full set via a substring match.
+  if (
+    (model.includes('3.6-flash') && !model.includes('lite')) ||
+    model.includes('3.5-flash') ||
+    model.includes('3.1-flash') ||
+    (/(?:^|\/)gemini-3(?:\.0)?-flash(?:-|$)/.test(model) && !model.includes('lite'))
+  ) {
+    return ALL_LEVELS
+  }
+  return null
+}
+
+function levelChoicesFor(model: string): ThinkingLevelId[] {
+  const documented = documentedThinkingLevels(model)
+  const discrete = documented ?? ['low', 'high']
+  return ['default', ...discrete]
 }
 
 export function modelCapabilities(id: string): ModelCapabilities {
@@ -133,10 +219,18 @@ export function modelCapabilities(id: string): ModelCapabilities {
   // Checked last, exactly like the engine, so "gemini-2.5-...-03-25" stays a 2.5 model.
   const is3x = !is20 && !is25 && model.includes('3')
   const isPro = model.includes('pro')
+  const isTranscribe = model.includes('transcribe')
 
   const supportsTranscription = isGemini && (is25 || is3x)
   const acceptsSamplingParams = acceptsSampling(model, isGemini)
   const shared = { supportsTranscription, acceptsSamplingParams }
+
+  // Dedicated transcription models reject ThinkingConfig. Classifying them as 3.x
+  // (the engine's grammar) would send `--thinking-level` and 400. Keep
+  // supportsTranscription true so the Transcribe page does not refuse them.
+  if (isTranscribe) {
+    return { ...NO_THINKING, ...shared }
+  }
 
   if (!isGemini || is20) {
     return { ...NO_THINKING, ...shared }
@@ -145,11 +239,11 @@ export function modelCapabilities(id: string): ModelCapabilities {
   if (is25) {
     return {
       thinking: 'budget',
-      // 2.5 Pro cannot disable thinking — the engine forces the budget back up to 128.
-      canDisableThinking: !isPro,
-      thinkingBudgetMin: isPro ? 128 : 0,
+      canDisableThinking: false,
+      // Engine range includes 0 for non-Pro, but cli.py `if args.thinking_budget:` drops it.
+      thinkingBudgetMin: isPro ? 128 : 1,
       thinkingBudgetMax: isPro ? 32768 : 24576,
-      rejectsMinimalLevel: false,
+      acceptedThinkingLevels: [],
       ...shared
     }
   }
@@ -157,11 +251,10 @@ export function modelCapabilities(id: string): ModelCapabilities {
   if (is3x) {
     return {
       thinking: 'level',
-      // "You cannot disable thinking for Gemini 3 models" — it coerces to the lowest level.
       canDisableThinking: false,
       thinkingBudgetMin: 0,
       thinkingBudgetMax: 0,
-      rejectsMinimalLevel: isPro,
+      acceptedThinkingLevels: levelChoicesFor(model),
       ...shared
     }
   }
@@ -188,13 +281,18 @@ export function samplingDefaults(id: string): { temperature: number; topP: numbe
 }
 
 /**
- * The thinking level the engine will actually apply, after its own coercions. Used so
- * the UI never claims a setting that the engine silently overrides.
+ * The thinking level the engine will actually apply, after this app's own coercions.
+ *
+ * `default` (and a leftover stored `disabled`) means omit the flag — Google's documented
+ * behaviour when no thinking level is specified. An unsupported discrete level is replaced
+ * by one this model accepts, so the Settings warning never claims a setting that would 400.
  */
 export function effectiveThinkingLevel(id: string, level: string): string {
   const caps = modelCapabilities(id)
   if (caps.thinking !== 'level') return level
-  if (level === 'disabled') return caps.rejectsMinimalLevel ? 'low' : 'minimal'
-  if (level === 'minimal' && caps.rejectsMinimalLevel) return 'low'
-  return level
+  if (level === 'default' || level === 'disabled') return 'default'
+  if (caps.acceptedThinkingLevels.includes(level as ThinkingLevelId)) return level
+  if (caps.acceptedThinkingLevels.includes('low')) return 'low'
+  const discrete = caps.acceptedThinkingLevels.find((v) => v !== 'default')
+  return discrete ?? 'default'
 }

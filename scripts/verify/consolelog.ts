@@ -264,14 +264,46 @@ async function main(): Promise<void> {
     check('S1 it holds stdout', text.includes('Translating batch 1/3...'))
     check('S1 and stderr, in the same file', text.includes('a warning the engine printed to stderr'))
     check('S1 including the last line, which had no newline', text.includes('Translation completed'))
-    // Acceptance 1: the panel is capped and collapsed, the file is neither.
+    // Acceptance 1 used to require the file to keep every redraw. REP-26 counts consecutive
+    // identical lines instead; the distinct retry line must still be there, once.
+    check('S1 a repeated line is still present', text.includes(REPEAT))
     check(
-      'S1 a repeated line is repeated, not counted',
-      text.split(REPEAT).length - 1 === 5,
+      'S1 consecutive redraws are counted, not duplicated',
+      text.split(REPEAT).length - 1 === 1 && text.includes('[redrawn 4 times]'),
       `${text.split(REPEAT).length - 1} occurrences`
     )
     check('S1 and how the run ended is recorded', text.includes('[run ended: exit code 0]'))
     check('S1 the job slot is released', !isRunning())
+  }
+
+  // ── S10: multi-line engine frame after the real app preamble (SOL-57) ─────────
+  section('S10 — a multi-line redraw after the app preamble is folded, not duplicated')
+  {
+    const frame = Array.from({ length: 11 }, (_, i) => `engine message ${i + 1}`)
+    __useScriptedEngine((e: ScriptedEngine) => {
+      for (let i = 0; i < 20; i++) {
+        for (const l of frame) e.stdout.write(`${l}\n`)
+      }
+      e.end(0)
+    })
+
+    const { handlers, done } = ending()
+    const started = startTranslate(translateArgs(makeSubtitle('s10.srt')), handlers)
+    const end = await endsWithin(done, 60_000, 'S10 the run reached an ending')
+    LITTER.push(started.outputPath, ...(end.logPaths ?? []))
+
+    const logPath = findConsoleLog(end.logPaths)
+    const text = logPath && fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf-8') : ''
+    check('S10 the command line is in the file', text.includes('$ ') && text.includes('translate -i '))
+    check('S10 and Starting engine is in the file', text.includes('Starting engine…'))
+    check(
+      'S10 each frame line lands once',
+      text.split('engine message 1\n').length - 1 === 1,
+      `${text.split('engine message 1\n').length - 1} copies`
+    )
+    check('S10 the other 19 draws are a counter', text.includes('[redrawn 19 times]'))
+    check('S10 the ending is recorded', text.includes('[run ended: exit code 0]'))
+    check('S10 the job slot is released', !isRunning())
   }
 
   // ── S2: transcription, which has no Save step ─────────────────────────────────

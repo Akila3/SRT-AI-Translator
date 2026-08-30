@@ -23,9 +23,10 @@ electron/
   main/      index.ts ipc.ts store.ts migrations.ts pythonBridge.ts ffmpeg.ts modelsList.ts tmdb.ts
   preload/   contextBridge -> window.api, plus its .d.ts contract
   shared/    types.ts languages.ts modelCaps.ts keyOrder.ts   (imported by BOTH processes)
-             outputSanity.ts ffmpegProgress.ts maskedCommand.ts stallBudget.ts   (pure, gate-tested)
+             outputSanity.ts ffmpegProgress.ts maskedCommand.ts stallBudget.ts
+             consoleLog.ts terminalNoise.ts transcribeSettings.ts
 src/
-  App.tsx    pages/  components/  lib/useRunner.ts  store/useStore.ts  data/
+  App.tsx    pages/  components/  lib/useRunner.ts lib/appVersion.ts  store/useStore.ts  data/
 scripts/
   build_python.py   freezes the engine with PyInstaller
   gates/            the automated check suite
@@ -404,8 +405,8 @@ already imports both, so it supplies the check and the bridge stays unaware of w
 | Trap when sending them | The CLI tests truthiness, so a literal **`0`** is silently dropped. |
 | Is there a model whitelist? | **No.** The list is whatever the key can see, filtered to models supporting `generateContent`. New Google models work with no code change. |
 | Is the model name validated? | Yes, strictly, as a membership test against that live list — an unknown id exits non-zero. |
-| How is thinking config chosen? | Substring match on the model id: `2.0` → none, `2.5` → budget, `3` → level. An id matching none of these gets nothing. |
-| Transcription support | Requires `gemini` **and** (`2.5` or `3`) in the name, else a hard error — which is why the UI blocks it before spawning. |
+| How is thinking config chosen? | Substring match on the model id, then a **per-model accepted-level table** (dated 2026-08-29). `2.0` → none, `2.5` → budget (min 1 except Pro 128), `3` → level. **Default sends no flag.** Unknown ids get Default/Low/High only. Dedicated `*transcribe*` ids are thinking-none but may still transcribe. |
+| Transcription support | Requires `gemini` **and** (`2.5` or `3`) in the name for the hard UI refusal. Dedicated transcribe models **warn and allow**; audio-incapable ids are refused. The Transcribe page reads caps from the **resolved** override model, not always `settings.model`. |
 
 ### stdout parsing
 
@@ -452,6 +453,11 @@ waiting on stdin. Making that flag conditional would immediately make it reachab
 6. **Never `parseFloat` a model version.** `parseFloat('3.10') === 3.1`, so a two-digit minor sorts
    below `3.9` and "newest" silently picks the older model.
 7. **A migration cannot prove a model is gone**, only a complete refresh can.
+8. **`handleNew` goes through `clearVideo()` and must not clear `ffmpeg`.** `setVideoFile('')` lets an in-flight probe refill tracks.
+9. **Console-log reduction filters before folding** and never buffers unwritten lines. Matching is a suffix of the written window.
+10. **Alignment is a separate sanity axis** (best-window Pearson r). Do not fold it into S1–S3. Do not “fix” passthrough exclusion. Do not Save a failed translate run.
+11. **Never strip digits generally for stall-budget novelty.** Closed-list countdown canonicalisation only.
+12. **Settings schema is version 5.** Stored `thinkingLevel: 'disabled'` becomes `'default'`.
 
 ## Building and checking
 

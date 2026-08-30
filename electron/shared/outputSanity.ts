@@ -16,6 +16,10 @@
  * clean run, and the first false alarm on a good file teaches the user to ignore the warning
  * permanently. Each cue is therefore judged against its own source cue and against the run's own
  * distribution, never against a constant.
+ *
+ * Alignment (REP-32) is a fourth signal, reported separately from S1/S2/S3. Filler is "this text is
+ * not a translation". Drift is "the text may be fine but it sits on the wrong timings". Folding
+ * those into one heading sends the user looking for garbage words when the real fault is a shift.
  */
 
 /** A contiguous range of cues that two independent signals both found suspicious. */
@@ -67,6 +71,45 @@ const S2_WINDOW_SHARE = 0.2
  * predicts fewer than one.
  */
 const S3_AGREEMENT = 0.9
+
+/**
+ * A window is drifted when its length-correlation sits this far below the run's **best** window.
+ *
+ * The first sketch used the median window. That fails on the measured flash-3.5 Boeing output:
+ * most windows are already drifted, so the median *is* the fault (0.32) and a median-relative
+ * rule goes quiet exactly when the file is worst. The best window is still the run's own high
+ * side — Bad Sisters sits 0.75–0.97 against its own 0.97 — and a 0.30 drop is wider than that
+ * clean spread and narrower than the Boeing drop (0.9-ish against under 0.4).
+ *
+ * If even the best window is below ALIGN_BEST_FLOOR, there is no healthy region to compare
+ * against. That floor is below every clean window measured on Bad Sisters (min 0.75), but it is
+ * still an absolute length-correlation cut: a correctly aligned pair whose cue lengths naturally
+ * do not move together would trip it. The floor therefore only fires when the source is also
+ * fragment-heavy — the measured cause of merging — so a low-r language with professional
+ * punctuation stays silent. Relative-drop detection does not need that corroboration.
+ * Windows with no length variance (r === null) are treated as aligned.
+ */
+const ALIGN_DROP = 0.3
+const ALIGN_BEST_FLOOR = 0.6
+
+/** Pearson needs this many usable cues in a window; below that the coefficient is noise. */
+const ALIGN_MIN_POINTS = 20
+
+/**
+ * Share of adjacent cues that look like a sentence continuing across the boundary — the source
+ * ends without sentence-final punctuation and the next cue starts lowercase.
+ *
+ * Measured: professionally authored Bad Sisters 3.5%; YouTube-style Boeing auto-transcript 53%.
+ * Twenty percent is several times the professional rate and well under the auto-caption rate.
+ * A short file is not judged: the five-cue live probe must not grow a scary pre-flight note.
+ */
+const FRAGMENT_NOTE_RATE = 0.2
+
+const SENTENCE_END = /[.!?…。！？]["'”’)\]]*\s*$/u
+const STARTS_LOWER = /^\p{Ll}/u
+
+const EXPECTED_COUNT = /Expected\s+(\d+)\s+lines,\s+got\s+(\d+)/i
+const FRAGMENT_NOTE_IN_LOG = /cues often break mid-sentence/i
 
 interface Cue {
   index: number
@@ -149,6 +192,200 @@ function median(values: number[]): number {
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
 }
 
+/** Pearson r, or null when a series has no variance (or too few points). */
+function pearson(xs: number[], ys: number[]): number | null {
+  const n = xs.length
+  if (n < 3 || n !== ys.length) return null
+  let sx = 0
+  let sy = 0
+  for (let i = 0; i < n; i++) {
+    sx += xs[i]
+    sy += ys[i]
+  }
+  const mx = sx / n
+  const my = sy / n
+  let num = 0
+  let dx = 0
+  let dy = 0
+  for (let i = 0; i < n; i++) {
+    const x = xs[i] - mx
+    const y = ys[i] - my
+    num += x * y
+    dx += x * x
+    dy += y * y
+  }
+  if (dx === 0 || dy === 0) return null
+  return num / Math.sqrt(dx * dy)
+}
+
+function flattenCue(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function fragmentRateFromSources(texts: readonly string[]): number {
+  if (texts.length < MIN_CUES) return 0
+  let hits = 0
+  let considered = 0
+  for (let i = 0; i < texts.length - 1; i++) {
+    const a = flattenCue(texts[i])
+    const b = flattenCue(texts[i + 1])
+    if (!a || !b) continue
+    considered++
+    if (isFragmentContinuation(a, b)) hits++
+  }
+  return considered === 0 ? 0 : hits / considered
+}
+
+function isFragmentContinuation(prev: string, next: string): boolean {
+  const a = flattenCue(prev)
+  const b = flattenCue(next)
+  if (!a || !b) return false
+  return !SENTENCE_END.test(a) && STARTS_LOWER.test(b)
+}
+
+/**
+ * Share of adjacent cue pairs that look like a sentence continuing across the boundary.
+ *
+ * Returns 0 for a file too short to judge. Exported so G3 can pin the threshold without spawning.
+ */
+export function fragmentContinuationRate(sourceText: string): number {
+  let cues: Cue[]
+  try {
+    cues = parseCues(sourceText ?? '')
+  } catch {
+    return 0
+  }
+  if (cues.length < MIN_CUES) return 0
+  return fragmentRateFromSources(cues.map((c) => c.text))
+}
+
+/**
+ * Log line the bridge emits when the source looks fragment-heavy. The Translate page picks this
+ * out of the runner log so the advisory is visible while StatusCard is showing (the raw log is
+ * hidden during a run). Exported so G3 can pin the same recognition the abort helper uses.
+ */
+export function fragmentNoteInLog(logText: string): string | null {
+  for (const line of (logText ?? '').split('\n')) {
+    if (FRAGMENT_NOTE_IN_LOG.test(line)) return line
+  }
+  return null
+}
+
+/**
+ * Advisory for a fragment-heavy source, or null when the file is fine / too short / unreadable.
+ *
+ * Emitted on stdout before spawn so it is in the console log. It does not block Start. A parse
+ * failure must not throw: a note we cannot produce is not a reason to skip the run.
+ */
+export function sourceFragmentNote(sourceText: string): string | null {
+  const rate = fragmentContinuationRate(sourceText)
+  if (rate < FRAGMENT_NOTE_RATE) return null
+  const pct = Math.round(rate * 100)
+  return (
+    `This source file’s cues often break mid-sentence (about ${pct}%). ` +
+    `The model will probably merge those fragments into whole sentences, which shifts later text ` +
+    `onto the wrong timings and can stop the run. Re-segment the source into whole sentences ` +
+    `before translating.`
+  )
+}
+
+/**
+ * Plain-language explanation when the engine reported a short item count, or null for any other
+ * failure.
+ *
+ * Three consecutive errors do not identify a cause — that stop is generic — so they are not
+ * treated as evidence of merging. A short `Expected N lines, got M` is the observed fact; merging
+ * is one possible cause, not a diagnosis, unless the same log already carries the fragment-heavy
+ * source note. Takes flattened console text so G3 can cover it without a renderer. Must not
+ * recommend a stronger model, and must not imply that batch size or a streaming toggle reliably
+ * fixes merging — both were measured, and both failed.
+ */
+export function explainTranslateAbort(logText: string): string | null {
+  const text = logText ?? ''
+  const count = EXPECTED_COUNT.exec(text)
+  const short = count !== null && Number(count[2]) < Number(count[1])
+  if (!short) return null
+  if (fragmentNoteInLog(text)) {
+    return (
+      `The model returned fewer subtitle lines than it was asked for. This source’s cues often ` +
+      `break mid-sentence, so merging those fragments is the likely cause — later text would sit ` +
+      `on the wrong timings. Re-segment the source into whole sentences and translate that. ` +
+      `A stronger model, a smaller batch, or turning streaming off will not reliably stop the merging.`
+    )
+  }
+  return (
+    `The model returned fewer subtitle lines than it was asked for. That can happen when it ` +
+    `merges cues that continue across boundaries, or when a response is truncated or malformed. ` +
+    `Merging is one possible cause, not a confirmed diagnosis. Check the log for the count mismatch.`
+  )
+}
+
+/**
+ * Windowed source-vs-output cue-length correlation. Independent of S1/S2/S3: a drifted cue is a
+ * perfectly plausible translation of *something*, so those signals stay quiet.
+ *
+ * Passthrough cues (excluded from filler) stay in the sample — a name or a number at the same
+ * index is evidence the pairing is still lined up. Cues already known to be filler (S1 run
+ * members, S2 shortfall) are left out, so a collapsed stretch cannot be misread as a shift.
+ */
+function alignmentWarnings(pairs: Pair[], runMember: readonly boolean[]): SanityWarning[] {
+  interface Win {
+    start: number
+    end: number
+    r: number | null
+  }
+  const wins: Win[] = []
+  for (let start = 0; start < pairs.length; start += STEP) {
+    const end = Math.min(start + WINDOW, pairs.length)
+    if (end - start < MIN_CUES) break
+    const xs: number[] = []
+    const ys: number[] = []
+    for (let i = start; i < end; i++) {
+      if (pairs[i].shortfall || runMember[i]) continue
+      xs.push(pairs[i].source.length)
+      ys.push(pairs[i].output.length)
+    }
+    wins.push({
+      start,
+      end: end - 1,
+      r: xs.length >= ALIGN_MIN_POINTS ? pearson(xs, ys) : null
+    })
+  }
+  const defined = wins.filter((w): w is Win & { r: number } => w.r !== null)
+  if (defined.length === 0) return []
+  const best = Math.max(...defined.map((w) => w.r))
+  // Absolute floor only with a fragment-heavy source (SOL-63). Relative drop always applies.
+  const wholeFileLow =
+    best < ALIGN_BEST_FLOOR && fragmentRateFromSources(pairs.map((p) => p.source)) >= FRAGMENT_NOTE_RATE
+  const drifted = defined.filter((w) => (wholeFileLow ? true : best - w.r >= ALIGN_DROP))
+  if (drifted.length === 0) return []
+
+  const regions: Array<{ start: number; end: number }> = []
+  for (const win of drifted) {
+    const last = regions[regions.length - 1]
+    if (last && win.start <= last.end + 1) last.end = Math.max(last.end, win.end)
+    else regions.push({ start: win.start, end: win.end })
+  }
+
+  return regions.map((region) => {
+    const first = pairs[region.start].index
+    const last = pairs[region.end].index
+    const count = region.end - region.start + 1
+    return {
+      from: first,
+      to: last,
+      cues: count,
+      signals: ['wrong timings'],
+      message:
+        `Cues ${first}–${last} (${count} of ${pairs.length}) look like a real translation on ` +
+        `the wrong timings — source and output cue lengths stop moving together in this range, ` +
+        `which is what happens when the model merges lines and every later cue shifts earlier. ` +
+        `Nothing has been changed: the file is exactly as the engine wrote it. Check that the ` +
+        `dialogue still sits on the right pictures before using it.`
+    }
+  })
+}
+
 /**
  * The longest run of consecutive byte-identical translations in `slice`, ignoring runs whose sources
  * are also all identical.
@@ -179,8 +416,9 @@ function longestIdenticalRun(slice: Pair[]): number {
 /**
  * Compare a translated subtitle against the source it came from.
  *
- * Returns one warning per suspect region, or an empty list. Never throws: a missing, empty or
- * unparseable file must produce no warning and must not stop the run from ending.
+ * Returns one warning per suspect region, or an empty list. Filler regions (S1/S2/S3) and
+ * alignment regions are separate entries — they describe different faults. Never throws: a
+ * missing, empty or unparseable file must produce no warning and must not stop the run from ending.
  */
 export function scanTranslatedOutput(sourceText: string, outputText: string): SanityWarning[] {
   let sourceCues: Cue[]
@@ -280,7 +518,9 @@ export function scanTranslatedOutput(sourceText: string, outputText: string): Sa
     )
     if (signals.length >= 2) affected.push({ start, end: end - 1, signals: new Set(signals) })
   }
-  if (affected.length === 0) return []
+
+  const drifted = alignmentWarnings(pairs, runMember)
+  if (affected.length === 0) return drifted
 
   // Merge windows that overlap or touch; regions separated by a clean window are reported separately.
   const regions: Affected[] = []
@@ -294,7 +534,7 @@ export function scanTranslatedOutput(sourceText: string, outputText: string): Sa
     }
   }
 
-  return regions.map((region) => {
+  const filler = regions.map((region) => {
     // Trim to the cues that actually carry evidence. Windows are 50 wide and step by 10, so raw
     // window bounds overshoot by up to 49 cues on either side; a warning that names 31 clean cues
     // as suspect is the kind of imprecision that gets warnings ignored.
@@ -321,4 +561,5 @@ export function scanTranslatedOutput(sourceText: string, outputText: string): Sa
         `as the engine wrote it. Check that range before using it.`
     }
   })
+  return [...filler, ...drifted]
 }

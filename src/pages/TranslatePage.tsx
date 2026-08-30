@@ -18,7 +18,8 @@ import { SubTrackPanel } from '../components/SubTrackPanel'
 import { TmdbSearch } from '../components/TmdbSearch'
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from '../data/languages'
 import { consoleLogPathFor, findConsoleLog } from '../../electron/shared/consoleLog'
-import { retryIsCurrent } from '../lib/logView'
+import { explainTranslateAbort, fragmentNoteInLog } from '../../electron/shared/outputSanity'
+import { retryIsCurrent, type LogRow } from '../lib/logView'
 import { companionName } from '../lib/outputName'
 import { useRunner } from '../lib/useRunner'
 import type { SubtitleTrack, TranslateArgs } from '../../electron/shared/types'
@@ -52,6 +53,14 @@ interface FfmpegTask {
  * like this run's report is the older one, and this run's real report is somewhere nobody was told
  * about (SOL-15). A stepped name is anything that does not begin with the subtitle's stem and a dot.
  */
+function flattenRunnerLog(rows: LogRow[]): string {
+  const lines: string[] = []
+  for (const r of rows) {
+    if (r.kind === 'block') lines.push(...r.lines)
+  }
+  return lines.join('\n')
+}
+
 function renamedAmong(sidecars: string[], subtitlePath: string): string[] {
   const base = subtitlePath.split(/[\\/]/).pop() ?? ''
   const stem = base.replace(/\.[^.]*$/, '')
@@ -230,6 +239,11 @@ export default function TranslatePage(): React.JSX.Element {
   if (!settings) return <div className="p-6 text-sm text-gray-500 dark:text-gray-400">Loading…</div>
 
   const isRunning = state.status === 'running'
+  const logText = flattenRunnerLog(state.log)
+  const fillerWarnings = state.warnings.filter((w) => !/wrong timings/i.test(w))
+  const timingWarnings = state.warnings.filter((w) => /wrong timings/i.test(w))
+  const fragmentLogNote = fragmentNoteInLog(logText)
+  const abortExplain = state.status === 'error' ? explainTranslateAbort(logText) : null
 
   /**
    * Why this run cannot start, or an empty string when it can.
@@ -370,6 +384,18 @@ export default function TranslatePage(): React.JSX.Element {
     setRenamedSidecars([])
     setStaleSidecars([])
     setSaveError('')
+    // Through the helper, never `setVideoFile('')`: that would skip the SOL-37 epoch bump
+    // and let an in-flight probe repopulate tracks for a video no longer in the field.
+    clearVideo()
+    setSrtFile('')
+    setAudioFile('')
+    setDescription('')
+    setTmdbResetKey((k) => k + 1)
+    setRunSource('')
+    setStartError('')
+    setShowLog(false)
+    setRunStartedAt(0)
+    setProbeStartedAt(0)
   }
 
   async function handleSave(): Promise<void> {
@@ -591,6 +617,21 @@ export default function TranslatePage(): React.JSX.Element {
             />
           </div>
         )}
+        {/*
+          An export can still be running when New clears the video. SubTrackPanel is keyed
+          by `videoFile` and returns null once the field is empty, so the row that was
+          showing "Extracting…" is gone. The lock itself is left alone (it is what stops a
+          second ffmpeg call); this is the progress that lock used to display.
+        */}
+        {ffmpeg?.kind === 'export' && !videoFile && (
+          <div className="mt-4">
+            <Working
+              label="Finishing a track extraction started before New"
+              pct={ffmpeg.pct}
+              since={ffmpeg.startedAt}
+            />
+          </div>
+        )}
 
         {(isRunning || state.status === 'done' || state.status === 'error' || state.status === 'stopped') && (
           <div className="mt-4 space-y-3">
@@ -610,6 +651,12 @@ export default function TranslatePage(): React.JSX.Element {
 
             {isRunning && retryIsCurrent(state.retry, state.currentLine) && state.retry && (
               <RetryNotice retry={state.retry} />
+            )}
+
+            {fragmentLogNote && (
+              <div className="rounded-md border border-amber-400 bg-amber-50 px-3.5 py-3 dark:border-amber-700/60 dark:bg-amber-900/25">
+                <p className="text-sm text-amber-800 dark:text-amber-300">{fragmentLogNote}</p>
+              </div>
             )}
 
             {state.status === 'error' || state.status === 'stopped' ? (
@@ -636,12 +683,24 @@ export default function TranslatePage(): React.JSX.Element {
               that filled 136 cues with two characters still reported success. This says so before
               the user picks a destination — it never blocks the save, and the file is untouched.
             */}
-            {state.status === 'done' && state.warnings.length > 0 && (
+            {state.status === 'done' && fillerWarnings.length > 0 && (
               <div className="rounded-md border border-amber-400 bg-amber-50 px-3.5 py-3 dark:border-amber-700/60 dark:bg-amber-900/25">
                 <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
                   ⚠ Part of this translation does not look right.
                 </p>
-                {state.warnings.map((w, i) => (
+                {fillerWarnings.map((w, i) => (
+                  <p key={i} className="mt-1 text-sm text-amber-800 dark:text-amber-300">
+                    {w}
+                  </p>
+                ))}
+              </div>
+            )}
+            {state.status === 'done' && timingWarnings.length > 0 && (
+              <div className="rounded-md border border-amber-400 bg-amber-50 px-3.5 py-3 dark:border-amber-700/60 dark:bg-amber-900/25">
+                <p className="text-sm font-semibold text-amber-900 dark:text-amber-200">
+                  ⚠ Text may be correct but on the wrong timings.
+                </p>
+                {timingWarnings.map((w, i) => (
                   <p key={i} className="mt-1 text-sm text-amber-800 dark:text-amber-300">
                     {w}
                   </p>
@@ -649,9 +708,22 @@ export default function TranslatePage(): React.JSX.Element {
               </div>
             )}
             {state.status === 'error' && (
-              <p className="text-sm font-medium text-red-600 dark:text-red-400">
-                Process ended with an error (exit code {state.exitCode}). Check the log above.
-              </p>
+              <div className="flex items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-red-600 dark:text-red-400">
+                    {abortExplain ??
+                      `Process ended with an error (exit code ${state.exitCode}). Check the log above.`}
+                  </p>
+                  {abortExplain && (
+                    <p className="mt-1 text-sm text-red-600/80 dark:text-red-400/80">
+                      The run did not finish, so nothing was saved.
+                    </p>
+                  )}
+                </div>
+                <Button variant="ghost" onClick={handleNew}>
+                  New
+                </Button>
+              </div>
             )}
             {/*
               A run the user ended is not a failure, and saying so in red told them the app had

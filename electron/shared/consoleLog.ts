@@ -1,5 +1,5 @@
 /**
- * The run's console, kept as a file (REP-1 / REP-3).
+ * The run's console, kept as a file (REP-1 / REP-3 / REP-26).
  *
  * Two reports independently asked for a way to keep what the run printed. The obvious
  * implementation — write out the array the panel is showing — is the one thing that must not
@@ -8,15 +8,24 @@
  * the user a file that is missing the middle of their run and has had its repetition folded
  * away, which is precisely the run they need to read when something went wrong.
  *
- * So the file is written from the source instead, line by line as it arrives, and the panel
- * stays capped. The two artefacts then describe the same run at different fidelities: the panel
- * is what you watch, the file is what you send.
+ * So the file is written from the source instead, as lines arrive, and the panel stays capped.
+ * REP-26 then reduces *terminal chrome* in the file — ANSI cursor frames, progress bars,
+ * token-tally redraws, carriage-return overwrites, and a block the engine reprints — because
+ * a two-hour transcription otherwise records 25,000 TTY frames for a dozen lines of substance.
+ * Distinct lines still land the moment they first appear. A speculative suffix
+ * copy is held until it completes (counted, not written) or breaks (written), so
+ * a repeated prefix with new context cannot vanish (SOL-60). A crash then costs
+ * at most a missing `[redrawn N times]` tally and an in-flight unmatched prefix.
+ * The panel's grow-frame folding stays in `logView.ts`; the two artefacts share
+ * only the chrome predicates in `terminalNoise.ts`.
  *
  * This module is the fidelity policy and nothing else — it never touches the filesystem. That
  * keeps the ceiling, the truncation marker and the tail testable as data, and it keeps the
  * module importable from the renderer, which needs the suffix constant and must not pull a
  * Node API into the browser bundle. `TextEncoder` rather than `Buffer` for the same reason.
  */
+
+import { isBarFrame, parseTokenLine, stripTerminalChrome } from './terminalNoise'
 
 /**
  * The compound suffix. Exported rather than written out at each site because
@@ -111,6 +120,9 @@ function clampLine(line: string, maxBytes: number): { text: string; dropped: num
  * reached the newest output is held in a bounded buffer instead, and appended after a marker
  * that says how much of the middle is missing. The shape is FP-3's, one artefact down.
  *
+ * Reduction (ANSI, bars, tokens, redraws) runs before the clamp, so an oversized payload
+ * is still cut to `lineBytes` and an S8-style `payload:xxx…` stays legible.
+ *
  * @param append receives already-newline-terminated text; the caller decides where it lands.
  */
 export function createConsoleLog(
@@ -125,33 +137,143 @@ export function createConsoleLog(
   let dropped = 0
   let closed = false
   const tail: string[] = []
+  /**
+   * Last distinct lines actually written. Bounded so a pathological growing reprint cannot
+   * keep the entire run in memory; independent of the panel's MAX_FRAME. Matching is by
+   * suffix — a redraw starts at the last occurrence of its first line, so the app preamble
+   * in front of the engine history is not part of the frame (SOL-57).
+   */
+  const REDRAW_WINDOW = 200
+  let window: string[] = []
+  /** Start of the suffix currently being matched; -1 when not in a redraw. */
+  let matchFrom = -1
+  let matchAt = 0
+  /**
+   * Lines consumed as a speculative suffix copy. Discarded only when the suffix
+   * completes (it was a redraw). Emitted on mismatch, blank, end marker, or close
+   * so a repeated prefix with new context cannot vanish (SOL-60).
+   */
+  let pending: string[] = []
+  let redraws = 0
+  let lastToken: string | null = null
+  let lastBlank = false
+
+  function emit(line: string): void {
+    // Clamped before any accounting, so ONE bounded value flows into both the head and the
+    // tail. Doing it at either of the two sites below would leave the other one open.
+    const clamped = clampLine(line, limits.lineBytes)
+    const text = clamped.dropped
+      ? `${clamped.text} ${CONSOLE_LOG_TRUNCATION_MARK} ${clamped.dropped} more character(s) on this line\n`
+      : `${line}\n`
+    if (headBytes < limits.headBytes) {
+      headBytes += byteLength(text)
+      append(text)
+      return
+    }
+    tail.push(text)
+    tailBytes += byteLength(text)
+    // `length > 1` so a single line larger than the whole tail budget is still kept: the last
+    // thing a run said is never the thing this drops.
+    while (tailBytes > limits.tailBytes && tail.length > 1) {
+      tailBytes -= byteLength(tail.shift() as string)
+      dropped++
+    }
+  }
+
+  function flushRedraw(): void {
+    if (redraws === 0) return
+    emit(`[redrawn ${redraws} times]`)
+    redraws = 0
+  }
+
+  function flushToken(): void {
+    if (lastToken === null) return
+    emit(lastToken)
+    lastToken = null
+  }
+
+  function noteUnique(line: string): void {
+    emit(line)
+    window.push(line)
+    if (window.length > REDRAW_WINDOW) window.shift()
+  }
+
+  function abortMatch(): void {
+    flushRedraw()
+    for (const line of pending) noteUnique(line)
+    pending = []
+    matchFrom = -1
+    matchAt = 0
+  }
+
+  function consider(line: string): void {
+    // A redraw is a suffix of what has already been written, not the whole window.
+    // The app preamble (`$ …`, `Starting engine…`) sits at the front and is never
+    // reprinted; the engine reprints from its first history line (SOL-57).
+    if (matchFrom >= 0 && matchAt < window.length && line === window[matchAt]) {
+      pending.push(line)
+      matchAt++
+      if (matchAt === window.length) {
+        pending = []
+        redraws++
+        matchAt = matchFrom
+      }
+      return
+    }
+
+    if (matchFrom >= 0) abortMatch()
+
+    const idx = window.lastIndexOf(line)
+    if (idx >= 0) {
+      matchFrom = idx
+      matchAt = idx + 1
+      if (matchAt === window.length) {
+        redraws++
+        matchAt = matchFrom
+        return
+      }
+      pending = [line]
+      return
+    }
+
+    noteUnique(line)
+  }
 
   return {
     write(line: string): void {
       if (closed) return
-      // Clamped before any accounting, so ONE bounded value flows into both the head and the
-      // tail. Doing it at either of the two sites below would leave the other one open.
-      const clamped = clampLine(line, limits.lineBytes)
-      const text = clamped.dropped
-        ? `${clamped.text} ${CONSOLE_LOG_TRUNCATION_MARK} ${clamped.dropped} more character(s) on this line\n`
-        : `${line}\n`
-      if (headBytes < limits.headBytes) {
-        headBytes += byteLength(text)
-        append(text)
+      const cleaned = stripTerminalChrome(line)
+      if (cleaned.trim() === '') {
+        abortMatch()
+        if (lastBlank) return
+        lastBlank = true
+        emit('')
         return
       }
-      tail.push(text)
-      tailBytes += byteLength(text)
-      // `length > 1` so a single line larger than the whole tail budget is still kept: the last
-      // thing a run said is never the thing this drops.
-      while (tailBytes > limits.tailBytes && tail.length > 1) {
-        tailBytes -= byteLength(tail.shift() as string)
-        dropped++
+      lastBlank = false
+
+      if (isBarFrame(cleaned)) return
+      if (parseTokenLine(cleaned)) {
+        lastToken = cleaned
+        return
       }
+
+      // Production writes this immediately before close(). Flush the deferred
+      // token tally first so the file ends …tally, [run ended: …].
+      if (cleaned.startsWith('[run ended:')) {
+        abortMatch()
+        flushToken()
+        emit(cleaned)
+        return
+      }
+
+      consider(cleaned)
     },
 
     close(): void {
       if (closed) return
+      abortMatch()
+      flushToken()
       closed = true
       if (tail.length === 0 && dropped === 0) return
       const mb = Math.round(limits.headBytes / (1024 * 1024))

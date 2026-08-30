@@ -108,12 +108,25 @@ export function paidQuotaTooltip(model: string, modelLabel: string): string {
 }
 
 export const THINKING_LEVELS = [
-  { value: 'disabled', label: 'Disabled' },
+  { value: 'default', label: 'Default' },
   { value: 'minimal', label: 'Minimal' },
-  { value: 'low', label: 'Low (Default)' },
+  { value: 'low', label: 'Low' },
   { value: 'medium', label: 'Medium' },
   { value: 'high', label: 'High' }
 ]
+
+/** Options a thinking-level Select should offer, given this model's accepted set. */
+export function thinkingLevelsForModel(
+  accepted: readonly string[],
+  current?: string
+): { value: string; label: string }[] {
+  const opts = THINKING_LEVELS.filter((o) => accepted.includes(o.value))
+  if (current && !opts.some((o) => o.value === current)) {
+    const orphan = THINKING_LEVELS.find((o) => o.value === current)
+    opts.push(orphan ?? { value: current, label: `${current} (not supported)` })
+  }
+  return opts
+}
 
 export const SERVICE_TIERS = [
   { value: 'standard', label: 'Standard (Default)' },

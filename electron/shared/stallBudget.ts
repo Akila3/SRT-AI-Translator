@@ -12,8 +12,8 @@
  *
  * **The budget comes first; the pattern only refines it.** Classifying free-form engine text as
  * fatal is how a working run gets killed by a message that merely resembles an auth error, and
- * a false positive destroys a paid, half-finished run. So nothing here terminates on a phrase.
- * A recognised marker only chooses which tier applies and what the message says.
+ * a false positive destroys a paid, half-finished run. So nothing here terminates on a phrase
+ * alone. A recognised marker only chooses which tier applies and what the message says.
  *
  * **The measure is absence of novelty, not repetition.** The obvious rule — "N identical
  * consecutive error lines" — is disproved by REP-2's own log: the engine redraws its live
@@ -25,7 +25,17 @@
  *
  * Deliberately NOT parsed: segment numbers, timestamps, percentages. Reading progress out of the
  * text would re-import the engine's stdout contract into the termination path and break the
- * moment a line is reworded — turning a cosmetic engine change into a killed run.
+ * moment a line is reworded — turning a cosmetic engine change into a killed run. REP-30's
+ * countdown canonicalisation is a closed list of known engine back-off ticks, not a general
+ * digit strip: collapsing `Transcribing audio segment N to N` would make a healthy long run look
+ * stalled (18k distinct segment lines in the measured transcription log).
+ *
+ * **Do not count display lines as retries (SOL-56).** The engine redraws its accumulated
+ * message history, and `pythonBridge` feeds that raw stream to `observe`. A recovered 400 that
+ * stays in that block would look like a hit every frame. There is no trustworthy retry
+ * boundary on stdout, so there is no independent recurrence kill. The measured REP-30 failure
+ * is fixed by collapsing the quota countdown (and by not treating a newly worded 400 as
+ * progress). Real work — a new segment or batch — still resets the budget.
  */
 
 /**
@@ -71,6 +81,14 @@ const FATAL_MARKERS: { re: RegExp; cause: string }[] = [
   { re: /\b401\b[^\n]{0,40}UNAUTHENTICATED/i, cause: 'the API refused the request as unauthenticated' }
 ]
 
+/**
+ * Engine 3.7.0, translate and transcribe: `for j in range(60, 0, -1)` prints a distinct line
+ * every second. Each tick is novel under a raw string key, which resets the budget and was
+ * how the measured REP-30 log (73 distinct lines, 431 non-novel streak) never reached 500.
+ */
+const QUOTA_WAIT = /All API quotas exceeded, waiting \d+ seconds/
+const QUOTA_WAIT_KEY = 'All API quotas exceeded, waiting N seconds'
+
 /** Cursor moves and erases from the engine's live display, which are not part of the text. */
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
 
@@ -90,6 +108,15 @@ export interface StallWatch {
 
 function normalize(line: string): string {
   return line.replace(ANSI, '').trim()
+}
+
+/** Novelty key: known back-off ticks collapse; everything else is the line as shown. */
+function noveltyKey(text: string): string {
+  return text.replace(QUOTA_WAIT, QUOTA_WAIT_KEY)
+}
+
+function isQuotaCountdown(text: string): boolean {
+  return QUOTA_WAIT.test(text)
 }
 
 /** Whole minutes and seconds, for a message a user has to act on. */
@@ -114,10 +141,10 @@ export function createStallWatch(): StallWatch {
   let marker: string | null = null
   let tripped = false
 
-  const remember = (text: string): void => {
-    if (seen.has(text)) return
-    seen.add(text)
-    recent.push(text)
+  const remember = (key: string): void => {
+    if (seen.has(key)) return
+    seen.add(key)
+    recent.push(key)
     if (recent.length > NOVELTY_WINDOW) {
       const dropped = recent.shift()
       if (dropped !== undefined) seen.delete(dropped)
@@ -133,22 +160,27 @@ export function createStallWatch(): StallWatch {
         lastNovelAt = now
       }
 
-      if (!seen.has(text)) {
-        // Forward progress. Everything the budget had accumulated is void, including the
-        // recognised marker: an auth error followed by real work is a run that recovered.
-        remember(text)
-        sinceNovel = 0
-        lastNovelAt = now
-        marker = null
-        return null
+      const key = noveltyKey(text)
+      const hit = FATAL_MARKERS.find((m) => m.re.test(text))
+      // A newly worded 400, or a known countdown tick, is not forward progress. Real work
+      // (a new segment or batch) still is — that is what keeps a recovered run alive when
+      // the old 400 stays in the engine's redrawn history (SOL-56).
+      const nonProgress = Boolean(hit) || isQuotaCountdown(text)
+
+      if (!seen.has(key)) {
+        remember(key)
+        if (!nonProgress) {
+          sinceNovel = 0
+          lastNovelAt = now
+          marker = null
+          return null
+        }
+      } else {
+        remember(key)
       }
 
-      remember(text)
       sinceNovel++
-      if (!marker) {
-        const hit = FATAL_MARKERS.find((m) => m.re.test(text))
-        if (hit) marker = hit.cause
-      }
+      if (hit && !marker) marker = hit.cause
 
       const quietMs = now - lastNovelAt
       if (marker && sinceNovel >= TIER1_LINES && quietMs >= TIER1_QUIET_MS) {

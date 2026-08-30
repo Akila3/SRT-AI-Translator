@@ -11,14 +11,23 @@ import {
   LogPanel,
   RetryNotice,
   Select,
+  NumberInput,
+  ToggleRow,
   Working
 } from '../components/ui'
-import { THINKING_LEVELS } from '../data/freeTier'
+import { thinkingLevelsForModel } from '../data/freeTier'
 import { retryIsCurrent } from '../lib/logView'
 import { useRunner } from '../lib/useRunner'
 import { findConsoleLog } from '../../electron/shared/consoleLog'
-import { modelCapabilities } from '../../electron/shared/modelCaps'
-import type { TranscribeArgs } from '../../electron/shared/types'
+import { effectiveThinkingLevel, modelCapabilities } from '../../electron/shared/modelCaps'
+import {
+  resolveTranscribeSettings,
+  seedTranscribeOverride,
+  transcribeRefusalMessage,
+  transcribeEngineWarning,
+  createSerialPatchQueue
+} from '../../electron/shared/transcribeSettings'
+import type { AppSettings, TranscribeArgs } from '../../electron/shared/types'
 
 const MEDIA_FILTERS = [
   { name: 'Audio/Video', extensions: ['mp4', 'mkv', 'mov', 'avi', 'webm', 'mp3', 'aac', 'wav', 'm4a', 'flac'] }
@@ -44,6 +53,19 @@ export default function TranscribePage(): React.JSX.Element {
    */
   const [convert, setConvert] = useState<{ pct: number | null; startedAt: number } | null>(null)
   const startOwned = useRef(false)
+  /**
+   * Override writes go through this queue, not `patch` directly. `patch` only updates
+   * the store after IPC returns, so Start against getState() during a pending write
+   * would still send the previous model (SOL-55).
+   */
+  const [savePending, setSavePending] = useState(0)
+  const saveQueue = useRef<ReturnType<typeof createSerialPatchQueue<Partial<AppSettings>>> | null>(null)
+  if (saveQueue.current === null) {
+    saveQueue.current = createSerialPatchQueue(
+      (p) => useStore.getState().patch(p),
+      setSavePending
+    )
+  }
 
   useEffect(() => {
     if (mediaFile && !outputFile) {
@@ -72,8 +94,14 @@ export default function TranscribePage(): React.JSX.Element {
 
   if (!settings) return <div className="p-6 text-sm text-gray-500 dark:text-gray-400">Loading…</div>
 
-  const caps = modelCapabilities(settings.model)
+  // Capabilities and argv must follow the model this page will actually send, which is
+  // the override when the toggle is on and Settings otherwise. Reading `settings.model`
+  // here would validate one model and run another.
+  const resolved = resolveTranscribeSettings(settings)
+  const caps = modelCapabilities(resolved.model)
+  const engineWarning = transcribeEngineWarning(resolved.model)
   const isRunning = state.status === 'running'
+  const overrideLive = settings.transcribeOverride && !isRunning
   /**
    * Where this run's console was written. Unlike Translate's, this path is already the final
    * one — there is no temp original and no copy — so it is used exactly as it arrives.
@@ -84,43 +112,59 @@ export default function TranscribePage(): React.JSX.Element {
   // model selected" even though one is stored. Settings keeps the id visible in that case;
   // this field must too, or the two pages disagree about what will run.
   const modelOptions = settings.cachedModels.map((m) => ({ value: m.id, label: m.label }))
-  if (settings.model && !settings.cachedModels.some((m) => m.id === settings.model)) {
-    modelOptions.unshift({ value: settings.model, label: `${settings.model} (not in fetched list)` })
+  if (resolved.model && !settings.cachedModels.some((m) => m.id === resolved.model)) {
+    modelOptions.unshift({ value: resolved.model, label: `${resolved.model} (not in fetched list)` })
   }
 
   async function handleStart(): Promise<void> {
     if (startOwned.current) return
     setStartError('')
-    if (!settings) return
     if (!mediaFile) {
       setStartError('Choose an audio or video file to transcribe.')
       return
     }
-    // The engine refuses transcription outright for anything that is not a Gemini 2.5/3.x
-    // model, so say so here instead of spawning a job that exits immediately.
-    if (!modelCapabilities(settings.model).supportsTranscription) {
-      setStartError(
-        `Transcription requires a Gemini 2.5 or 3.x model. "${settings.model}" cannot transcribe — ` +
-          'pick a different model in Settings → Model & Generation.'
-      )
-      return
-    }
+    // Claim the start lock before waiting: a second click while a save is in flight
+    // must not launch two runs once the queue drains.
     startOwned.current = true
     try {
+      // The store is only updated after setSettings resolves. Wait out every override
+      // write queued from this page, then re-resolve, so Start sends the selection the
+      // user just made rather than the previous one (SOL-55). A failed persist must
+      // not fall through to launching that previous selection.
+      const persistError = await saveQueue.current!.idle()
+      if (persistError) {
+        setStartError(
+          'Could not save the transcription model selection, so the run was not started. ' +
+            'Check the model and thinking values and try again.'
+        )
+        return
+      }
+
+      const s = useStore.getState().settings
+      if (!s) return
+      const run = resolveTranscribeSettings(s)
+      // The engine refuses transcription outright for anything that is not a Gemini 2.5/3.x
+      // model, so say so here instead of spawning a job that exits immediately. The model
+      // named is the resolved one — the id this run would send — and the remedy points at
+      // the picker that can actually change it.
+      if (!modelCapabilities(run.model).supportsTranscription) {
+        setStartError(transcribeRefusalMessage(run.model, s.transcribeOverride))
+        return
+      }
       const args: TranscribeArgs = {
         mediaFile,
         outputFile: outputFile || mediaFile.replace(/\.[^.]+$/, '') + '.srt',
         targetLang: '',
-        model: settings.model,
-        apiKeys: settings.apiKeys,
-        thinkingLevel: settings.thinkingLevel,
-        thinkingBudget: settings.thinkingBudget,
-        customGenerationParams: settings.customGenerationParams,
-        temperature: settings.temperature,
-        topP: settings.topP,
-        topK: settings.topK,
+        model: run.model,
+        apiKeys: s.apiKeys,
+        thinkingLevel: run.thinkingLevel,
+        thinkingBudget: run.thinkingBudget,
+        customGenerationParams: s.customGenerationParams,
+        temperature: s.temperature,
+        topP: s.topP,
+        topK: s.topK,
         description: description || undefined,
-        ffmpegPath: settings.ffmpegPath || undefined
+        ffmpegPath: s.ffmpegPath || undefined
       }
       setRunStartedAt(Date.now())
       setConvert(null)
@@ -128,6 +172,19 @@ export default function TranscribePage(): React.JSX.Element {
     } finally {
       startOwned.current = false
     }
+  }
+
+  function handleNew(): void {
+    reset()
+    // Source and destination together: the effect at lines 48-52 derives the output
+    // only when `mediaFile && !outputFile`, so clearing one alone either orphans a
+    // path or immediately regenerates it from the old media file.
+    setMediaFile('')
+    setOutputFile('')
+    setDescription('')
+    setStartError('')
+    setRunStartedAt(0)
+    setConvert(null)
   }
 
   return (
@@ -193,35 +250,86 @@ export default function TranscribePage(): React.JSX.Element {
 
       <Box>
         <BoxTitle>Model</BoxTitle>
-        <div className="flex gap-6">
+        <ToggleRow
+          label="Use a different model for transcription"
+          desc="Off (default): this tab uses the model and thinking values from Settings. On: the choices below are stored here and survive restart."
+          checked={settings.transcribeOverride}
+          onChange={(on) => {
+            if (on) saveQueue.current!.enqueue(seedTranscribeOverride(settings))
+            else saveQueue.current!.enqueue({ transcribeOverride: false })
+          }}
+          disabled={isRunning}
+          tip={
+            'OFF (default): transcription uses the same model and thinking setting as Translate, from Settings → Model & Generation.\n\n' +
+            'ON: this page keeps its own model and thinking values. They are written to disk, so they come back after a restart, and they do not change the Settings used for translation.\n\n' +
+            'The thinking control follows the model you pick here: a level dropdown for Gemini 3.x, a budget field for Gemini 2.5, and nothing for a model that has no thinking config. A model that cannot accept audio is refused before anything is sent.'
+          }
+        />
+        <div className="mt-4 flex gap-6">
           <div className="flex-1">
-            <Label tip="The model used for transcription is taken from your Settings → Model & Generation. Shown here for reference.">
-              Model (from Settings)
-            </Label>
-            <Select value={settings.model} onChange={() => {}} disabled options={modelOptions} className="w-full" />
-          </div>
-          <div className="flex-1">
-            <Label tip="Thinking level for transcription (Gemini 3.x). Low is usually sufficient. Disabled for 2.x models, which use the Thinking Budget from Settings instead.">
-              Thinking Level
+            <Label
+              tip={
+                settings.transcribeOverride
+                  ? 'The model this transcription will use. Stored on this tab; turning the override off returns to Settings without forgetting this choice.'
+                  : 'The model used for transcription is taken from Settings → Model & Generation. Turn the override on to pick a different one here.'
+              }
+            >
+              Model{settings.transcribeOverride ? '' : ' (from Settings)'}
             </Label>
             <Select
-              value={caps.thinking === 'level' ? settings.thinkingLevel : ''}
-              onChange={() => {}}
-              disabled={caps.thinking !== 'level'}
-              options={
-                caps.thinking === 'level'
-                  ? THINKING_LEVELS
-                  : [{ value: '', label: '3.x models only' }]
-              }
+              value={resolved.model}
+              onChange={(v) => saveQueue.current!.enqueue({ transcribeModel: v })}
+              disabled={!overrideLive}
+              options={modelOptions}
               className="w-full"
             />
           </div>
+          {caps.thinking === 'level' && (
+            <div className="flex-1">
+              <Label tip="Thinking level for this transcription (Gemini 3.x). Default sends no thinking-level flag. Low is usually sufficient.">
+                Thinking Level
+              </Label>
+              <Select
+                value={resolved.thinkingLevel}
+                onChange={(v) => saveQueue.current!.enqueue({ transcribeThinkingLevel: v })}
+                disabled={!overrideLive}
+                options={thinkingLevelsForModel(caps.acceptedThinkingLevels, resolved.thinkingLevel)}
+                className="w-full"
+              />
+              {effectiveThinkingLevel(resolved.model, resolved.thinkingLevel) !== resolved.thinkingLevel && (
+                <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                  This model does not support “{resolved.thinkingLevel}” — it will run at “
+                  {effectiveThinkingLevel(resolved.model, resolved.thinkingLevel)}”.
+                </p>
+              )}
+            </div>
+          )}
+          {caps.thinking === 'budget' && (
+            <div className="flex-1">
+              <Label tip="Thinking budget for this transcription (Gemini 2.5). 0 cannot be delivered — the engine discards it.">
+                Thinking Budget
+              </Label>
+              <NumberInput
+                value={resolved.thinkingBudget}
+                min={caps.thinkingBudgetMin}
+                max={caps.thinkingBudgetMax}
+                onChange={(v) => saveQueue.current!.enqueue({ transcribeThinkingBudget: v ?? 512 })}
+                disabled={!overrideLive}
+                className="w-28"
+              />
+              <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
+                Range for this model: {caps.thinkingBudgetMin} – {caps.thinkingBudgetMax.toLocaleString()}
+              </p>
+            </div>
+          )}
         </div>
         {!caps.supportsTranscription && (
           <p className="mt-3 text-sm text-amber-600 dark:text-amber-400">
-            “{settings.model}” cannot transcribe — the engine accepts only Gemini 2.5 and 3.x
-            models here. Choose another model in Settings → Model &amp; Generation.
+            {transcribeRefusalMessage(resolved.model, settings.transcribeOverride)}
           </p>
+        )}
+        {caps.supportsTranscription && engineWarning && (
+          <p className="mt-3 text-sm text-amber-600 dark:text-amber-400">{engineWarning}</p>
         )}
         <div className="mt-4">
           <Label tip="Optional context to help transcription accuracy — e.g. names, jargon, or the topic. Passed to the model as a hint.">
@@ -240,6 +348,9 @@ export default function TranscribePage(): React.JSX.Element {
       <Box>
         <BoxTitle>Transcribe</BoxTitle>
         {startError && <p className="mb-3 text-sm text-red-600 dark:text-red-400">{startError}</p>}
+        {caps.supportsTranscription && engineWarning && !startError && (
+          <p className="mb-3 text-sm text-amber-600 dark:text-amber-400">{engineWarning}</p>
+        )}
         <div className="flex items-center gap-2">
           {!isRunning ? (
             <Button
@@ -248,7 +359,7 @@ export default function TranscribePage(): React.JSX.Element {
                 if (e.detail > 1) return
                 void handleStart()
               }}
-              disabled={!mediaFile || !caps.supportsTranscription}
+              disabled={!mediaFile || !caps.supportsTranscription || savePending > 0}
             >
               Start Transcription
             </Button>
@@ -269,7 +380,7 @@ export default function TranscribePage(): React.JSX.Element {
               <Button variant="secondary" onClick={() => window.api.showItemInFolder(state.outputPath)}>
                 Open folder
               </Button>
-              <Button variant="ghost" onClick={reset}>
+              <Button variant="ghost" onClick={handleNew}>
                 New
               </Button>
             </>
@@ -325,9 +436,14 @@ export default function TranscribePage(): React.JSX.Element {
               <p className="text-sm font-medium text-green-700 dark:text-green-400">✅ Transcription saved → {state.outputPath}</p>
             )}
             {state.status === 'error' && (
-              <p className="text-sm font-medium text-red-600 dark:text-red-400">
-                Process ended with an error (exit code {state.exitCode}). Check the log above.
-              </p>
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-medium text-red-600 dark:text-red-400">
+                  Process ended with an error (exit code {state.exitCode}). Check the log above.
+                </p>
+                <Button variant="ghost" onClick={handleNew}>
+                  New
+                </Button>
+              </div>
             )}
             {/*
               A run the user ended is not a failure — see MAN-1. Transcription writes straight
@@ -342,7 +458,7 @@ export default function TranscribePage(): React.JSX.Element {
                     ? ` A partial transcription may already be at ${state.outputPath || outputFile}.`
                     : ' Nothing was written.'}
                 </p>
-                <Button variant="ghost" onClick={reset}>
+                <Button variant="ghost" onClick={handleNew}>
                   New
                 </Button>
               </div>

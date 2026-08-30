@@ -58,7 +58,8 @@ import {
   createConsoleLog,
   findConsoleLog
 } from '../../electron/shared/consoleLog'
-import { scanTranslatedOutput } from '../../electron/shared/outputSanity'
+import { isBarFrame, parseTokenLine, stripAnsi, stripTerminalChrome } from '../../electron/shared/terminalNoise'
+import { scanTranslatedOutput, sourceFragmentNote, explainTranslateAbort, fragmentNoteInLog } from '../../electron/shared/outputSanity'
 import {
   durationFromProbe,
   parseTimestamp,
@@ -79,7 +80,13 @@ import {
   orderKeySlots,
   reindexEvidenceAfterRemoval
 } from '../../electron/shared/keyOrder'
-import { RATE_LIMITS_URL, lookupFreeTier, paidQuotaTooltip } from '../../src/data/freeTier'
+import {
+  RATE_LIMITS_URL,
+  THINKING_LEVELS,
+  lookupFreeTier,
+  paidQuotaTooltip,
+  thinkingLevelsForModel
+} from '../../src/data/freeTier'
 import {
   HEAD_LINES,
   TAIL_LINES,
@@ -96,6 +103,13 @@ import {
   modelCapabilities,
   samplingDefaults
 } from '../../electron/shared/modelCaps'
+import {
+  createSerialPatchQueue,
+  resolveTranscribeSettings,
+  seedTranscribeOverride,
+  transcribeRefusalMessage,
+  transcribeEngineWarning
+} from '../../electron/shared/transcribeSettings'
 import { valueOnBlur, valueWhileTyping, type NumberFieldRules } from '../../src/lib/numberField'
 import { companionName, extractedTrackName } from '../../src/lib/outputName'
 import {
@@ -313,6 +327,186 @@ section('G1b — fixture F9 (provenance backfill)')
   eq('F9 label preserved', out[0].label, 'Gemini Flash Lite 3.1')
   eq('F9 existing provenance untouched', out[1].source, 'live')
   eq('F9 existing availability untouched', out[1].availableOn, [0])
+}
+
+section('G1d — M7 thinkingLevel disabled → default (REP-28)')
+{
+  const fromV0 = migrateSettings({ ...pristineProfile(), thinkingLevel: 'disabled' }, CTX)
+  eq('M7 a v0 Disabled profile becomes Default', fromV0.settings.thinkingLevel, 'default')
+  eq('M7 schemaVersion reaches target', fromV0.settings.schemaVersion, CURRENT_SCHEMA_VERSION)
+  const again = migrateSettings(fromV0.settings, CTX)
+  eq('M7 second pass is a no-op', again.changed, false)
+  eq('M7 second pass keeps Default', again.settings.thinkingLevel, 'default')
+
+  const fromV4 = migrateSettings({ ...pristineProfile(), schemaVersion: 4, thinkingLevel: 'disabled' }, CTX)
+  eq('M7 a v4 Disabled profile becomes Default', fromV4.settings.thinkingLevel, 'default')
+
+  const kept = migrateSettings({ ...pristineProfile(), schemaVersion: 4, thinkingLevel: 'high' }, CTX)
+  eq('M7 does not rewrite a real stored level', kept.settings.thinkingLevel, 'high')
+}
+
+section('G1e — transcribe override resolver (REP-27)')
+{
+  const globals = {
+    transcribeOverride: false,
+    transcribeModel: 'gemini-2.5-flash',
+    transcribeThinkingLevel: 'high',
+    transcribeThinkingBudget: 4096,
+    model: 'gemini-3.1-flash-lite',
+    thinkingLevel: 'low',
+    thinkingBudget: 512
+  }
+  eq('G1e override off ignores stored transcribe fields', resolveTranscribeSettings(globals), {
+    model: 'gemini-3.1-flash-lite',
+    thinkingLevel: 'low',
+    thinkingBudget: 512
+  })
+  eq(
+    'G1e override on uses the stored transcribe fields',
+    resolveTranscribeSettings({ ...globals, transcribeOverride: true }),
+    { model: 'gemini-2.5-flash', thinkingLevel: 'high', thinkingBudget: 4096 }
+  )
+  eq(
+    'G1e empty override fields fall back to global',
+    resolveTranscribeSettings({
+      transcribeOverride: true,
+      transcribeModel: '',
+      transcribeThinkingLevel: '',
+      transcribeThinkingBudget: 0,
+      model: 'gemini-3.1-flash-lite',
+      thinkingLevel: 'medium',
+      thinkingBudget: 512
+    }),
+    { model: 'gemini-3.1-flash-lite', thinkingLevel: 'medium', thinkingBudget: 512 }
+  )
+
+  const seeded = seedTranscribeOverride(globals)
+  eq('G1e seed turns the override on', seeded.transcribeOverride, true)
+  eq('G1e seed keeps a stored model rather than overwriting it', seeded.transcribeModel, 'gemini-2.5-flash')
+  const firstOn = seedTranscribeOverride({
+    ...globals,
+    transcribeModel: '',
+    transcribeThinkingLevel: '',
+    transcribeThinkingBudget: 0
+  })
+  eq('G1e first-on seed copies the global model', firstOn.transcribeModel, 'gemini-3.1-flash-lite')
+  eq('G1e first-on seed copies the global thinking level', firstOn.transcribeThinkingLevel, 'low')
+  eq('G1e first-on seed copies the global budget', firstOn.transcribeThinkingBudget, 512)
+
+  check(
+    'G1e override-off refusal points at Settings',
+    transcribeRefusalMessage('gemini-2.0-flash', false).includes('Settings → Model & Generation')
+  )
+  check(
+    'G1e override-on refusal points at the local picker',
+    transcribeRefusalMessage('gemini-2.0-flash', true).includes('above')
+  )
+  check(
+    'G1e refusal names the model that would have run',
+    transcribeRefusalMessage('gemini-2.0-flash', false).includes('gemini-2.0-flash')
+  )
+  const dedicatedWarn = transcribeEngineWarning('gemini-3.5-transcribe')
+  check('G1e a dedicated transcribe model is warned, not refused', dedicatedWarn !== null)
+  check(
+    'G1e the warning names the system instruction',
+    (dedicatedWarn ?? '').includes('system instruction')
+  )
+  check(
+    'G1e and the JSON response schema',
+    (dedicatedWarn ?? '').toLowerCase().includes('json') &&
+      (dedicatedWarn ?? '').toLowerCase().includes('schema')
+  )
+  check(
+    'G1e and names the model that would run',
+    (dedicatedWarn ?? '').includes('gemini-3.5-transcribe')
+  )
+  eq('G1e an ordinary 3.x model is not warned', transcribeEngineWarning('gemini-3.1-flash-lite'), null)
+  eq('G1e an audio-incapable model is not this warning', transcribeEngineWarning('gemini-2.0-flash'), null)
+  eq(
+    'G1e dedicated transcribe is still allowed by the capability test',
+    modelCapabilities('gemini-3.5-transcribe').supportsTranscription,
+    true
+  )
+  eq(
+    'G1e a transcribe-looking 2.0 id cannot transcribe',
+    modelCapabilities('gemini-2.0-transcribe').supportsTranscription,
+    false
+  )
+  eq(
+    'G1e so it does not get the warn-and-allow overlay (REP-33)',
+    transcribeEngineWarning('gemini-2.0-transcribe'),
+    null
+  )
+  check(
+    'G1e warning and refusal stay mutually exclusive',
+    transcribeEngineWarning('gemini-2.0-transcribe') === null &&
+      transcribeRefusalMessage('gemini-2.0-transcribe', true).includes('cannot transcribe')
+  )
+  check(
+    'G1e a startable dedicated id is warned, not refused',
+    transcribeEngineWarning('gemini-3.5-transcribe') !== null &&
+      modelCapabilities('gemini-3.5-transcribe').supportsTranscription
+  )
+
+  const absent = sanitizeSettingsView(
+    { ...pristineProfile(), schemaVersion: CURRENT_SCHEMA_VERSION },
+    DEFAULT_SETTINGS
+  )
+  eq('G1e a profile that predates the override defaults to off', absent.settings.transcribeOverride, false)
+  eq('G1e empty model overlay', absent.settings.transcribeModel, '')
+  eq('G1e budget 0 means unset', absent.settings.transcribeThinkingBudget, 0)
+  eq('G1e the fields are not written by sanitise', 'transcribeOverride' in absent.persist, false)
+  eq('G1e sanitise is not a persistable change', absent.changed, false)
+
+  const migrated = migrateSettings({ ...pristineProfile(), schemaVersion: CURRENT_SCHEMA_VERSION }, CTX)
+  eq('G1e current-version migration does not invent the override', migrated.changed, false)
+  eq('G1e and does not bump the schema for it', migrated.settings.schemaVersion, CURRENT_SCHEMA_VERSION)
+
+  {
+    const order: number[] = []
+    let releaseFirst!: () => void
+    const firstHold = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const q = createSerialPatchQueue(async (id: number) => {
+      if (id === 1) await firstHold
+      order.push(id)
+    })
+    q.enqueue(1)
+    q.enqueue(2)
+    eq('G1e overlapping writes are pending together', q.pending(), 2)
+    releaseFirst()
+    await q.idle()
+    eq('G1e writes land in enqueue order, not completion-race order', order, [1, 2])
+    eq('G1e the queue is idle afterwards', q.pending(), 0)
+  }
+  {
+    const order: number[] = []
+    const q = createSerialPatchQueue(async (id: number) => {
+      if (id === 1) throw new Error('persist failed')
+      order.push(id)
+    })
+    q.enqueue(1)
+    q.enqueue(2)
+    const persistError = await q.idle()
+    eq('G1e a failed write does not strand the next one', order, [2])
+    eq('G1e pending returns to 0 after a failure', q.pending(), 0)
+    eq(
+      'G1e a later successful partial write does not hide an earlier failure',
+      persistError,
+      'persist failed'
+    )
+  }
+  {
+    const q = createSerialPatchQueue(async (id: number) => {
+      if (id === 2) throw new Error('persist failed')
+    })
+    q.enqueue(1)
+    q.enqueue(2)
+    const persistError = await q.idle()
+    eq('G1e a failed last write is reported to Start', persistError, 'persist failed')
+    eq('G1e the reported failure is consumed, not sticky across later idles', await q.idle(), null)
+  }
 }
 
 // ── G1c: runtime shape repair is separate from the versioned chain (SOL-29) ────
@@ -1003,8 +1197,12 @@ function flagValue(args: string[], flag: string): string | null {
   eq('3.x uses --thinking-level', flagValue(lvl, '--thinking-level'), 'medium')
   check('3.x never receives --thinking-budget', !lvl.includes('--thinking-budget'))
 
+  const default3x = buildTranslateArgs(baseArgs({ model: 'gemini-3.1-flash-lite', thinkingLevel: 'default' }), 'C:/o.srt')
+  check('3.x Default omits --thinking-level', !default3x.includes('--thinking-level'))
+  check('3.x Default omits --no-thinking', !default3x.includes('--no-thinking'))
+
   const disabled3x = buildTranslateArgs(baseArgs({ model: 'gemini-3.1-flash-lite', thinkingLevel: 'disabled' }), 'C:/o.srt')
-  eq('3.x cannot disable thinking; coerced to minimal', flagValue(disabled3x, '--thinking-level'), 'minimal')
+  check('a leftover Disabled is treated as Default (omit)', !disabled3x.includes('--thinking-level'))
   check('3.x never receives --no-thinking', !disabled3x.includes('--no-thinking'))
 
   const pro3 = buildTranslateArgs(baseArgs({ model: 'gemini-3.1-pro', thinkingLevel: 'minimal' }), 'C:/o.srt')
@@ -1014,13 +1212,203 @@ function flagValue(args: string[], flag: string): string | null {
   eq('2.5 uses --thinking-budget', flagValue(budget, '--thinking-budget'), '4096')
 
   const disabled25 = buildTranslateArgs(baseArgs({ model: 'gemini-2.5-flash', thinkingLevel: 'disabled' }), 'C:/o.srt')
-  check('2.5 non-pro honours --no-thinking', disabled25.includes('--no-thinking'))
+  check('2.5 never receives --no-thinking', !disabled25.includes('--no-thinking'))
+  eq('2.5 still sends its budget when thinkingLevel is leftover Disabled', flagValue(disabled25, '--thinking-budget'), '512')
+
+  const zeroBudget = buildTranslateArgs(baseArgs({ model: 'gemini-2.5-flash', thinkingBudget: 0 }), 'C:/o.srt')
+  check('2.5 budget 0 is omitted, not sent as 0', !zeroBudget.includes('--thinking-budget'))
 
   const pro25 = buildTranslateArgs(baseArgs({ model: 'gemini-2.5-pro', thinkingBudget: 0 }), 'C:/o.srt')
-  eq('2.5 Pro budget is clamped to its floor', flagValue(pro25, '--thinking-budget'), '128')
+  eq('2.5 Pro budget 0 is clamped to the floor, not omitted', flagValue(pro25, '--thinking-budget'), '128')
+  eq(
+    '2.5 Pro transcription clamps a stale 0 the same way',
+    flagValue(
+      buildTranscribeArgs(
+        {
+          mediaFile: 'C:/a.mp4',
+          outputFile: 'C:/a.srt',
+          targetLang: '',
+          model: 'gemini-2.5-pro',
+          apiKeys: ['KEY-A'],
+          thinkingLevel: 'low',
+          thinkingBudget: 0,
+          customGenerationParams: false,
+          temperature: 0.5,
+          topP: 0.9,
+          topK: null
+        },
+        'C:/a.srt'
+      ),
+      '--thinking-budget'
+    ),
+    '128'
+  )
 
   const legacy = buildTranslateArgs(baseArgs({ model: 'gemini-2.0-flash' }), 'C:/o.srt')
   check('2.0 receives no thinking flags at all', !legacy.includes('--thinking-level') && !legacy.includes('--thinking-budget') && !legacy.includes('--no-thinking'))
+
+  const proFloor = buildTranslateArgs(baseArgs({ model: 'gemini-2.5-pro', thinkingBudget: 50 }), 'C:/o.srt')
+  eq('2.5 Pro budget below the floor is clamped to 128', flagValue(proFloor, '--thinking-budget'), '128')
+
+  eq('2.5 Flash floor is 1, not 0', modelCapabilities('gemini-2.5-flash').thinkingBudgetMin, 1)
+  eq('2.5 Pro floor is 128', modelCapabilities('gemini-2.5-pro').thinkingBudgetMin, 128)
+  eq('thinking cannot be switched off on Flash either', modelCapabilities('gemini-2.5-flash').canDisableThinking, false)
+
+  const dedicatedCaps = modelCapabilities('gemini-3.5-transcribe')
+  eq('dedicated transcribe model has no thinking control', dedicatedCaps.thinking, 'none')
+  eq('dedicated transcribe model can still be selected for transcription', dedicatedCaps.supportsTranscription, true)
+  const dedicated = buildTranscribeArgs(
+    {
+      mediaFile: 'C:/a.mp4',
+      outputFile: 'C:/a.srt',
+      targetLang: '',
+      model: 'gemini-3.5-transcribe',
+      apiKeys: ['KEY-A'],
+      thinkingLevel: 'minimal',
+      thinkingBudget: 512,
+      customGenerationParams: false,
+      temperature: 0.5,
+      topP: 0.9,
+      topK: null
+    },
+    'C:/a.srt'
+  )
+  check(
+    'dedicated transcribe model sends no thinking flags',
+    !dedicated.includes('--thinking-level') &&
+      !dedicated.includes('--thinking-budget') &&
+      !dedicated.includes('--no-thinking')
+  )
+
+  const txResolved = resolveTranscribeSettings({
+    transcribeOverride: true,
+    transcribeModel: 'gemini-2.5-flash',
+    transcribeThinkingLevel: 'high',
+    transcribeThinkingBudget: 2048,
+    model: 'gemini-3.1-flash-lite',
+    thinkingLevel: 'low',
+    thinkingBudget: 512
+  })
+  const txOverride = buildTranscribeArgs(
+    {
+      mediaFile: 'C:/a.mp4',
+      outputFile: 'C:/a.srt',
+      targetLang: '',
+      model: txResolved.model,
+      apiKeys: ['KEY-A'],
+      thinkingLevel: txResolved.thinkingLevel,
+      thinkingBudget: txResolved.thinkingBudget,
+      customGenerationParams: false,
+      temperature: 0.5,
+      topP: 0.9,
+      topK: null
+    },
+    'C:/a.srt'
+  )
+  eq('override model reaches -m, not the global 3.x id', flagValue(txOverride, '-m'), 'gemini-2.5-flash')
+  eq('override budget is what 2.5 receives', flagValue(txOverride, '--thinking-budget'), '2048')
+  check('override 2.5 does not receive a 3.x thinking level', !txOverride.includes('--thinking-level'))
+
+  const flash37 = modelCapabilities('gemini-3.7-flash').acceptedThinkingLevels
+  check('3.7 Flash offers Default', flash37.includes('default'))
+  check('3.7 Flash does not offer Minimal', !flash37.includes('minimal'))
+  check('3.7 Flash offers Low/Medium/High', flash37.includes('low') && flash37.includes('medium') && flash37.includes('high'))
+  eq(
+    '3.7 Flash coerces Minimal to Low',
+    flagValue(buildTranslateArgs(baseArgs({ model: 'gemini-3.7-flash', thinkingLevel: 'minimal' }), 'C:/o.srt'), '--thinking-level'),
+    'low'
+  )
+
+  const pro3id = modelCapabilities('gemini-3-pro').acceptedThinkingLevels
+  check('3 Pro offers Default', pro3id.includes('default'))
+  check('3 Pro does not offer Medium', !pro3id.includes('medium'))
+  check('3 Pro does not offer Minimal', !pro3id.includes('minimal'))
+  eq(
+    '3 Pro coerces Medium to Low',
+    flagValue(buildTranslateArgs(baseArgs({ model: 'gemini-3-pro', thinkingLevel: 'medium' }), 'C:/o.srt'), '--thinking-level'),
+    'low'
+  )
+
+  eq(
+    'unknown 3.x falls back to Default/Low/High',
+    modelCapabilities('gemini-3.9-ultra').acceptedThinkingLevels,
+    ['default', 'low', 'high']
+  )
+  eq(
+    '3 Pro Image is Default + High',
+    modelCapabilities('gemini-3-pro-image').acceptedThinkingLevels,
+    ['default', 'high']
+  )
+  eq(
+    '3 Pro Image with the API prefix is the same model',
+    modelCapabilities('models/gemini-3-pro-image').acceptedThinkingLevels,
+    ['default', 'high']
+  )
+  eq(
+    '3 Pro Image preview keeps the documented set',
+    modelCapabilities('gemini-3-pro-image-preview').acceptedThinkingLevels,
+    ['default', 'high']
+  )
+  eq('3 Pro Image coerces an unsupported level to High', effectiveThinkingLevel('gemini-3-pro-image', 'medium'), 'high')
+  eq(
+    '3.1 Flash Image is Default + Minimal + High',
+    modelCapabilities('gemini-3.1-flash-image').acceptedThinkingLevels,
+    ['default', 'minimal', 'high']
+  )
+  eq(
+    '3.1 Flash-Lite Image is the same pair',
+    modelCapabilities('gemini-3.1-flash-lite-image').acceptedThinkingLevels,
+    ['default', 'minimal', 'high']
+  )
+  eq(
+    'an unknown flash-image id falls back rather than inheriting Minimal',
+    modelCapabilities('gemini-3.9-flash-image').acceptedThinkingLevels,
+    ['default', 'low', 'high']
+  )
+  eq(
+    'an unknown pro-image id falls back rather than High-only',
+    modelCapabilities('gemini-3.9-pro-image').acceptedThinkingLevels,
+    ['default', 'low', 'high']
+  )
+  eq(
+    'stored Low stays Low on an unknown image model',
+    effectiveThinkingLevel('gemini-3.9-flash-image', 'low'),
+    'low'
+  )
+  eq(
+    'an image id does not inherit its text-model cousin’s full set',
+    modelCapabilities('gemini-3.5-flash-image').acceptedThinkingLevels,
+    ['default', 'low', 'high']
+  )
+
+  eq(
+    '3.1 Pro does not offer Minimal',
+    modelCapabilities('gemini-3.1-pro').acceptedThinkingLevels.includes('minimal'),
+    false
+  )
+  eq(
+    '3.5 Flash-Lite keeps all four discrete levels',
+    modelCapabilities('gemini-3.5-flash-lite').acceptedThinkingLevels,
+    ['default', 'minimal', 'low', 'medium', 'high']
+  )
+  eq(
+    'undocumented 3.6 Flash-Lite falls back rather than inheriting 3.6 Flash',
+    modelCapabilities('gemini-3.6-flash-lite').acceptedThinkingLevels,
+    ['default', 'low', 'high']
+  )
+
+  check('THINKING_LEVELS has a Default entry', THINKING_LEVELS.some((o) => o.value === 'default' && o.label === 'Default'))
+  check('THINKING_LEVELS has no Disabled entry', !THINKING_LEVELS.some((o) => o.value === 'disabled'))
+  check('Low is not labelled as Default', !THINKING_LEVELS.some((o) => o.value === 'low' && /default/i.test(o.label)))
+  eq(
+    'dropdown hides unsupported levels',
+    thinkingLevelsForModel(['default', 'low', 'high']).map((o) => o.value),
+    ['default', 'low', 'high']
+  )
+  check(
+    'dropdown keeps an orphan current value so the Select is not blank',
+    thinkingLevelsForModel(['default', 'low', 'high'], 'medium').some((o) => o.value === 'medium')
+  )
 
   eq('transcription capability matches the engine', modelCapabilities('gemini-2.0-flash').supportsTranscription, false)
   eq('2.5 can transcribe', modelCapabilities('gemini-2.5-flash').supportsTranscription, true)
@@ -1123,6 +1511,7 @@ section('G3 — output sanity: two signals must agree before anything is said')
     check(`G3 the range starts at or before the first bad cue`, w.from <= 464, `from ${w.from}`)
     eq('G3 the range ends at the last bad cue', w.to, 599)
     check('G3 all three signals fired', w.signals.length === 3, w.signals.join('+'))
+    check('G3 filler is not reported as a timing shift', !w.signals.includes('wrong timings'))
     check('G3 the message says the file was not altered', /exactly\s+as the engine wrote it/i.test(w.message))
   }
   eq('G3 the same file without the filler is silent', scanTranslatedOutput(srt(bad.source), srt(bad.output)).length, 0)
@@ -1269,6 +1658,200 @@ section('G3c — the scan can never strand a finished job')
   eq('G3c an empty output', scanOutputFiles(junk, empty), [])
   eq('G3c an unparseable pair', scanOutputFiles(junk, junk), [])
   eq('G3c a directory where a file was expected', scanOutputFiles(dir, junk), [])
+}
+
+section('G3d — alignment, fragment-heavy sources, abort copy (REP-32)')
+{
+  const srt = (cues: string[]): string =>
+    cues
+      .map((text, i) => {
+        const s = i * 2
+        const stamp = (sec: number): string =>
+          `00:${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')},000`
+        return `${i + 1}\n${stamp(s)} --> ${stamp(s + 1)}\n${text}\n`
+      })
+      .join('\n')
+
+  /** Length-only pair: S1/S2/S3 stay quiet (distinct, proportional, one line). */
+  function lengthPair(
+    count: number,
+    outLen: (i: number, srcLen: number) => number
+  ): { source: string[]; output: string[] } {
+    const source: string[] = []
+    const output: string[] = []
+    for (let i = 0; i < count; i++) {
+      const sl = 12 + (i % 19) * 3
+      source.push('S'.repeat(sl))
+      output.push('T'.repeat(Math.max(1, outLen(i, sl))))
+    }
+    return { source, output }
+  }
+
+  const aligned = lengthPair(400, (_i, sl) => sl)
+  eq(
+    'G3d an aligned length pair is silent',
+    scanTranslatedOutput(srt(aligned.source), srt(aligned.output)).length,
+    0
+  )
+
+  const uniformSrc = Array.from({ length: 80 }, () => 'hello world')
+  const uniformOut = Array.from({ length: 80 }, () => 'shalom olam!!')
+  eq(
+    'G3d uniform lengths (no variance) are treated as aligned',
+    scanTranslatedOutput(srt(uniformSrc), srt(uniformOut)).length,
+    0
+  )
+
+  const scramble = (i: number, sl: number): number => 12 + ((i * 7 + 3) % 19) * 3
+  const late = lengthPair(400, (i, sl) => (i < 240 ? sl : scramble(i, sl)))
+  const lateWarn = scanTranslatedOutput(srt(late.source), srt(late.output))
+  check('G3d late drift warns', lateWarn.length >= 1, `got ${lateWarn.length}`)
+  if (lateWarn.length >= 1) {
+    const w = lateWarn[0]
+    check('G3d late drift is a timing warning', w.signals.includes('wrong timings'))
+    check('G3d late drift names wrong timings', /wrong timings/i.test(w.message))
+    check('G3d late drift starts in the scrambled half', w.from >= 180, `from ${w.from}`)
+    check('G3d late drift does not accuse the aligned prefix', w.from > 50, `from ${w.from}`)
+  }
+
+  const early = lengthPair(400, (i, sl) => (i < 40 ? sl : scramble(i, sl)))
+  const earlyWarn = scanTranslatedOutput(srt(early.source), srt(early.output))
+  check('G3d early drift warns', earlyWarn.length >= 1, `got ${earlyWarn.length}`)
+  if (earlyWarn.length >= 1) {
+    check('G3d early drift is a timing warning', earlyWarn[0].signals.includes('wrong timings'))
+    check('G3d early drift starts before the late-stretch fixture', earlyWarn[0].from < 180, `from ${earlyWarn[0].from}`)
+  }
+
+  const weak = lengthPair(400, (i) => 20 + (i % 3))
+  eq(
+    'G3d weak length correlation without fragments stays silent (SOL-63)',
+    scanTranslatedOutput(srt(weak.source), srt(weak.output)).length,
+    0
+  )
+
+  function fragPad(i: number, n: number): string {
+    const stem = i % 2 === 0 ? 'this fragment continues without a stop ' : 'and the next cue starts lower '
+    if (n <= stem.length) return stem.slice(0, Math.max(1, n))
+    return stem.repeat(Math.ceil(n / stem.length)).slice(0, n)
+  }
+  const wholeFragSrc = Array.from({ length: 400 }, (_, i) => fragPad(i, 12 + (i % 19) * 3))
+  const wholeFragOut = Array.from({ length: 400 }, (_, i) => 'T'.repeat(Math.max(1, scramble(i, 12 + (i % 19) * 3))))
+  const wholeFragWarn = scanTranslatedOutput(srt(wholeFragSrc), srt(wholeFragOut))
+  check(
+    'G3d a fully drifted fragment-heavy file still warns',
+    wholeFragWarn.length >= 1,
+    `got ${wholeFragWarn.length}`
+  )
+  if (wholeFragWarn.length >= 1) {
+    check('G3d whole-file fragment drift is a timing warning', wholeFragWarn[0].signals.includes('wrong timings'))
+  }
+
+  const pro = Array.from({ length: 80 }, (_, i) => {
+    if (i % 28 === 1) return 'on the next line we finish.'
+    if (i % 28 === 0) return 'This sentence continues'
+    return `A complete sentence number ${i}.`
+  })
+  eq('G3d a professionally punctuated source is silent', sourceFragmentNote(srt(pro)), null)
+
+  const youtube = Array.from({ length: 80 }, (_, i) =>
+    i % 2 === 0 ? `this fragment continues without a stop ${i}` : `and the next cue starts lower ${i}`
+  )
+  const ytNote = sourceFragmentNote(srt(youtube))
+  check('G3d a fragment-heavy source produces a log note', ytNote !== null)
+  if (ytNote) {
+    check('G3d the note names mid-sentence breaks', /mid-sentence/i.test(ytNote))
+    check('G3d the note tells them to re-segment', /re-segment/i.test(ytNote))
+    check('G3d the note does not block by promising a model fix', !/try a stronger|use a stronger/i.test(ytNote))
+    check('G3d the page can lift that note out of a log', fragmentNoteInLog(`Starting engine…\n${ytNote}\n`) === ytNote)
+  }
+  eq(
+    'G3d a short fragment-heavy file is not judged',
+    sourceFragmentNote(srt(youtube.slice(0, 10))),
+    null
+  )
+
+  eq(
+    'G3d three strikes alone is not a merge diagnosis (SOL-61)',
+    explainTranslateAbort('Stopping script due to reaching 3 consecutive errors'),
+    null
+  )
+  const abortShort = explainTranslateAbort(
+    'Retrying immediately...\nExpected 300 lines, got 208\nStopping script due to reaching 3 consecutive errors'
+  )
+  check('G3d a short item count is reported', abortShort !== null)
+  if (abortShort) {
+    check('G3d short-count copy names the observed shortage', /fewer subtitle lines/i.test(abortShort))
+    check('G3d short-count copy treats merging as possible, not confirmed', /possible cause/i.test(abortShort))
+    check('G3d short-count copy does not prescribe re-segmenting', !/re-segment/i.test(abortShort))
+    check(
+      'G3d short-count copy does not offer a stronger model',
+      !/try a stronger|use a stronger|pick a stronger/i.test(abortShort)
+    )
+  }
+  const abortFrag = explainTranslateAbort(
+    `${ytNote ?? 'This source file’s cues often break mid-sentence (about 53%).'}\nExpected 300 lines, got 208`
+  )
+  check('G3d a short count plus a fragment note is a merge diagnosis', abortFrag !== null)
+  if (abortFrag) {
+    check('G3d corroborated abort names merging as likely', /likely cause/i.test(abortFrag))
+    check('G3d corroborated abort names re-segmenting as the fix', /re-segment/i.test(abortFrag))
+    check('G3d corroborated abort names wrong timings', /wrong timings/i.test(abortFrag))
+    check(
+      'G3d corroborated abort does not offer a stronger model as a fix',
+      /will not reliably/i.test(abortFrag) && !/try a stronger|use a stronger|pick a stronger/i.test(abortFrag)
+    )
+  }
+  eq('G3d an unrelated error is not this abort', explainTranslateAbort('Failed to start gst: spawn ENOENT'), null)
+  eq('G3d an empty log is not this abort', explainTranslateAbort(''), null)
+
+  const evidenceRoots = [
+    path.join(process.cwd(), '.secrets', 'Issues', '_Reported', 'Error translating'),
+    path.join(process.cwd(), '.secrets', 'Issues', 'Error translating')
+  ]
+  const evidence = evidenceRoots.find((p) => fs.existsSync(p))
+  if (!evidence) {
+    check('G3d evidence files optional — skipped', true)
+  } else {
+    const sistersSrc = path.join(evidence, '1', 'Bad.Sisters.S01E01.eng.srt')
+    const sistersOut = path.join(evidence, '1', 'Bad.Sisters.S01E01.eng_he.srt')
+    if (fs.existsSync(sistersSrc) && fs.existsSync(sistersOut)) {
+      const sisters = scanTranslatedOutput(fs.readFileSync(sistersSrc, 'utf-8'), fs.readFileSync(sistersOut, 'utf-8'))
+      eq('G3d Bad Sisters stays silent (the false-positive that matters)', sisters.length, 0)
+      eq('G3d Bad Sisters is not flagged as fragment-heavy', sourceFragmentNote(fs.readFileSync(sistersSrc, 'utf-8')), null)
+    }
+    const dir2 = path.join(evidence, '2')
+    if (fs.existsSync(dir2)) {
+      const names = fs.readdirSync(dir2)
+      const srcName = names.find((f) => f.endsWith('.srt') && !f.endsWith('_he.srt') && !f.includes('Flash'))
+      const heName = names.find((f) => f.endsWith('_he.srt'))
+      if (srcName && heName) {
+        const srcText = fs.readFileSync(path.join(dir2, srcName), 'utf-8')
+        const lite = scanTranslatedOutput(srcText, fs.readFileSync(path.join(dir2, heName), 'utf-8'))
+        check(
+          'G3d Boeing flash-lite is a timing warning',
+          lite.some((w) => w.signals.includes('wrong timings')),
+          lite.map((w) => `${w.from}-${w.to} ${w.signals.join('+')}`).join('; ') || 'nothing'
+        )
+        check('G3d Boeing source is fragment-heavy', sourceFragmentNote(srcText) !== null)
+        const flash35 = path.join(dir2, 'Flash 3.5', '1788037983296.srt')
+        if (fs.existsSync(flash35)) {
+          const worse = scanTranslatedOutput(srcText, fs.readFileSync(flash35, 'utf-8'))
+          check(
+            'G3d Boeing flash 3.5 is a timing warning',
+            worse.some((w) => w.signals.includes('wrong timings')),
+            worse.map((w) => `${w.from}-${w.to} ${w.signals.join('+')}`).join('; ') || 'nothing'
+          )
+          if (lite.length >= 1 && worse.length >= 1) {
+            check(
+              'G3d flash 3.5 drift starts earlier than flash-lite',
+              worse[0].from < lite[0].from,
+              `3.5 from ${worse[0].from}, lite from ${lite[0].from}`
+            )
+          }
+        }
+      }
+    }
+  }
 }
 
 // ── G4: the run panel (REP-2/3/12, MAN-1/6/8) ──────────────────────────────────
@@ -1859,7 +2442,8 @@ section('G8b — a run that stops getting anywhere is ended (REP-2)')
   {
     const watch = createStallWatch()
     let verdict: ReturnType<typeof watch.observe> = null
-    // A healthy run: the same status block redrawn, but with a new segment each cycle.
+    // A healthy run: the same status block redrawn — including a historical 400 — with a
+    // new segment each cycle. Display-line recurrence of that 400 is not a retry (SOL-56).
     for (let i = 0; i < 20_000 && !verdict; i++) {
       const cycle = i % 4
       const line =
@@ -1887,6 +2471,64 @@ section('G8b — a run that stops getting anywhere is ended (REP-2)')
     for (let i = 0; i < 400 && !verdict; i++) verdict = watch.observe(`Batch ${i} translated.`, 20_000 + i * 40)
     for (let i = 0; i < 400 && !verdict; i++) verdict = watch.observe(STORM[i % 2], 40_000 + i * 40)
     check('G8b a recovered run does not carry its old error into the budget', verdict === null)
+  }
+  {
+    // REP-30: sixty distinct quota-wait ticks are one back-off, not sixty steps of progress.
+    // Interleaved with the recorded 400 they used to reset the budget every second.
+    const watch = createStallWatch()
+    let verdict: ReturnType<typeof watch.observe> = null
+    let at = 0
+    const cycle = (i: number): string => {
+      const step = i % 62
+      if (step === 0) return STORM[2]
+      if (step === 1) return 'Transcribing audio segment 00:00 to 05:00.'
+      return `All API quotas exceeded, waiting ${62 - step} seconds...`
+    }
+    for (let i = 0; i < TIER1_LINES * 5 && !verdict; i++) {
+      verdict = watch.observe(cycle(i), i * 40)
+      if (verdict) at = i
+    }
+    check('G8b a quota countdown does not reset the novelty budget', verdict !== null)
+    eq('G8b and the countdown storm is still tier 1', verdict?.tier, 1)
+    check('G8b and it still waits out the quiet period', at * 40 >= TIER1_QUIET_MS, `${at} lines`)
+  }
+  {
+    // REP-30: a 400 that is newly worded every time (request id, wrapping) is not progress.
+    const watch = createStallWatch()
+    let verdict: ReturnType<typeof watch.observe> = null
+    let at = 0
+    for (let i = 0; i < TIER1_LINES * 5 && !verdict; i++) {
+      verdict = watch.observe(
+        `An unexpected error occurred: 400 invalid_argument. request ${i}. Retrying immediately...`,
+        i * 40
+      )
+      if (verdict) at = i
+    }
+    check('G8b a newly worded 400 is not treated as progress', verdict !== null)
+    eq('G8b and unique wrapping still dies at tier 1', verdict?.tier, 1)
+    check('G8b and unique wrapping still waits out the quiet period', at * 40 >= TIER1_QUIET_MS, `${at} lines`)
+  }
+  {
+    // SOL-56: the engine redraws its message history, so one recovered 400 can reappear
+    // every second while real batches continue. That is not 60 retry attempts.
+    const watch = createStallWatch()
+    let verdict: ReturnType<typeof watch.observe> = null
+    for (let i = 0; i < 180 && !verdict; i++) {
+      const t = i * 1_000
+      watch.observe(`Batch ${i} translated.`, t)
+      verdict = watch.observe(STORM[2], t + 1)
+    }
+    check('G8b a historical 400 redrawn beside new work does not end the run', verdict === null)
+  }
+  {
+    // Digit-stripping the novelty key would collapse 18k healthy segment lines into one
+    // key and let tier 2 kill a paid run. The quota-wait rule must not generalise.
+    const watch = createStallWatch()
+    let verdict: ReturnType<typeof watch.observe> = null
+    for (let i = 0; i < 6_000 && !verdict; i++) {
+      verdict = watch.observe(`Transcribing audio segment ${i} to ${i + 10}.`, i * 100)
+    }
+    check('G8b collapsing every digit would have killed this run', verdict === null)
   }
   {
     // Only `user` reads as Stopped. A budget termination has to read as a failure with a
@@ -2212,6 +2854,146 @@ section('G9d — one line cannot step over the ceiling the other lines respect')
     'G9d the per-line budget is the smallest of them',
     DEFAULT_CONSOLE_LOG_LIMITS.lineBytes < DEFAULT_CONSOLE_LOG_LIMITS.tailBytes &&
       DEFAULT_CONSOLE_LOG_LIMITS.tailBytes < DEFAULT_CONSOLE_LOG_LIMITS.headBytes
+  )
+}
+
+section('G9e — the console file drops terminal chrome and counts redraws (REP-26)')
+{
+  check('G9e ANSI cursor junk is stripped', stripAnsi('\x1b[F\x1b[Khello') === 'hello')
+  check('G9e a transcribe bar is chrome', isBarFrame('Transcribing: |████░░░░| 50%'))
+  check('G9e a translating bar is still chrome', isBarFrame('Translating: |--|'))
+  check('G9e an empty bar gutter is still chrome', isBarFrame('Transcribing: |'))
+  check('G9e a batch line is not chrome', !isBarFrame('Translating batch 3 of 40…'))
+  check(
+    'G9e a warning that happens to contain a block character is not chrome',
+    !isBarFrame('WARNING: glyph █ in the filename')
+  )
+  check(
+    'G9e a CR-overwritten bar is still a bar after chrome strip',
+    isBarFrame(stripTerminalChrome('old text\rTranscribing: |████| 1%'))
+  )
+  check(
+    'G9e a token tally parses',
+    JSON.stringify(parseTokenLine('Prompt Tokens: 10 | Thoughts Tokens: 2 | Output Tokens: 3 | Total Tokens: 15')) ===
+      JSON.stringify({ prompt: 10, thoughts: 2, output: 3, total: 15 })
+  )
+  check(
+    'G9e carriage-return keeps the last overwrite',
+    stripTerminalChrome('first\rsecond') === 'second'
+  )
+
+  const frame = Array.from({ length: 11 }, (_, i) => `engine message ${i + 1}`)
+  const flood: string[] = []
+  const folded = createConsoleLog((c) => flood.push(c), { headBytes: 4096, tailBytes: 4096 })
+  for (let i = 0; i < 50; i++) for (const l of frame) folded.write(l)
+  folded.close()
+  const foldedFile = flood.join('')
+  check('G9e an 11-line frame is written once', foldedFile.startsWith(frame.map((l) => `${l}\n`).join('')))
+  check('G9e the other 49 draws are a counter', foldedFile.includes('[redrawn 49 times]'))
+  eq('G9e each message still appears once', foldedFile.split('engine message 1\n').length - 1, 1)
+  check('G9e a distinct-line flood is not this', !foldedFile.includes('engine message 12'))
+
+  const preamble: string[] = []
+  const afterApp = createConsoleLog((c) => preamble.push(c), { headBytes: 8192, tailBytes: 8192 })
+  afterApp.write('$ gst translate -i episode.srt -k ***')
+  afterApp.write('Starting engine…')
+  for (let i = 0; i < 50; i++) for (const l of frame) afterApp.write(l)
+  afterApp.close()
+  const afterAppFile = preamble.join('')
+  check(
+    'G9e the app preamble survives a later engine flood',
+    afterAppFile.startsWith('$ gst translate -i episode.srt -k ***\nStarting engine…\n')
+  )
+  check(
+    'G9e an 11-line frame after that preamble is still written once',
+    afterAppFile.split('engine message 1\n').length - 1 === 1
+  )
+  check(
+    'G9e and the other 49 draws are still a counter (SOL-57)',
+    afterAppFile.includes('[redrawn 49 times]')
+  )
+  eq('G9e the command line is not eaten by the fold', afterAppFile.split('$ gst translate').length - 1, 1)
+
+  const distinct: string[] = []
+  const unique = createConsoleLog((c) => distinct.push(c), { headBytes: 4096, tailBytes: 4096 })
+  for (let i = 1; i <= 20; i++) unique.write(`line ${i} ${'x'.repeat(20)}`)
+  unique.close()
+  const uniqueFile = distinct.join('')
+  check('G9e twenty distinct lines are twenty lines', uniqueFile.split('\n').filter(Boolean).length === 20)
+  check('G9e and they are not counted as redraws', !uniqueFile.includes('[redrawn'))
+
+  const esc = '\x1b[F\x1b[K'
+  const ansi: string[] = []
+  const growing = createConsoleLog((c) => ansi.push(c), { headBytes: 8192, tailBytes: 8192 })
+  growing.write('$ gst transcribe -i episode.mp3')
+  growing.write('Starting engine…')
+  const history = Array.from({ length: 8 }, (_, i) => `history line ${i + 1}`)
+  const draws = [2, 2, 2, 3, 2, 2, 2, 3]
+  draws.forEach((d, i) => {
+    for (let k = 0; k < d; k++) {
+      for (const msg of history.slice(0, i + 1)) growing.write(`${esc}${msg}`)
+      growing.write(`${esc}Transcribing: |${'█'.repeat(4)}${'░'.repeat(4)}| ${i + 1}0%`)
+      growing.write(
+        `${esc}Prompt Tokens: ${10 + i} | Thoughts Tokens: 1 | Output Tokens: 2 | Total Tokens: ${13 + i}`
+      )
+    }
+  })
+  growing.write('[run ended: exit code 0]')
+  growing.close()
+  const grown = ansi.join('')
+  check('G9e growing ANSI frames leave no ESC bytes', !grown.includes('\x1b'))
+  check('G9e growing still keeps the preamble', grown.startsWith('$ gst transcribe -i episode.mp3\nStarting engine…\n'))
+  for (const msg of history) {
+    check(`G9e ${msg} lands once`, grown.split(`${msg}\n`).length - 1 === 1)
+  }
+  check('G9e the bar never lands', !grown.includes('Transcribing: |'))
+  check('G9e a redraw counter is present', grown.includes('[redrawn '))
+  check(
+    'G9e the last token tally survives, then the ending',
+    /Prompt Tokens: 17 \| Thoughts Tokens: 1 \| Output Tokens: 2 \| Total Tokens: 20\n\[run ended: exit code 0\]\n$/.test(
+      grown
+    )
+  )
+  check('G9e earlier token tallies are not kept', !grown.includes('Prompt Tokens: 10 |'))
+
+  const blanks: string[] = []
+  const gap = createConsoleLog((c) => blanks.push(c), { headBytes: 4096, tailBytes: 4096 })
+  gap.write('keep')
+  gap.write('')
+  gap.write('')
+  gap.write('   ')
+  gap.write('after')
+  gap.close()
+  check('G9e a run of blanks collapses to one', blanks.join('') === 'keep\n\nafter\n')
+
+  const cr: string[] = []
+  const overwrite = createConsoleLog((c) => cr.push(c), { headBytes: 4096, tailBytes: 4096 })
+  overwrite.write('first\rsecond')
+  overwrite.close()
+  check('G9e an in-place CR overwrite keeps the last text', cr.join('') === 'second\n')
+
+  const mismatch: string[] = []
+  const retry = createConsoleLog((c) => mismatch.push(c), { headBytes: 4096, tailBytes: 4096 })
+  retry.write('Retrying immediately...')
+  retry.write('Batch 1 failed')
+  retry.write('Retrying immediately...')
+  retry.write('Batch 2 failed')
+  retry.close()
+  check(
+    'G9e a repeated prefix with new context is not dropped (SOL-60)',
+    mismatch.join('') ===
+      'Retrying immediately...\nBatch 1 failed\nRetrying immediately...\nBatch 2 failed\n'
+  )
+
+  const mid: string[] = []
+  const dangling = createConsoleLog((c) => mid.push(c), { headBytes: 4096, tailBytes: 4096 })
+  dangling.write('A')
+  dangling.write('B')
+  dangling.write('A')
+  dangling.close()
+  check(
+    'G9e a partial suffix at close is written, not swallowed',
+    mid.join('') === 'A\nB\nA\n'
   )
 }
 

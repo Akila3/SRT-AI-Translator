@@ -27,8 +27,8 @@
  */
 import type { AppSettings, ModelInfo } from '../shared/types'
 
-/** Bumped by the step that owns the migration: Steps 5 (1-3) and 3b (4). */
-export const CURRENT_SCHEMA_VERSION = 4
+/** Bumped by the step that owns the migration: Steps 5 (1-3), 3b (4), REP-28 (5). */
+export const CURRENT_SCHEMA_VERSION = 5
 
 /**
  * Ids a previous build removed from the picker. Two of them (`gemini-2.0-flash`,
@@ -245,6 +245,15 @@ export function migrateSettings(
     } else if (cached !== undefined) {
       notes.push('M6: cachedModels is not an array; left untouched')
     }
+  }
+
+  // ── M7 (v<5, REP-28): retired thinkingLevel "disabled" → "default". ───────────
+  // "Disabled" used to be coerced to a real thinking_level (minimal/low) or to
+  // --no-thinking. Neither is omit-the-flag, which is what the user asked for and
+  // what Google documents as the model's own default. A leftover enum value would
+  // render as a blank Select.
+  if (from < 5 && next.thinkingLevel === 'disabled') {
+    setField('thinkingLevel', 'default', 'M7: mapped thinkingLevel "disabled" to "default" (send nothing)')
   }
 
   // The version bump comes LAST, so a crash mid-chain simply re-runs it next launch.

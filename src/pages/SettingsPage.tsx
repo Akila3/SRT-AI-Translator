@@ -18,7 +18,7 @@ import {
   uncheckedNote
 } from '../lib/keyStatus'
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from '../data/languages'
-import { THINKING_LEVELS, SERVICE_TIERS, paidQuotaTooltip, RATE_LIMITS_URL } from '../data/freeTier'
+import { thinkingLevelsForModel, SERVICE_TIERS, paidQuotaTooltip, RATE_LIMITS_URL } from '../data/freeTier'
 import { openExternalLink } from '../lib/openExternal'
 import {
   activeKeySlots,
@@ -771,7 +771,7 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
         {/* Left: thinking */}
         <div className="space-y-5">
           <div>
-            <Label tip="Gemini 3.x only. Controls how much internal reasoning the model does before output. Order: Minimal (fastest) → Low (default, recommended) → Medium → High (most thorough, slowest). Low is sufficient for most subtitle jobs. Thinking cannot be switched off entirely on 3.x models — the engine raises 'Disabled' to the lowest level the model accepts. Gemini 3 Pro does not accept 'Minimal' and treats it as 'Low'. For 2.5 models use Thinking Budget instead.">
+            <Label tip="Gemini 3.x only. How much internal reasoning the model does before output. Default sends no thinking-level flag, so the model uses Google's own default for that id (not the same level on every model). Minimal is the lowest discrete setting and is not accepted by every model — unsupported values are omitted from the list. Thinking cannot be switched off on 3.x. For 2.5 models use Thinking Budget instead.">
               Thinking Level
             </Label>
             {caps.thinking === 'level' ? (
@@ -779,9 +779,7 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
                 <Select
                   value={settings.thinkingLevel}
                   onChange={(v) => set('thinkingLevel', v)}
-                  options={THINKING_LEVELS.filter(
-                    (o) => !(caps.rejectsMinimalLevel && o.value === 'minimal')
-                  )}
+                  options={thinkingLevelsForModel(caps.acceptedThinkingLevels, settings.thinkingLevel)}
                   className="w-52"
                 />
                 {effectiveThinkingLevel(settings.model, settings.thinkingLevel) !==
@@ -800,7 +798,7 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
             )}
           </div>
           <div>
-            <Label tip="Gemini 2.5 only. Maximum tokens the model may use for internal reasoning. Default: 512. On non-Pro 2.5 models, 0 disables thinking (faster, cheaper) and the maximum is 24,576. Gemini 2.5 Pro cannot disable thinking: its range is 128 – 32,768. Increase to 2048–8192 for complex content. For 3.x models use Thinking Level instead.">
+            <Label tip="Gemini 2.5 only. Maximum tokens the model may use for internal reasoning. Default shown: 512. Gemini 2.5 Pro cannot disable thinking: its range is 128 – 32,768. Non-Pro 2.5 starts at 1, not 0 — Google documents 0 as a disable, but the engine silently discards a zero budget, so this app will not offer it. To send no thinking parameter at all, pick a Gemini 3.x model and set Thinking Level to Default. For 3.x models use Thinking Level instead.">
               Thinking Budget
             </Label>
             {caps.thinking === 'budget' ? (
@@ -814,7 +812,9 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
                 />
                 <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
                   Range for this model: {caps.thinkingBudgetMin} – {caps.thinkingBudgetMax.toLocaleString()}
-                  {caps.canDisableThinking ? ' (0 disables thinking)' : ' (cannot be disabled)'}.
+                  {caps.thinkingBudgetMin >= 128
+                    ? ' (cannot be disabled).'
+                    : '. 0 cannot be delivered — the engine discards it. On 3.x, Thinking Level → Default sends nothing.'}
                 </p>
               </>
             ) : (

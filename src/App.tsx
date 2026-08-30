@@ -3,6 +3,7 @@ import { useStore } from './store/useStore'
 import TranslatePage from './pages/TranslatePage'
 import TranscribePage from './pages/TranscribePage'
 import SettingsPage from './pages/SettingsPage'
+import { APP_VERSION } from './lib/appVersion'
 
 type Tab = 'translate' | 'transcribe' | 'settings'
 
@@ -48,7 +49,9 @@ export default function App(): React.JSX.Element {
       <header className="flex items-center justify-between border-b border-gray-200 bg-white px-6 py-3 dark:border-gray-700 dark:bg-gray-800">
         <div>
           <h1 className="text-lg font-bold text-gray-900 dark:text-gray-100">Gemini SRT Translator</h1>
-          <p className="text-xs text-gray-500 dark:text-gray-400">Powered by Google Gemini AI</p>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            Powered by Google Gemini AI · v{APP_VERSION}
+          </p>
         </div>
         <nav className="flex gap-1">
           {TABS.map((t) => (

@@ -43,6 +43,16 @@ export interface AppSettings {
   topK: number | null
   thinkingLevel: string
   thinkingBudget: number
+  /**
+   * Transcribe-page override of Settings → Model & Generation. Default off: this tab
+   * uses the global model and thinking values. When on, the three fields below are
+   * what a transcribe run sends. Empty strings / budget 0 mean "use the global".
+   * No schema bump: sanitizeSettingsView overlays these from defaults when absent.
+   */
+  transcribeOverride: boolean
+  transcribeModel: string
+  transcribeThinkingLevel: string
+  transcribeThinkingBudget: number
   serviceTier: string
   paidQuota: boolean
   disableStreaming: boolean

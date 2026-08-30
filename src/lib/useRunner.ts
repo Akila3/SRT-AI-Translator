@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { isBarFrame, parseTokenLine, stripTerminalChrome, type TokenTally } from '../../electron/shared/terminalNoise'
 import {
   appendLogLine,
   readRetryState,
@@ -8,14 +9,7 @@ import {
   type RunStatus
 } from './logView'
 
-export type { RunStatus, LogRow, RetryState }
-
-export interface TokenTally {
-  prompt: number
-  thoughts: number
-  output: number
-  total: number
-}
+export type { RunStatus, LogRow, RetryState, TokenTally }
 
 export interface RunnerState {
   status: RunStatus
@@ -56,16 +50,6 @@ const INITIAL: RunnerState = {
   exitCode: null
 }
 
-// Strip ANSI escape sequences (cursor moves, line erases, colors) that the CLI
-// emits for its live terminal UI but which render as garbage in a plain log.
-const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
-
-// A line that is purely the animated progress/spinner bar — noise we don't want
-// to accumulate in the log.
-function isSpinnerLine(s: string): boolean {
-  return /[█░]/.test(s) || /^Translating:\s*\|/.test(s)
-}
-
 function deriveStatus(s: string): string | null {
   if (/sending batch/i.test(s)) return 'Sending batch…'
   if (/validating token size/i.test(s)) return 'Validating tokens…'
@@ -103,16 +87,9 @@ function applyLine(s: RunnerState, clean: string): RunnerState {
   if (pct) progress = Math.min(100, parseInt(pct[1], 10))
 
   // Token breakdown line.
-  const tk = clean.match(
-    /Prompt Tokens:\s*(\d+)\s*\|\s*Thoughts Tokens:\s*(\d+)\s*\|\s*Output Tokens:\s*(\d+)\s*\|\s*Total Tokens:\s*(\d+)/i
-  )
+  const tk = parseTokenLine(clean)
   if (tk) {
-    tokens = {
-      prompt: parseInt(tk[1], 10),
-      thoughts: parseInt(tk[2], 10),
-      output: parseInt(tk[3], 10),
-      total: parseInt(tk[4], 10)
-    }
+    tokens = tk
     tokenStats = clean
   }
 
@@ -123,7 +100,7 @@ function applyLine(s: RunnerState, clean: string): RunnerState {
   // are surfaced separately. Everything else goes through the collapser, which folds repeats
   // rather than dropping them — note this happens AFTER the parsing above, because the same
   // lines carry progress, token and status state and collapsing first would blank them.
-  const skip = isSpinnerLine(clean) || tk !== null
+  const skip = isBarFrame(clean) || tk !== null
   const log = skip ? s.log : appendLogLine(s.log, clean)
 
   return { ...s, log, progress, tokenStats, tokens, currentLine, totalLines, statusText }
@@ -226,7 +203,7 @@ export function useRunner(): {
       // reaches the only runner that can be listening.
       if (from !== undefined && from !== runId.current) return
       if (!line) return
-      const clean = line.replace(ANSI, '').trim()
+      const clean = stripTerminalChrome(line).trim()
       if (!clean) return
 
       pending.current.push(clean)
