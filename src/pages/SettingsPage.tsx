@@ -32,7 +32,8 @@ import {
 import {
   effectiveThinkingLevel,
   modelCapabilities,
-  samplingDefaults
+  samplingDefaults,
+  shouldPersistSamplingToggleOff
 } from '../../electron/shared/modelCaps'
 import {
   DEFAULT_RESUME_CONTEXT_SIZE,
@@ -42,6 +43,54 @@ import {
 } from '../../electron/shared/types'
 
 const PRICING_URL = 'https://ai.google.dev/gemini-api/docs/pricing'
+
+/** Shown beside Custom Generation Parameters while the selected model still accepts them. */
+export const SAMPLING_TOGGLE_DESC =
+  "Override the model's own temperature / top-p / top-k defaults"
+
+/**
+ * Shown while the control is greyed. Neutral, not amber: the switch cannot appear ON for a
+ * model that rejects sampling (hazard 137), and the reason belongs in `desc`.
+ */
+export const SAMPLING_UNAVAILABLE_DESC =
+  'Not available for this model — Google deprecated temperature, top-p and top-k from Gemini 3.6 Flash and 3.5 Flash-Lite onwards. Steer it with the Description field instead.'
+
+export function samplingToggleDesc(model: string): string {
+  return modelCapabilities(model).acceptsSamplingParams ? SAMPLING_TOGGLE_DESC : SAMPLING_UNAVAILABLE_DESC
+}
+
+/** Visual ON only when the stored intent applies to this Settings model. */
+export function samplingToggleChecked(customGenerationParams: boolean, model: string): boolean {
+  return customGenerationParams && modelCapabilities(model).acceptsSamplingParams
+}
+
+/**
+ * One settings write for a model change (SF-7 trap 2).
+ *
+ * The stored toggle is shared with Transcribe. Do not persist OFF merely because the *global*
+ * model rejects sampling — an override may still accept, and `generationParamArgs` already
+ * withholds flags per run model (SOL-69). Persist OFF only when leaving a rejecting model
+ * for an accepting one (`shouldPersistSamplingToggleOff`), so the control does not switch
+ * itself back on. Main-process refresh uses the same helper (SOL-71).
+ *
+ * Temperature / top-p refresh only while the user already had the toggle off. A capability
+ * hide, or the delayed persist-off on return, must not wipe typed values (SOL-70 / REP-5).
+ */
+export function settingsPatchOnModelChange(
+  settings: Pick<AppSettings, 'customGenerationParams' | 'model'>,
+  model: string
+): Partial<AppSettings> {
+  const patch: Partial<AppSettings> = { model }
+  const customOn = settings.customGenerationParams
+  if (shouldPersistSamplingToggleOff(settings.model, model, customOn)) {
+    patch.customGenerationParams = false
+  }
+  if (customOn) return patch
+  const d = samplingDefaults(model)
+  patch.temperature = d.temperature
+  patch.topP = d.topP
+  return patch
+}
 
 function ExternalLink({
   url,
@@ -265,7 +314,7 @@ export default function SettingsPage(): React.JSX.Element {
             onCountReset={() => setModelCount(null)}
           />
         )}
-        {sec === 'model' && <SectionModel settings={settings} set={set} />}
+        {sec === 'model' && <SectionModel settings={settings} set={set} patch={patch} />}
         {sec === 'service' && <SectionService settings={settings} set={set} />}
         {sec === 'tmdb' && <SectionTmdb settings={settings} set={set} />}
         {sec === 'output' && <SectionOutput settings={settings} set={set} />}
@@ -637,7 +686,14 @@ function SectionApiKeys({
   )
 }
 
-function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
+function SectionModel({
+  settings,
+  set,
+  patch
+}: SectionProps & { patch: (p: Partial<AppSettings>) => Promise<void> }): React.JSX.Element {
+  // Trap 3: this is the GLOBAL model. A transcribe override that rejects sampling while
+  // Settings' model still accepts it leaves the toggle live; generationParamArgs withholds
+  // the flags on the run. Do not widen SF-7 to chase that.
   const caps = modelCapabilities(settings.model)
   const cached = settings.cachedModels
   const verifiedAny = cached.some((m) => m.source === 'live')
@@ -682,19 +738,7 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
   const samplingLive = settings.customGenerationParams && caps.acceptsSamplingParams
 
   function handleModel(v: string): void {
-    set('model', v)
-    // Sampling defaults differ by generation, and are refreshed ONLY while the toggle is
-    // off. With it off nothing is sent, so these numbers are a preview and keeping them
-    // current for the selected generation is what the original code was for. With it on
-    // they are the user's own choice and go to the API verbatim, and overwriting them was
-    // the whole of REP-5: a value typed deliberately vanished on the next model change.
-    // Top-K was never reset, so leaving all three alone makes them consistent rather than
-    // introducing a rule. "Reset to defaults" below is what keeps the old behaviour
-    // available on purpose.
-    if (settings.customGenerationParams) return
-    const d = samplingDefaults(v)
-    set('temperature', d.temperature)
-    set('topP', d.topP)
+    void patch(settingsPatchOnModelChange(settings, v))
   }
 
   return (
@@ -830,9 +874,10 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
         <div className="space-y-5">
           <ToggleRow
             label="Custom Generation Parameters"
-            desc="Override the model's own temperature / top-p / top-k defaults"
-            checked={settings.customGenerationParams}
+            desc={samplingToggleDesc(settings.model)}
+            checked={samplingToggleChecked(settings.customGenerationParams, settings.model)}
             onChange={(v) => set('customGenerationParams', v)}
+            disabled={!caps.acceptsSamplingParams}
             tip={
               'OFF (default, recommended): temperature, top-p and top-k are not sent at all, so each model uses the values Google tuned for it. This is what you want unless you have a specific reason.\n\n' +
               'ON: the three values below are sent with every request. They apply to ALL models, including ones released after these defaults were chosen — a value that suits one generation can degrade another.\n\n' +
@@ -840,21 +885,6 @@ function SectionModel({ settings, set }: SectionProps): React.JSX.Element {
               'Note: a value of exactly 0 cannot be sent (the engine treats it as "not set"), which is why the minimums below are above zero.'
             }
           />
-          {/*
-            Only while the toggle is ON. With it off the fields are greyed because the user
-            has not asked for them, which needs no explanation — and since the app defaults to
-            the newest flash-lite, which IS a deprecated model, an unconditional warning would
-            sit permanently on a default installation about a feature nobody switched on.
-          */}
-          {settings.customGenerationParams && !caps.acceptsSamplingParams && (
-            <p className="text-xs text-amber-600 dark:text-amber-400">
-              This model does not use these settings. Google deprecated temperature, top-p and
-              top-k for Gemini 3.6 Flash, Gemini 3.5 Flash-Lite and every model released since
-              — they are ignored today and newer models reject a request that includes them, so
-              the app does not send them for this model. Steer it with the Description field
-              instead.
-            </p>
-          )}
           <div className={samplingLive ? '' : 'pointer-events-none opacity-50'}>
             <div className="space-y-5">
               <div>

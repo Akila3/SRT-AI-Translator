@@ -281,6 +281,28 @@ export function samplingDefaults(id: string): { temperature: number; topP: numbe
 }
 
 /**
+ * Persist the shared sampling toggle OFF only when the selected model itself becomes
+ * one that accepts sampling.
+ *
+ * The stored flag is shared with Transcribe. Do not clear it merely because the *current*
+ * model rejects sampling — an override may still accept, and `generationParamArgs`
+ * withholds flags per run model (SOL-69). Do clear it on rejecting → accepting, or a
+ * refresh that swaps the id would expose stored ON again without the user turning the
+ * control back on (SF-7 / SOL-71).
+ */
+export function shouldPersistSamplingToggleOff(
+  previousModel: string,
+  nextModel: string,
+  customGenerationParams: boolean
+): boolean {
+  return (
+    customGenerationParams &&
+    !modelCapabilities(previousModel).acceptsSamplingParams &&
+    modelCapabilities(nextModel).acceptsSamplingParams
+  )
+}
+
+/**
  * The thinking level the engine will actually apply, after this app's own coercions.
  *
  * `default` (and a leftover stored `disabled`) means omit the flag — Google's documented

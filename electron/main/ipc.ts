@@ -28,6 +28,7 @@ import {
 } from './pythonBridge'
 import { copyExclusive, writeExclusive } from './exclusiveFile'
 import { ACTIVE_SET_SIZE, activeKeySlots, orderKeySlots } from '../shared/keyOrder'
+import { shouldPersistSamplingToggleOff } from '../shared/modelCaps'
 import { CONSOLE_LOG_SUFFIX } from '../shared/consoleLog'
 import { scanTranslatedOutput } from '../shared/outputSanity'
 import type {
@@ -369,6 +370,26 @@ export function applyModelSelectionRules(
   return { model: stored, notice: '', changed: false }
 }
 
+/**
+ * Settings fields that ride with an automatic model change from refresh / key-check.
+ *
+ * Same rejecting → accepting persist-off as the Settings Select path, in the same
+ * `setSettings` patch that writes `model`. Temperature / top-p stay untouched so
+ * typed values survive (SOL-70). Shared intent stays stored while the selected
+ * model remains rejecting (SOL-69).
+ */
+export function selectionSettingsPatch(
+  current: Pick<AppSettings, 'model' | 'customGenerationParams'>,
+  sel: { changed: boolean; model: string }
+): Partial<AppSettings> {
+  if (!sel.changed) return {}
+  const patch: Partial<AppSettings> = { model: sel.model }
+  if (shouldPersistSamplingToggleOff(current.model, sel.model, current.customGenerationParams)) {
+    patch.customGenerationParams = false
+  }
+  return patch
+}
+
 export function registerIpc(): void {
   // ---- Settings ----
   ipcMain.handle('settings:get', () => getSettings())
@@ -430,7 +451,7 @@ export function registerIpc(): void {
       patch.cachedModels = summary.models
       patch.modelsUpdatedAt = updatedAt
     }
-    if (sel.changed) patch.model = sel.model
+    Object.assign(patch, selectionSettingsPatch(s, sel))
     if (verified && summary.unionIds.includes(sel.model)) patch.modelNeedsVerification = false
     setSettings(patch)
 
@@ -489,8 +510,9 @@ export function registerIpc(): void {
 
     // The previous cache must be read BEFORE the write below: the auto-advance rule
     // compares the stored model against the PREVIOUS list's default.
-    const prevCached = (getSettings().cachedModels as ModelInfo[]) ?? []
-    const sel = applyModelSelectionRules(getSettings().model, prevCached, {
+    const current = getSettings()
+    const prevCached = (current.cachedModels as ModelInfo[]) ?? []
+    const sel = applyModelSelectionRules(current.model, prevCached, {
       models: res.models,
       unionIds: res.unionIds,
       runnableIds: res.runnableIds,
@@ -511,7 +533,7 @@ export function registerIpc(): void {
       patch.cachedModels = res.models
       patch.modelsUpdatedAt = updatedAt
     }
-    if (sel.changed) patch.model = sel.model
+    Object.assign(patch, selectionSettingsPatch(current, sel))
     // Advisory flag from migrations M1/M3: only live evidence may clear it, and only at
     // the activeComplete bar. A partial refresh proves nothing about the stored id.
     if (verified && res.unionIds.includes(sel.model)) patch.modelNeedsVerification = false

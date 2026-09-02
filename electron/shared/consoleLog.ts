@@ -14,7 +14,9 @@
  * a two-hour transcription otherwise records 25,000 TTY frames for a dozen lines of substance.
  * Distinct lines still land the moment they first appear. A speculative suffix
  * copy is held until it completes (counted, not written) or breaks (written), so
- * a repeated prefix with new context cannot vanish (SOL-60). A crash then costs
+ * a repeated prefix with new context cannot vanish (SOL-60). A blank between
+ * redraw frames is part of the frame, not a boundary — aborting on it is what
+ * made every tally read `[redrawn 1 times]` (REP-38). A crash then costs
  * at most a missing `[redrawn N times]` tally and an in-flight unmatched prefix.
  * The panel's grow-frame folding stays in `logView.ts`; the two artefacts share
  * only the chrome predicates in `terminalNoise.ts`.
@@ -150,13 +152,25 @@ export function createConsoleLog(
   let matchAt = 0
   /**
    * Lines consumed as a speculative suffix copy. Discarded only when the suffix
-   * completes (it was a redraw). Emitted on mismatch, blank, end marker, or close
-   * so a repeated prefix with new context cannot vanish (SOL-60).
+   * completes (it was a redraw). Emitted on mismatch, end marker, close, or when
+   * a match swallows more blanks than MAX_REDRAW_BLANKS, so a repeated prefix
+   * with new context cannot vanish (SOL-60). Empty strings in this array are
+   * collapsed blanks kept in their original position (SOL-67); they are not
+   * compared to the redraw window and are not written into it.
    */
   let pending: string[] = []
   let redraws = 0
   let lastToken: string | null = null
   let lastBlank = false
+  /**
+   * Blanks swallowed while a suffix match is in progress. The engine puts one
+   * blank between redraw frames; aborting on it is REP-38. Unbounded swallowing
+   * would hold `pending` across an endless blank run, so a crash could lose an
+   * unmatched prefix of unbounded age. Eight is well above one-per-frame and
+   * still a hard stop.
+   */
+  const MAX_REDRAW_BLANKS = 8
+  let blanksInMatch = 0
 
   function emit(line: string): void {
     // Clamped before any accounting, so ONE bounded value flows into both the head and the
@@ -200,10 +214,21 @@ export function createConsoleLog(
 
   function abortMatch(): void {
     flushRedraw()
-    for (const line of pending) noteUnique(line)
+    for (const line of pending) {
+      if (line === '') {
+        if (!lastBlank) {
+          lastBlank = true
+          emit('')
+        }
+      } else {
+        noteUnique(line)
+        lastBlank = false
+      }
+    }
     pending = []
     matchFrom = -1
     matchAt = 0
+    blanksInMatch = 0
   }
 
   function consider(line: string): void {
@@ -244,6 +269,15 @@ export function createConsoleLog(
       if (closed) return
       const cleaned = stripTerminalChrome(line)
       if (cleaned.trim() === '') {
+        // A blank between redraw frames is part of the frame (REP-38). Aborting
+        // here is why every tally used to read `[redrawn 1 times]`.
+        if (matchFrom >= 0) {
+          blanksInMatch++
+          if (blanksInMatch <= MAX_REDRAW_BLANKS) {
+            if (pending[pending.length - 1] !== '') pending.push('')
+            return
+          }
+        }
         abortMatch()
         if (lastBlank) return
         lastBlank = true
@@ -251,6 +285,7 @@ export function createConsoleLog(
         return
       }
       lastBlank = false
+      blanksInMatch = 0
 
       if (isBarFrame(cleaned)) return
       if (parseTokenLine(cleaned)) {
@@ -268,6 +303,7 @@ export function createConsoleLog(
       }
 
       consider(cleaned)
+      lastBlank = false
     },
 
     close(): void {

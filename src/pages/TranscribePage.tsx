@@ -18,6 +18,7 @@ import {
 import { thinkingLevelsForModel } from '../data/freeTier'
 import { retryIsCurrent, type LogRow } from '../lib/logView'
 import { classifyEngineFailure } from '../../electron/shared/engineErrors'
+import { transcribeFailedDetail, transcribeUnsavedDetail } from '../../electron/shared/stallBudget'
 import { useRunner } from '../lib/useRunner'
 import { findConsoleLog } from '../../electron/shared/consoleLog'
 import { effectiveThinkingLevel, modelCapabilities } from '../../electron/shared/modelCaps'
@@ -448,28 +449,36 @@ export default function TranscribePage(): React.JSX.Element {
               <p className="text-sm font-medium text-green-700 dark:text-green-400">✅ Transcription saved → {state.outputPath}</p>
             )}
             {state.status === 'error' && (
-              <div className="flex items-center gap-2">
-                <p className="text-sm font-medium text-red-600 dark:text-red-400">
-                  {abortExplain ??
-                    `Process ended with an error (exit code ${state.exitCode}). Check the log above.`}
-                </p>
+              <div className="flex items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-red-600 dark:text-red-400">
+                    {abortExplain ??
+                      `Process ended with an error (exit code ${state.exitCode}). Check the log above.`}
+                  </p>
+                  {/*
+                    Not the Stop sentence. The engine can write the .srt and then fail during
+                    cleanup, so a nonzero exit is not proof that nothing is on disk (SOL-68).
+                  */}
+                  <p className="mt-1 text-sm text-red-600/80 dark:text-red-400/80">
+                    {transcribeFailedDetail()}
+                  </p>
+                </div>
                 <Button variant="ghost" onClick={handleNew}>
                   New
                 </Button>
               </div>
             )}
             {/*
-              A run the user ended is not a failure — see MAN-1. Transcription writes straight
-              to the chosen path, so a Stop can leave a partial file there (SOL-41). Translate's
-              output stays temporary until Save; that page's "Nothing was saved" is accurate.
+              A run the user ended is not a failure — see MAN-1. Engine 3.7.0 buffers the
+              transcription and writes the .srt once at the end (SF-4 probe 2026-09-02, plus
+              stage-3 stops whose .progress showed completed minutes). A Stop therefore leaves
+              no partial file. Translate's output stays temporary until Save; that page's
+              "Nothing was saved" is accurate.
             */}
             {state.status === 'stopped' && (
               <div className="flex items-center gap-2">
                 <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                  Stopped.
-                  {state.outputPath || outputFile
-                    ? ` A partial transcription may already be at ${state.outputPath || outputFile}.`
-                    : ' Nothing was written.'}
+                  Stopped. {transcribeUnsavedDetail()}
                 </p>
                 <Button variant="ghost" onClick={handleNew}>
                   New

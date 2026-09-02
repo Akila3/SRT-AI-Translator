@@ -69,6 +69,31 @@ export const TIER2_LINES = 5_000
 export const TIER2_QUIET_MS = 600_000
 
 /**
+ * Shared factual claim for a transcription that was stopped or stalled (SF-4 / REP-37).
+ *
+ * Engine 3.7.0 buffers then writes the `.srt` once. A user Stop (live `taskkill /F /T`) or a
+ * tier-2 stall therefore leaves no usable file. That claim is NOT safe on a generic engine
+ * failure: transcribe() writes `output_file` before progress-file / log / extracted-audio
+ * cleanup, so a later `os.remove` can exit nonzero after a complete `.srt` is already there
+ * (SOL-68). TranscribePage uses `transcribeFailedDetail()` for that path.
+ */
+export const NOTHING_WAS_WRITTEN = 'nothing was written'
+
+/** Stopped copy on TranscribePage. Same claim as tier 2's tail, plus "must start over". */
+export function transcribeUnsavedDetail(): string {
+  return 'Nothing was written. The transcription must start over.'
+}
+
+/**
+ * Generic transcribe failure. Must not deny a post-save cleanup error that left a complete file.
+ */
+export function transcribeFailedDetail(): string {
+  return (
+    'Check the output path before starting over. If a file is already there, it may be complete.'
+  )
+}
+
+/**
  * Errors that are permanent by nature: retrying cannot fix a credential the API has refused.
  *
  * These NEVER terminate on their own — they select tier 1 and name the cause. The list is the
@@ -201,7 +226,7 @@ export function createStallWatch(): StallWatch {
           message:
             `Ended by the app: ${sinceNovel} lines over ${humanQuiet(quietMs)} with nothing ` +
             'new in any of them, so the engine has stopped making progress. The last lines above ' +
-            'are the best evidence of why; nothing was written, and you can start again.'
+            `are the best evidence of why; ${NOTHING_WAS_WRITTEN}, and you can start again.`
         }
       }
       return null

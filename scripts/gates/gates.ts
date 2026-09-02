@@ -48,7 +48,8 @@ import {
   scanOutputFiles,
   sidecarDestination,
   singleKeyRefreshScope,
-  isHttpsUrl
+  isHttpsUrl,
+  selectionSettingsPatch
 } from '../../electron/main/ipc'
 import {
   CONSOLE_LOG_SUFFIX,
@@ -61,6 +62,13 @@ import {
 import { isBarFrame, parseTokenLine, stripAnsi, stripTerminalChrome } from '../../electron/shared/terminalNoise'
 import { scanTranslatedOutput, sourceFragmentNote, explainTranslateAbort, fragmentNoteInLog } from '../../electron/shared/outputSanity'
 import { classifyEngineFailure } from '../../electron/shared/engineErrors'
+import {
+  SAMPLING_TOGGLE_DESC,
+  SAMPLING_UNAVAILABLE_DESC,
+  samplingToggleChecked,
+  samplingToggleDesc,
+  settingsPatchOnModelChange
+} from '../../src/pages/SettingsPage'
 import {
   durationFromProbe,
   parseTimestamp,
@@ -102,7 +110,8 @@ import {
 import {
   effectiveThinkingLevel,
   modelCapabilities,
-  samplingDefaults
+  samplingDefaults,
+  shouldPersistSamplingToggleOff
 } from '../../electron/shared/modelCaps'
 import {
   createSerialPatchQueue,
@@ -132,7 +141,11 @@ import {
 import {
   TIER1_LINES,
   TIER1_QUIET_MS,
-  createStallWatch
+  TIER2_LINES,
+  createStallWatch,
+  NOTHING_WAS_WRITTEN,
+  transcribeFailedDetail,
+  transcribeUnsavedDetail
 } from '../../electron/shared/stallBudget'
 import type {
   AppSettings,
@@ -2997,6 +3010,84 @@ section('G9e — the console file drops terminal chrome and counts redraws (REP-
     'G9e a partial suffix at close is written, not swallowed',
     mid.join('') === 'A\nB\nA\n'
   )
+
+  const withBlanks: string[] = []
+  const blanked = createConsoleLog((c) => withBlanks.push(c), { headBytes: 4096, tailBytes: 4096 })
+  for (let i = 0; i < 50; i++) {
+    for (const l of frame) blanked.write(l)
+    blanked.write('')
+  }
+  blanked.close()
+  const blankedFile = withBlanks.join('')
+  check(
+    'G9e an 11-line frame with a blank between draws is still written once',
+    blankedFile.startsWith(frame.map((l) => `${l}\n`).join(''))
+  )
+  check(
+    'G9e and those blank-separated draws are one counter, not forty-nine ones (REP-38)',
+    blankedFile.includes('[redrawn 49 times]')
+  )
+  eq('G9e blank-separated draws still appear once', blankedFile.split('engine message 1\n').length - 1, 1)
+  check('G9e blank-separated draws are not forty-nine tallies of 1', !blankedFile.includes('[redrawn 1 times]'))
+  check(
+    'G9e consecutive blanks in that flood still collapse to at most one in a row',
+    !blankedFile.includes('\n\n\n')
+  )
+
+  const bound: string[] = []
+  const bounded = createConsoleLog((c) => bound.push(c), { headBytes: 4096, tailBytes: 4096 })
+  bounded.write('A')
+  bounded.write('B')
+  bounded.write('A')
+  for (let i = 0; i < 9; i++) bounded.write('')
+  bounded.write('C')
+  bounded.close()
+  check(
+    'G9e a match does not hold pending across an unbounded blank run',
+    bound.join('') === 'A\nB\nA\n\nC\n'
+  )
+
+  const restored: string[] = []
+  const restore = createConsoleLog((c) => restored.push(c), { headBytes: 4096, tailBytes: 4096 })
+  restore.write('A')
+  restore.write('B')
+  restore.write('A')
+  restore.write('')
+  restore.write('C')
+  restore.close()
+  check(
+    'G9e a blank swallowed in a failed match is restored (SOL-67)',
+    restored.join('') === 'A\nB\nA\n\nC\n'
+  )
+
+  const placed: string[] = []
+  const place = createConsoleLog((c) => placed.push(c), { headBytes: 4096, tailBytes: 4096 })
+  for (const l of ['A', 'B', 'C', 'D']) place.write(l)
+  place.write('A')
+  place.write('B')
+  place.write('')
+  place.write('C')
+  place.write('X')
+  place.close()
+  check(
+    'G9e a blank in a failed match stays before the later matched line (SOL-67)',
+    placed.join('') === 'A\nB\nC\nD\nA\nB\n\nC\nX\n'
+  )
+
+  const twoGaps: string[] = []
+  const gaps = createConsoleLog((c) => twoGaps.push(c), { headBytes: 4096, tailBytes: 4096 })
+  for (const l of ['A', 'B', 'C', 'D']) gaps.write(l)
+  gaps.write('A')
+  gaps.write('')
+  gaps.write('B')
+  gaps.write('')
+  gaps.write('C')
+  gaps.write('X')
+  gaps.close()
+  check(
+    'G9e two blank runs in one failed match stay in their places (SOL-67)',
+    twoGaps.join('') === 'A\nB\nC\nD\nA\n\nB\n\nC\nX\n'
+  )
 }
 
 section('G9b — no sidecar overwrites another, and the console log is one of them')
@@ -3452,6 +3543,226 @@ section('G13 — classifyEngineFailure names a rejected key (REP-34 / SF-1)')
     eq('G13 the item-8 translate log is rejected', classifyEngineFailure(whole)?.kind, 'rejected')
     eq('G13 and the page headline on that log names the API key', translateHeadline(whole), REJECTED)
   }
+}
+
+section('G14 — transcribe endings tell the truth about the file (SF-4 / REP-37)')
+{
+  const stopped = transcribeUnsavedDetail()
+  const failed = transcribeFailedDetail()
+  eq(
+    'G14 the stopped detail is stable',
+    stopped,
+    'Nothing was written. The transcription must start over.'
+  )
+  check('G14 stopped uses the shared claim', stopped.toLowerCase().includes(NOTHING_WAS_WRITTEN), stopped)
+  check('G14 and tells the user the work must start over', /must start over/i.test(stopped), stopped)
+  check('G14 stopped does not point at a partial file', !/partial/i.test(stopped), stopped)
+
+  check('G14 generic failure is not the stopped sentence', failed !== stopped, failed)
+  check(
+    'G14 generic failure does not claim nothing was written (SOL-68)',
+    !failed.toLowerCase().includes(NOTHING_WAS_WRITTEN),
+    failed
+  )
+  check(
+    'G14 generic failure tells the user to check the output path',
+    /check the output path/i.test(failed),
+    failed
+  )
+
+  const watch = createStallWatch()
+  const dull = ['Working…', 'Still working…']
+  let verdict: ReturnType<typeof watch.observe> = null
+  for (let i = 0; i < TIER2_LINES + 2_000 && !verdict; i++) {
+    verdict = watch.observe(dull[i % dull.length], i * 100)
+  }
+  check('G14 tier 2 still fires', verdict?.tier === 2, verdict)
+  check(
+    'G14 tier 2 still agrees with Stop that nothing was written',
+    (verdict?.message ?? '').toLowerCase().includes(NOTHING_WAS_WRITTEN),
+    verdict?.message
+  )
+}
+
+section('G15 — generation-parameters toggle follows the model (SF-7 / F2)')
+{
+  const onAccepting = {
+    model: 'gemini-3.5-flash',
+    customGenerationParams: true,
+    temperature: 0.7,
+    topP: 0.8
+  }
+
+  const toRejecting = settingsPatchOnModelChange(onAccepting, 'gemini-3.6-flash')
+  check(
+    'G15 sitting on a rejecting model does not destroy sampling intent (SOL-69)',
+    toRejecting.customGenerationParams === undefined,
+    toRejecting
+  )
+  eq('G15 and records the new model', toRejecting.model, 'gemini-3.6-flash')
+  check(
+    'G15 that hop does not wipe typed sampling values (REP-5)',
+    toRejecting.temperature === undefined && toRejecting.topP === undefined,
+    toRejecting
+  )
+  eq(
+    'G15 the greyed switch does not look ON',
+    samplingToggleChecked(true, 'gemini-3.6-flash'),
+    false
+  )
+  eq(
+    'G15 an accepting model still shows the stored ON',
+    samplingToggleChecked(true, 'gemini-3.5-flash'),
+    true
+  )
+
+  const back = settingsPatchOnModelChange(
+    { model: 'gemini-3.6-flash', customGenerationParams: true, temperature: 0.7, topP: 0.8 },
+    'gemini-3.5-flash'
+  )
+  eq('G15 switching back does not restore the toggle', back.customGenerationParams, false)
+  check(
+    'G15 and keeps the typed 0.7 / 0.8 (SOL-70)',
+    back.temperature === undefined && back.topP === undefined,
+    back
+  )
+  eq('G15 and the control is live again', modelCapabilities('gemini-3.5-flash').acceptsSamplingParams, true)
+
+  eq(
+    'G15 persist-off helper: rejecting → accepting',
+    shouldPersistSamplingToggleOff('gemini-3.6-flash', 'gemini-3.5-flash', true),
+    true
+  )
+  eq(
+    'G15 persist-off helper: accepting → rejecting leaves shared intent (SOL-69)',
+    shouldPersistSamplingToggleOff('gemini-3.5-flash', 'gemini-3.6-flash', true),
+    false
+  )
+  eq(
+    'G15 persist-off helper: still rejecting leaves shared intent (SOL-69)',
+    shouldPersistSamplingToggleOff('gemini-3.6-flash', 'gemini-3.6-flash-lite', true),
+    false
+  )
+  eq(
+    'G15 persist-off helper: user-off does not write false',
+    shouldPersistSamplingToggleOff('gemini-3.6-flash', 'gemini-3.5-flash', false),
+    false
+  )
+
+  {
+    const live = (id: string, on: number[]): ModelInfo => ({
+      id,
+      label: id,
+      source: 'live',
+      availableOn: on
+    })
+    const stored = 'gemini-3.6-flash'
+    const next = {
+      models: [live('gemini-3.5-flash', [0])],
+      unionIds: ['gemini-3.5-flash'],
+      runnableIds: ['gemini-3.5-flash'],
+      outcome: 'allComplete' as const
+    }
+    const sel = applyModelSelectionRules(stored, [live(stored, [0])], next)
+    eq('G15 refresh proves the rejecting model absent (SOL-71)', sel.changed, true)
+    eq('G15 and selects an accepting fallback', sel.model, 'gemini-3.5-flash')
+    const persist = selectionSettingsPatch(
+      { model: stored, customGenerationParams: true },
+      sel
+    )
+    eq('G15 that same patch persists the toggle OFF (SOL-71)', persist.customGenerationParams, false)
+    check(
+      'G15 refresh persist-off does not write temperature / top-p (SOL-70)',
+      persist.temperature === undefined && persist.topP === undefined,
+      persist
+    )
+
+    const ontoRejecting = applyModelSelectionRules(stored, [live(stored, [0])], {
+      models: [live('gemini-3.6-flash-lite', [0])],
+      unionIds: ['gemini-3.6-flash-lite'],
+      runnableIds: ['gemini-3.6-flash-lite'],
+      outcome: 'allComplete'
+    })
+    const stay = selectionSettingsPatch(
+      { model: stored, customGenerationParams: true },
+      ontoRejecting
+    )
+    eq('G15 refresh onto another rejecting model still writes the fallback', stay.model, 'gemini-3.6-flash-lite')
+    check(
+      'G15 and leaves shared sampling intent stored (SOL-69)',
+      stay.customGenerationParams === undefined,
+      stay
+    )
+
+    const advance = applyModelSelectionRules(
+      'gemini-3.1-flash-lite',
+      [live('gemini-3.1-flash-lite', [0, 1])],
+      {
+        models: [live('gemini-3.2-flash-lite', [0, 1])],
+        unionIds: ['gemini-3.2-flash-lite'],
+        runnableIds: ['gemini-3.2-flash-lite'],
+        outcome: 'activeComplete'
+      }
+    )
+    const stayOn = selectionSettingsPatch(
+      { model: 'gemini-3.1-flash-lite', customGenerationParams: true },
+      advance
+    )
+    eq('G15 auto-advance between accepting models still writes the new id', stayOn.model, 'gemini-3.2-flash-lite')
+    check(
+      'G15 and does not turn the toggle off',
+      stayOn.customGenerationParams === undefined,
+      stayOn
+    )
+  }
+
+  const alreadyOff = settingsPatchOnModelChange(
+    { model: 'gemini-3.5-flash', customGenerationParams: false },
+    'gemini-2.5-flash'
+  )
+  eq('G15 preview defaults still refresh while the toggle is off', alreadyOff.temperature, 0.3)
+  eq('G15 including top-p', alreadyOff.topP, 0.8)
+
+  eq('G15 accepting models keep the override desc', samplingToggleDesc('gemini-3.5-flash'), SAMPLING_TOGGLE_DESC)
+  eq('G15 3.1 flash-lite keeps the override desc', samplingToggleDesc('gemini-3.1-flash-lite'), SAMPLING_TOGGLE_DESC)
+  eq(
+    'G15 a greyed control explains why',
+    samplingToggleDesc('gemini-3.6-flash'),
+    SAMPLING_UNAVAILABLE_DESC
+  )
+  eq(
+    'G15 flash-lite at 3.5 is greyed for the same reason',
+    samplingToggleDesc('gemini-3.5-flash-lite'),
+    SAMPLING_UNAVAILABLE_DESC
+  )
+  check(
+    'G15 the greyed reason still points at Description',
+    /Steer it with the Description field/i.test(SAMPLING_UNAVAILABLE_DESC)
+  )
+  check(
+    'G15 the greyed reason is not an amber warning',
+    !/text-amber/.test(SAMPLING_UNAVAILABLE_DESC)
+  )
+
+  const page = fs.readFileSync(path.join(process.cwd(), 'src', 'pages', 'SettingsPage.tsx'), 'utf8')
+  check(
+    'G15 the unreachable amber deprecation paragraph is gone (hazard 137)',
+    !page.includes('This model does not use these settings.')
+  )
+  check(
+    'G15 the toggle is disabled when the model rejects sampling',
+    page.includes('disabled={!caps.acceptsSamplingParams}')
+  )
+  check(
+    'G15 Settings does not persist-off on a rejecting global model (SOL-69)',
+    !page.includes('void patch({ customGenerationParams: false })')
+  )
+  const ipcSrc = fs.readFileSync(path.join(process.cwd(), 'electron', 'main', 'ipc.ts'), 'utf8')
+  eq(
+    'G15 both refresh handlers persist via selectionSettingsPatch (SOL-71)',
+    (ipcSrc.match(/Object\.assign\(patch, selectionSettingsPatch\(/g) ?? []).length,
+    2
+  )
 }
 
 // ── result ─────────────────────────────────────────────────────────────────────
