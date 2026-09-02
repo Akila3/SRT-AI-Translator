@@ -24,7 +24,7 @@ SRT AI Translator is a portable Windows desktop app for translating, transcribin
 
 ### Portable Windows Release
 
-1. Download the latest `SRT AI Translator-<version>-portable.zip` from GitHub Releases.
+1. Download `SRT.AI.Translator-<version>-portable.zip` from the [latest release](https://github.com/Akila3/SRT-AI-Translator/releases/latest). GitHub writes the spaces in the file name as dots, so the download is named `SRT.AI.Translator-1.1.0-portable.zip` rather than `SRT AI Translator-1.1.0-portable.zip` — same file.
 2. Extract the ZIP anywhere, for example to your Desktop, a USB drive, or another folder.
 3. Run `SRT AI Translator.exe` from the extracted folder.
 4. Enter at least one Gemini API key in Settings.
