@@ -24,7 +24,7 @@ electron/
   preload/   contextBridge -> window.api, plus its .d.ts contract
   shared/    types.ts languages.ts modelCaps.ts keyOrder.ts   (imported by BOTH processes)
              outputSanity.ts ffmpegProgress.ts maskedCommand.ts stallBudget.ts
-             consoleLog.ts terminalNoise.ts transcribeSettings.ts
+             consoleLog.ts terminalNoise.ts transcribeSettings.ts engineErrors.ts
 src/
   App.tsx    pages/  components/  lib/useRunner.ts lib/appVersion.ts  store/useStore.ts  data/
 scripts/
@@ -58,7 +58,7 @@ state survives tab switches. The app always opens on Translate.
 flowchart TD
     R["Renderer (React 18)"]
     P["Preload contextBridge -> window.api"]
-    I["main/ipc.ts (hub, 19 channels)"]
+    I["main/ipc.ts (hub, 20 channels)"]
     S["electron-store config.json"]
     PB["main/pythonBridge.ts"]
     G["gst child process"]
@@ -362,6 +362,8 @@ Notable helpers, and the promise each makes:
 | `describeEngine()` (`electron/main/pythonBridge.ts`) | Which `gst` will actually run, and whether it is the bundled copy. The same answer feeds the startup console line, every run's command line and Settings > Advanced, so the three cannot disagree. Worth knowing: in a **dev** run this resolves through PATH, where a pip-installed engine can win over `resources/bin` — a packaged build always uses the bundled absolute path. |
 | `classifyFetchFailure()` (`electron/main/modelsList.ts`) / `src/lib/keyStatus.ts` | A key is only ever branded invalid when **the API refused it**. A DNS failure, a timeout, an exhausted quota and an error we do not recognise all mean *unchecked* — which is persisted as `null`, not `false`, because a false rejection silently demotes a working key at spawn time. `keyStatus.ts` owns every sentence the panel says about a check, since the failure mode here is wording rather than logic. |
 | `keepProvenRejections()` (`electron/main/modelsList.ts`) | The same rule running backwards: a check that proved nothing may not **erase** a rejection either. Only a rejection is carried forward, never a pass — `orderKeySlots` drops `false` and treats `true` and `null` alike, so `false` is the only verdict with operational weight, and retaining a `true` would let a failed check report "✓ N of N keys valid". A retained verdict is dropped the moment the key is edited or cleared, and it never implies anything about which models that key can see. |
+| `classifyEngineFailure()` (`electron/shared/engineErrors.ts`) | Turns a whole run log into one actionable sentence. Translation has no key preflight, so a rejected key dies inside the engine and surfaces as a Python 401 dict that never says "API key" and recommends an OAuth token this app cannot use. Reading a *run log* rather than a failed fetch is what makes it delicate: the log always contains the command line, and may contain progress like `401/600`, so command, progress and non-terminal preflight lines are excluded before anything is matched, and a bare number can never look like an HTTP status. The latest match wins, but a later batch or segment line that **differs** from the one on screen when the error arrived clears it — that is recovery. Identical redraws keep the match, which is how a retry storm stuck on one segment stays diagnosed. Unrecognised returns `null`, leaving the page's generic banner. Its wording is deliberately duplicated from `classifyFetchFailure` rather than shared: the renderer cannot import from `main/`, and consolidating meant keeping six strings byte-identical across three consumption shapes. |
+| `shouldPersistSamplingToggleOff()` (`electron/shared/modelCaps.ts`) | The single rule for when the Custom Generation Parameters toggle is switched off on the user's behalf: only when it was on, the previous model rejected sampling parameters, and the next one accepts them. It exists because a model can change in **two** places — the Settings picker and an automatic re-selection during a refresh — and the second path is in the main process. Without one shared rule the toggle came back on by itself after a refresh moved the user onto an accepting model. `selectionSettingsPatch()` in `main/ipc.ts` is the main-process caller, used by both `models:refresh` and `models:checkKeys`. |
 
 ### Three contracts that cross the process boundary
 
@@ -449,7 +451,8 @@ waiting on stdin. Making that flag conditional would immediately make it reachab
    *release* must put `resources/bin` on PATH itself, as `scripts/verify/badkey.ts` does.
 3. **One job at a time**, enforced in the main process. The UI has no separate guard.
 4. **`resources/bin/` is git-ignored.** A fresh clone has no binaries; see below.
-5. **No test framework, no ESLint, no Prettier** — but three automated checks, described next.
+5. **No test framework, no ESLint, no Prettier** — but a gate suite, a release preflight and nine
+   live probes, described under "Building and checking". Seven of the probes need no API key.
 6. **Never `parseFloat` a model version.** `parseFloat('3.10') === 3.1`, so a two-digit minor sorts
    below `3.9` and "newest" silently picks the older model.
 7. **A migration cannot prove a model is gone**, only a complete refresh can.
@@ -484,6 +487,24 @@ cross-building for Windows from another OS still demands `.exe`.
 `verify:live` reads its key from a git-ignored `.secrets/gemini-key.txt` (or `GEMINI_API_KEY`) and
 masks it out of all engine output. A few of its checks need sample media in `.secrets/fixtures/`;
 without it they report SKIP rather than failing.
+
+`scripts/verify/` holds nine probes, each with its own `run-*.mjs` entry point. They exist because
+the gates stub the engine by design, and some claims can only be settled by the real one:
+
+| Probe | Needs a key? | Settles |
+|---|---|---|
+| `run-badkey.mjs` | **No** | That a rejected key ends the run rather than retrying forever |
+| `run-consolelog.mjs` | No | That a real job through the real lifecycle leaves a real file behind — reached from a spawn that threw, an engine that exited, and a Stop that killed a process tree, since the seams are in `finish()` rather than in the naming policy the gates already cover |
+| `run-buffering.mjs` | No | That the frozen engine's output streams as it happens instead of arriving in one late burst. The defect and its fix both live in `scripts/gst_entry.py`, whose only observable effect is inside the frozen binary |
+| `run-buildstamp.mjs` | No | That `check-bin.mjs` actually **refuses**. Every run of it had ever passed, which proves the happy path and nothing else — a gate that has only said yes is indistinguishable from one that always says yes |
+| `run-fetch-timeout.mjs` | No | That a child which never answers and never exits is abandoned rather than waited on forever, so a model fetch cannot hang the app |
+| `run-progress.mjs` | No | That a real ffmpeg streams `-progress` at all and its numbers climb — and, the part with teeth, that adding those flags did not change the file that comes out |
+| `run-sanity-corpus.mjs` | No | Calibrates the output-sanity thresholds against real subtitles; SKIPs without a corpus |
+| `run-thinking.mjs` | **Yes** | That thinking flags reach the engine and behave per model |
+| `run.mjs` (`verify:live`) | **Yes** | The full live pass — translate, transcribe, encoding, `.ass`, key handling |
+
+The key-less ones are the useful half: they are the checks a contributor without quota can still
+run, and `run-badkey.mjs` in particular guards the failure that once wrote 97 GB before stopping.
 
 ### Getting the binaries
 

@@ -13,7 +13,10 @@ SRT AI Translator is a portable Windows desktop app for translating, transcribin
 - Manage up to five Gemini API keys ranked by validity: a run uses the two highest-ranked keys, and the rest are a reserve pool promoted automatically when a key above them turns invalid.
 - Fetch the Gemini model list from your own keys, with each model labelled by what the app has actually verified — which of your keys can run it, or that it has not been checked yet.
 - Configure generation options: batch size, cross-batch context, thinking level or budget (whichever the selected model supports), resume context size, service tier, and an optional custom temperature / Top-P / Top-K.
-- Save optional translation artifacts beside the exported SRT: token reports, progress logs, and thoughts logs.
+- Save optional translation artifacts beside the exported SRT: token reports, progress logs, and thoughts logs. A `.console.log` recording everything the run said is always written, so a failed run can still be diagnosed.
+- See what long work is doing: a real percentage where the wait can be measured, an elapsed clock where it cannot, and the exact command line each run used with the API keys masked out.
+- Get told the truth about how a run ended. A run you stopped reads as stopped rather than failed, a rejected key is caught before any quota is spent, and a run that has stopped making progress is ended with its cause instead of retrying indefinitely.
+- Be warned when a finished translation looks wrong — the engine can report success for a batch it filled with junk. The warning is advisory: your file is never altered or blocked from saving.
 - Use bundled FFmpeg/FFprobe in the portable build, with an optional manual FFmpeg override in Settings.
 - Switch between light, dark, and automatic UI themes.
 
@@ -34,12 +37,19 @@ Settings and API keys are stored per Windows user under `%APPDATA%`; they are no
 
 - Bundled engine updated to `gemini-srt-translator` 3.7.0.
 - `.ass` subtitle files can be translated directly, keeping their styling.
+- Any embedded subtitle track can be exported, not just the one being translated — text tracks as `.srt`, image/PGS tracks as `.sup`.
 - API keys are now ranked: a run uses the two highest-ranked valid keys and promotes a reserve key automatically when one above it fails. Settings shows each key's role and which key a run will actually use.
 - The model list is built from what your own keys report, with per-model availability, instead of a curated list containing moving `-latest` aliases. A failed or partial check keeps your previous list instead of clearing it.
 - The app no longer displays free-tier rate-limit figures, which Google stopped publishing; it links to the live source and to AI Studio instead.
 - New options: resume context size, and a Custom Generation Parameters toggle that keeps temperature / Top-P / Top-K off unless you deliberately want them.
 - Thinking controls now follow the selected model instead of being offered where the engine would ignore them.
 - Settings migrate automatically and non-destructively on first launch, with a backup written beforehand.
+- Every run writes a `.console.log` beside its output containing what the run actually said, so a failed or stopped run still leaves a complete record.
+- Long waits report honestly: a real percentage where it can be measured, an elapsed clock where it cannot, and never an invented number.
+- A run that cannot succeed now ends. A rejected key is caught before anything is spawned, and a run that has stopped making progress is terminated with its cause instead of retrying indefinitely.
+- Stopping a run reads as **Stopped**, not as a failure, and a finished translation is checked for signs the model returned filler — as a warning only, never a change to your file.
+
+The full list, including fixes, is in [CHANGELOG.md](CHANGELOG.md).
 
 ### Upgrading From 1.0.0
 
@@ -102,7 +112,7 @@ Subtitle files must be UTF-8. A non-UTF-8 `.srt` is converted automatically to a
 - **Model & Generation**: select the model, batch size, and cross-batch context. Thinking controls follow the model — a 3.x model exposes a thinking level, a 2.5 model exposes a thinking budget, and a 2.0 model exposes neither. Custom Generation Parameters is off by default; turn it on to set temperature, Top-P, and Top-K, otherwise the engine's own defaults apply.
 - **Service**: choose the Gemini service tier. Paid-quota behavior is shown here as a read-only reflection of the promoted primary key's tier, which is set per key in the API Keys section.
 - **Advanced**: resume context size, streaming, and other engine-level options.
-- **Logging**: enable token report (`.tokens.json`), progress log (`.progress.log`), and thoughts log (`.thoughts.log`) output.
+- **Logging**: enable token report (`.tokens.json`), progress log (`.progress.log`), and thoughts log (`.thoughts.log`) output. A `.console.log` is always written beside the output regardless of these toggles — it is the record of what the run actually said, and it is the file to attach when reporting a problem.
 - **FFmpeg Path**: leave empty to use bundled FFmpeg in the portable build; set a path only if you want to override it.
 - **Theme**: choose Light, Dark, or Auto.
 
@@ -135,6 +145,16 @@ npm run check:bin   # release preflight: the binaries a package needs are presen
 ```
 
 `test:gates` bundles the real main-process modules with esbuild and stubs only `electron` and `electron-store`, so a gate cannot pass against a stale copy of the logic. It prints its own assertion total on every run.
+
+There is also a set of optional probes under `scripts/verify/` that run the **real** engine rather than a stub. Most need nothing but time:
+
+```bash
+node scripts/verify/run-badkey.mjs   # proves a rejected key ends the run; needs no API key
+node scripts/verify/run-consolelog.mjs
+npm run verify:live                  # needs a real API key and spends quota
+```
+
+`verify:live` reads its key from a git-ignored `.secrets/gemini-key.txt` (or the `GEMINI_API_KEY` environment variable) and masks it out of all engine output. Probes whose sample media is absent report SKIP rather than failing. Nothing under `.secrets/` is ever committed — use a disposable key and revoke it afterwards.
 
 ## Building
 
@@ -180,6 +200,7 @@ scripts/
   build_python.py  PyInstaller build for the bundled gst executable
   check-bin.mjs    Release preflight for the bundled binaries
   gates/           Automated checks for migrations, model rules, key ranking and argv
+  verify/          Optional probes that drive the real engine; most need no API key
 resources/
   bin/        Local bundled runtime binaries; ignored by Git
 ```
@@ -192,7 +213,23 @@ The repository is configured to avoid committing local/generated data:
 - `out/`
 - `release/`
 - `resources/bin/`
+- `.secrets/`
 - logs
 - build caches
 
-Do not commit Gemini API keys, TMDB keys, `.env` files, local app config, generated translations, or private subtitle/media files.
+Do not commit Gemini API keys, TMDB keys, `.env` files, local app config, generated translations, or private subtitle/media files. Treat a key that has been pushed once as burned even if the next commit removes it — git history is permanent.
+
+## License
+
+Released under the [MIT License](LICENSE).
+
+### Third-Party Components
+
+The portable build redistributes software owned by others. Their licenses apply to those components, not this project's:
+
+| Component | Bundled as | License |
+|---|---|---|
+| [`gemini-srt-translator`](https://github.com/MaKTaiL/gemini-srt-translator) | `resources/bin/gst.exe`, frozen with PyInstaller | MIT — Copyright (c) 2024 Matheus Castro |
+| [FFmpeg](https://ffmpeg.org/) and FFprobe | `resources/bin/ffmpeg.exe`, `resources/bin/ffprobe.exe` | LGPL or GPL **depending on the binary you supply** — the build used for 1.1.0 is GPL v3 |
+
+FFmpeg is invoked as a separate executable over its command line; none of its code is linked into this application. Even so, redistributing the binary carries that binary's own obligations. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the details and for how to check which license your own FFmpeg build falls under — this app needs only subtitle extraction and audio conversion, neither of which requires a GPL build.

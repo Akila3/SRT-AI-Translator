@@ -5,6 +5,14 @@
   "main": "./out/main/index.js",
   "author": "SRT AI Translation UI",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Akila3/SRT-AI-Translator.git"
+  },
+  "homepage": "https://github.com/Akila3/SRT-AI-Translator#readme",
+  "bugs": {
+    "url": "https://github.com/Akila3/SRT-AI-Translator/issues"
+  },
   "scripts": {
     "dev": "electron-vite dev",
     "start": "electron-vite preview",
@@ -58,6 +66,20 @@
           "ffmpeg*",
           "ffprobe*"
         ]
+      }
+    ],
+    "extraFiles": [
+      {
+        "from": "LICENSE",
+        "to": "LICENSE.txt"
+      },
+      {
+        "from": "THIRD-PARTY-NOTICES.md",
+        "to": "THIRD-PARTY-NOTICES.md"
+      },
+      {
+        "from": "licenses",
+        "to": "licenses"
       }
     ],
     "beforePack": "./scripts/electron-builder-beforePack.cjs",
