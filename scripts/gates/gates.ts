@@ -1806,7 +1806,8 @@ section('G3d — alignment, fragment-heavy sources, abort copy (REP-32)')
 
   const evidenceRoots = [
     path.join(process.cwd(), '.secrets', 'Issues', '_Reported', 'Error translating'),
-    path.join(process.cwd(), '.secrets', 'Issues', 'Error translating')
+    path.join(process.cwd(), '.secrets', 'Issues', 'Error translating'),
+    path.join(process.cwd(), '.secrets', 'Issues', 'Issues_round_02', '_Reported', 'Error translating')
   ]
   const evidence = evidenceRoots.find((p) => fs.existsSync(p))
   if (!evidence) {
