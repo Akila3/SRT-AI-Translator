@@ -60,6 +60,7 @@ import {
 } from '../../electron/shared/consoleLog'
 import { isBarFrame, parseTokenLine, stripAnsi, stripTerminalChrome } from '../../electron/shared/terminalNoise'
 import { scanTranslatedOutput, sourceFragmentNote, explainTranslateAbort, fragmentNoteInLog } from '../../electron/shared/outputSanity'
+import { classifyEngineFailure } from '../../electron/shared/engineErrors'
 import {
   durationFromProbe,
   parseTimestamp,
@@ -3313,6 +3314,144 @@ section('G9c — a run\u2019s console is named after its output, and found again
   check('G12 javascript is not', !isHttpsUrl('javascript:alert(1)'))
   check('G12 empty is not', !isHttpsUrl(''))
   check('G12 malformed is not', !isHttpsUrl('not a url'))
+}
+
+section('G13 — classifyEngineFailure names a rejected key (REP-34 / SF-1)')
+{
+  /**
+   * Translate's headline: a recognised API failure outranks the count-mismatch abort copy.
+   * Transcribe does not use that copy — cue-merging advice is meaningless on audio (SOL-66).
+   */
+  const translateHeadline = (logText: string): string | null =>
+    classifyEngineFailure(logText)?.message ?? explainTranslateAbort(logText)
+  const transcribeHeadline = (logText: string): string | null =>
+    classifyEngineFailure(logText)?.message ?? null
+
+  const REJECTED =
+    'Invalid API key. Double-check the key from Google AI Studio and try again.'
+  const COUNT = 'Expected 300 lines, got 208'
+  const PROGRESS = 'Translating batch 1: 10/300 lines\nTranscribing audio segment 00:00 to 00:10.'
+  /**
+   * Verbatim last line of Issues_round_03/Check List/08/translate.txt — the engine's 401 dict
+   * that never says "API key" and tells the user to obtain an OAuth 2 token.
+   */
+  const TRANSLATE_401 =
+    "Translation failed: 401 UNAUTHENTICATED. {'error': {'code': 401, 'message': 'Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential. See https://developers.google.com/identity/sign-in/web/devconsole-project.', 'status': 'UNAUTHENTICATED', 'details': [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo', 'reason': 'ACCESS_TOKEN_TYPE_UNSUPPORTED', 'metadata': {'method': 'google.ai.generativelanguage.v1beta.ModelService.ListModels', 'service': 'generativelanguage.googleapis.com'}}]}}"
+  const PAID_CMD =
+    '$ "C:\\App\\resources\\bin\\gst.exe" translate -i "show.srt" -o out.srt -k *** -m gemini-3.5-flash --paid-quota --no-resume'
+
+  const rejected = classifyEngineFailure(TRANSLATE_401)
+  eq('G13 the translate 401 dict is rejected', rejected?.kind, 'rejected')
+  eq('G13 and names the API key and Google AI Studio', rejected?.message, REJECTED)
+  eq('G13 ordinary progress is not an engine failure', classifyEngineFailure(PROGRESS), null)
+
+  eq('G13 API_KEY_INVALID is rejected', classifyEngineFailure('API_KEY_INVALID')?.kind, 'rejected')
+  eq('G13 api key not valid is rejected', classifyEngineFailure('400 api key not valid. please pass a valid api key.')?.kind, 'rejected')
+  eq('G13 invalid authentication is rejected', classifyEngineFailure('Request had invalid authentication credentials.')?.kind, 'rejected')
+  eq('G13 unauthenticated is rejected', classifyEngineFailure('status UNAUTHENTICATED')?.kind, 'rejected')
+  eq('G13 401 UNAUTHENTICATED is rejected', classifyEngineFailure('401 UNAUTHENTICATED')?.kind, 'rejected')
+  eq('G13 all five rejected alternatives share one sentence', classifyEngineFailure('API_KEY_INVALID')?.message, REJECTED)
+  eq('G13 api key not valid shares that sentence', classifyEngineFailure('api key not valid')?.message, REJECTED)
+  eq('G13 invalid authentication shares that sentence', classifyEngineFailure('invalid authentication')?.message, REJECTED)
+  eq('G13 unauthenticated shares that sentence', classifyEngineFailure('unauthenticated')?.message, REJECTED)
+  eq('G13 401 UNAUTHENTICATED shares that sentence', classifyEngineFailure('401 UNAUTHENTICATED')?.message, REJECTED)
+
+  eq('G13 a 403 FORBIDDEN is forbidden, not rejected', classifyEngineFailure('PERMISSION_DENIED: 403 FORBIDDEN')?.kind, 'forbidden')
+  eq('G13 PERMISSION_DENIED alone is forbidden', classifyEngineFailure('PERMISSION_DENIED')?.kind, 'forbidden')
+  eq('G13 exhausted quota is quota, not rejected', classifyEngineFailure('429 RESOURCE_EXHAUSTED: quota')?.kind, 'quota')
+  eq('G13 quotas exceeded is quota', classifyEngineFailure('All API quotas exceeded, waiting 12 seconds...')?.kind, 'quota')
+  eq('G13 a DNS failure is network, not rejected', classifyEngineFailure('getaddrinfo ENOTFOUND generativelanguage.googleapis.com')?.kind, 'network')
+  eq('G13 an unrecognised failure falls through', classifyEngineFailure('something went sideways'), null)
+  eq('G13 empty text is not a fetch-timeout fallback', classifyEngineFailure(''), null)
+  check(
+    'G13 does not invent the model-list fallback',
+    !/Could not retrieve models/i.test(classifyEngineFailure('something went sideways')?.message ?? '')
+  )
+
+  const abortOnly = explainTranslateAbort(`Retrying immediately...\n${COUNT}\nStopping script due to reaching 3 consecutive errors`)
+  check('G13 count-mismatch abort copy still fires in isolation', abortOnly !== null)
+  eq('G13 and Translate keeps that copy when there is no API error', translateHeadline(`Retrying immediately...\n${COUNT}`), abortOnly)
+
+  const both = `${TRANSLATE_401}\n${COUNT}`
+  eq('G13 a log with both signals prefers the API-key sentence', translateHeadline(both), REJECTED)
+  check('G13 while explainTranslateAbort still sees the shortage', explainTranslateAbort(both) !== null)
+  eq('G13 a 401 dict alone is the API-key sentence', translateHeadline(TRANSLATE_401), REJECTED)
+  eq('G13 progress has no headline', translateHeadline(PROGRESS), null)
+
+  // SOL-64: the command line and progress must not be read as API failures.
+  eq('G13 a bare 401 is not a credential failure', classifyEngineFailure('error code 401'), null)
+  eq('G13 a progress line at 401/600 is not a credential failure', classifyEngineFailure('Translating batch 1: 401/600 lines'), null)
+  eq('G13 a 403 in a command path is not forbidden', classifyEngineFailure('$ gst.exe translate -i "C:\\403-forbidden.srt" -o out.srt'), null)
+  eq(
+    'G13 a description mentioning a network connection is not a network failure',
+    classifyEngineFailure('$ gst.exe translate -d "poor network connection in this scene"'),
+    null
+  )
+  const paidMismatch = `${PAID_CMD}\nStarting engine…\nTranslating batch 1: 300/300 lines\n${COUNT}\nStopping script due to reaching 3 consecutive errors`
+  eq('G13 --paid-quota plus count mismatch is not quota', classifyEngineFailure(paidMismatch), null)
+  eq('G13 and Translate still shows the shortage copy', translateHeadline(paidMismatch), abortOnly)
+  const paidUnrelated = `${PAID_CMD}\nStarting engine…\nFailed to start gst: spawn ENOENT`
+  eq('G13 --paid-quota plus an unrelated error is not quota', classifyEngineFailure(paidUnrelated), null)
+  eq('G13 no quota was spent is not a quota failure', classifyEngineFailure('Nothing was sent and no quota was spent.'), null)
+
+  // SOL-65: the transcribe preflight's own sentences, which contain neither API_KEY_INVALID nor 403.
+  const preflightRejected =
+    'The API rejected this key before the transcription started: Invalid API key. Double-check the key from Google AI Studio and try again. Nothing was sent and no quota was spent. Open Settings > Gemini API Keys to fix it.'
+  eq('G13 a transcribe preflight rejection is rejected, not quota', classifyEngineFailure(preflightRejected)?.kind, 'rejected')
+  eq('G13 and the transcribe headline names the API key', transcribeHeadline(preflightRejected), REJECTED)
+  const preflightForbidden =
+    'The API rejected this key before the transcription started: This API key is not authorized for the Gemini API. Enable it in Google AI Studio. Nothing was sent and no quota was spent. Open Settings > Gemini API Keys to fix it.'
+  eq('G13 a transcribe preflight 403 is forbidden', classifyEngineFailure(preflightForbidden)?.kind, 'forbidden')
+
+  // SOL-66
+  eq('G13 Transcribe does not use the translate abort copy', transcribeHeadline(`Retrying immediately...\n${COUNT}`), null)
+
+  // SOL-64 leftover: a non-terminal quota record must not headline a later unrelated failure.
+  const preflightQuota =
+    'The API key could not be checked first: Quota exceeded for this key, so it could not be checked. The key itself is fine — wait a bit and retry, or use a paid key. Starting anyway.'
+  eq('G13 a starting-anyway quota preflight is not itself terminal', classifyEngineFailure(preflightQuota), null)
+  const preflightThenFail = `${preflightQuota}\n$ gst.exe transcribe -a audio.mp3 -o out.srt\nStarting engine…\nTranscribing audio segment 00:00 to 00:10.\nFailed to start gst: spawn ENOENT`
+  eq('G13 preflight quota then an unrelated failure is not quota', classifyEngineFailure(preflightThenFail), null)
+  eq('G13 preflight quota then count mismatch is the shortage copy', translateHeadline(`${preflightQuota}\n${COUNT}`), abortOnly)
+  const recoveredQuota =
+    'All API quotas exceeded, waiting 12 seconds...\n' +
+    'Transcribing audio segment 00:00 to 05:00.\n' +
+    'Transcribing audio segment 05:00 to 10:00.\n' +
+    'Failed to start gst: spawn ENOENT'
+  eq('G13 a recovered quota wait is not a later unrelated failure', classifyEngineFailure(recoveredQuota), null)
+  const oneSegmentRecovered =
+    'All API quotas exceeded, waiting 12 seconds...\n' +
+    'Transcribing audio segment 00:00 to 05:00.\n' +
+    'Failed to start gst: spawn ENOENT'
+  eq('G13 one new segment after quota is already recovery', classifyEngineFailure(oneSegmentRecovered), null)
+  eq(
+    'G13 one new batch after quota yields the shortage copy',
+    translateHeadline(
+      `All API quotas exceeded, waiting 12 seconds...\nTranslating batch 1: 300/300 lines\n${COUNT}`
+    ),
+    abortOnly
+  )
+  const storm401 = Array.from(
+    { length: 8 },
+    () =>
+      'Transcribing audio segment 00:00 to 00:10.\nAn unexpected error occurred: 401 UNAUTHENTICATED. Retrying immediately...'
+  ).join('\n')
+  eq('G13 a 401 retry storm on one segment is still rejected', classifyEngineFailure(storm401)?.kind, 'rejected')
+
+  const evidence401 = path.join(
+    process.cwd(),
+    '.secrets',
+    'Issues',
+    'Issues_round_03',
+    'Check List',
+    '08',
+    'translate.txt'
+  )
+  if (fs.existsSync(evidence401)) {
+    const whole = fs.readFileSync(evidence401, 'utf-8')
+    eq('G13 the item-8 translate log is rejected', classifyEngineFailure(whole)?.kind, 'rejected')
+    eq('G13 and the page headline on that log names the API key', translateHeadline(whole), REJECTED)
+  }
 }
 
 // ── result ─────────────────────────────────────────────────────────────────────

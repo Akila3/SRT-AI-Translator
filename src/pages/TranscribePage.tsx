@@ -16,7 +16,8 @@ import {
   Working
 } from '../components/ui'
 import { thinkingLevelsForModel } from '../data/freeTier'
-import { retryIsCurrent } from '../lib/logView'
+import { retryIsCurrent, type LogRow } from '../lib/logView'
+import { classifyEngineFailure } from '../../electron/shared/engineErrors'
 import { useRunner } from '../lib/useRunner'
 import { findConsoleLog } from '../../electron/shared/consoleLog'
 import { effectiveThinkingLevel, modelCapabilities } from '../../electron/shared/modelCaps'
@@ -32,6 +33,14 @@ import type { AppSettings, TranscribeArgs } from '../../electron/shared/types'
 const MEDIA_FILTERS = [
   { name: 'Audio/Video', extensions: ['mp4', 'mkv', 'mov', 'avi', 'webm', 'mp3', 'aac', 'wav', 'm4a', 'flac'] }
 ]
+
+function flattenRunnerLog(rows: LogRow[]): string {
+  const lines: string[] = []
+  for (const r of rows) {
+    if (r.kind === 'block') lines.push(...r.lines)
+  }
+  return lines.join('\n')
+}
 
 export default function TranscribePage(): React.JSX.Element {
   const settings = useStore((s) => s.settings)
@@ -107,6 +116,9 @@ export default function TranscribePage(): React.JSX.Element {
    * one — there is no temp original and no copy — so it is used exactly as it arrives.
    */
   const consoleLog = findConsoleLog(state.logPaths)
+  const logText = flattenRunnerLog(state.log)
+  const abortExplain =
+    state.status === 'error' ? (classifyEngineFailure(logText)?.message ?? null) : null
 
   // A Select whose value is absent from its options renders BLANK, which reads as "no
   // model selected" even though one is stored. Settings keeps the id visible in that case;
@@ -438,7 +450,8 @@ export default function TranscribePage(): React.JSX.Element {
             {state.status === 'error' && (
               <div className="flex items-center gap-2">
                 <p className="text-sm font-medium text-red-600 dark:text-red-400">
-                  Process ended with an error (exit code {state.exitCode}). Check the log above.
+                  {abortExplain ??
+                    `Process ended with an error (exit code ${state.exitCode}). Check the log above.`}
                 </p>
                 <Button variant="ghost" onClick={handleNew}>
                   New

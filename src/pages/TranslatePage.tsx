@@ -18,6 +18,7 @@ import { SubTrackPanel } from '../components/SubTrackPanel'
 import { TmdbSearch } from '../components/TmdbSearch'
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from '../data/languages'
 import { consoleLogPathFor, findConsoleLog } from '../../electron/shared/consoleLog'
+import { classifyEngineFailure } from '../../electron/shared/engineErrors'
 import { explainTranslateAbort, fragmentNoteInLog } from '../../electron/shared/outputSanity'
 import { retryIsCurrent, type LogRow } from '../lib/logView'
 import { companionName } from '../lib/outputName'
@@ -243,7 +244,10 @@ export default function TranslatePage(): React.JSX.Element {
   const fillerWarnings = state.warnings.filter((w) => !/wrong timings/i.test(w))
   const timingWarnings = state.warnings.filter((w) => /wrong timings/i.test(w))
   const fragmentLogNote = fragmentNoteInLog(logText)
-  const abortExplain = state.status === 'error' ? explainTranslateAbort(logText) : null
+  const abortExplain =
+    state.status === 'error'
+      ? (classifyEngineFailure(logText)?.message ?? explainTranslateAbort(logText))
+      : null
 
   /**
    * Why this run cannot start, or an empty string when it can.
