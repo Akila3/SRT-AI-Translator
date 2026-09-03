@@ -2313,8 +2313,13 @@ section('G7 — ffmpeg progress is read, never invented (REP-11)')
 
 section('G8a — the command line is shown, the keys are not (MAN-7)')
 {
-  const KEY = 'AIzaSyD-1234567890abcdefghijklmnopqrstu'
-  const KEY2 = 'AIzaSyC-0987654321zyxwvutsrqponmlkjihg'
+  // Split on purpose. A contiguous `AIza` + 35-character literal matches GitHub's Google-API-key
+  // pattern, and the scanner cannot tell a fixture from a live credential — it opened an alert
+  // against this exact line. Concatenating keeps the runtime values identical while leaving no
+  // matching literal in the file. The rule is "never write a whole key-shaped literal", not
+  // "stay one character under the limit", so both halves of the pair are written this way.
+  const KEY = 'AIza' + 'SyD-1234567890abcdefghijklmnopqrstu'
+  const KEY2 = 'AIza' + 'SyC-0987654321zyxwvutsrqponmlkjihg'
 
   const line = maskCommandLine('C:\\App\\resources\\bin\\gst.exe', [
     'translate', '-i', 'C:\\Subs\\My Show.srt', '-o', 'C:\\out.srt',

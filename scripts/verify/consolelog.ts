@@ -75,8 +75,11 @@ const SURVIVORS: { kill(): void }[] = []
  * point of the file is that a user can send it — and the command line is the one line in a run
  * that has ever held a credential. `run()` emits only the masked rendering and the tee copies
  * what `run()` emits, so asserting on the file asserts on the entire chain.
+ *
+ * Split for the same reason as `BAD_KEY` in `badkey.ts`: a whole key-shaped literal trips GitHub's
+ * secret scanner. The runtime value is unchanged.
  */
-const KEY = 'AIzaSyB0000000000000000000000000000000x'
+const KEY = 'AIza' + 'SyB0000000000000000000000000000000x'
 
 let failures = 0
 let passes = 0
