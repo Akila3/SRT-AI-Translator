@@ -1,5 +1,10 @@
 # SRT AI Translator
 
+> **There is a newer app: [SRT AI Translator NG](https://github.com/Akila3/SRT-AI-Translator-NG)
+> (New Generation).** Its engine was rewritten inside the app and calls the Gemini API directly, and it
+> adds subtitle timing alignment among other features. NG is a separate product, so the two can be
+> installed side by side. NG translates `.srt` only; for styled `.ass` subtitles keep using this app.
+
 SRT AI Translator is a portable Windows desktop app for translating, transcribing, and extracting subtitles with Google Gemini. It wraps the [`gemini-srt-translator`](https://github.com/MaKTaiL/gemini-srt-translator) CLI in an Electron + React interface and bundles the runtime pieces needed for normal end-user use.
 
 ## What It Does
